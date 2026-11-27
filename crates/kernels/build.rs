@@ -30,20 +30,32 @@ fn compile_arch(hip_src: &Path, arch: &str, out_path: &Path) {
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let hip_src = manifest_dir.join("hip/gate_kernels.hip");
+    let gate_src = manifest_dir.join("hip/gate_kernels.hip");
+    let infer_src = manifest_dir.join("hip/infer_kernels.hip");
     let compat_hdr = manifest_dir.join("hip/arch_compat.h");
-    println!("cargo:rerun-if-changed={}", hip_src.display());
+    println!("cargo:rerun-if-changed={}", gate_src.display());
+    println!("cargo:rerun-if-changed={}", infer_src.display());
     println!("cargo:rerun-if-changed={}", compat_hdr.display());
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     compile_arch(
-        &hip_src,
+        &gate_src,
         "gfx1201",
         &out_dir.join("gate_kernels_gfx1201.hsaco"),
     );
     compile_arch(
-        &hip_src,
+        &gate_src,
         "gfx942",
         &out_dir.join("gate_kernels_gfx942.hsaco"),
+    );
+    compile_arch(
+        &infer_src,
+        "gfx1201",
+        &out_dir.join("infer_kernels_gfx1201.hsaco"),
+    );
+    compile_arch(
+        &infer_src,
+        "gfx942",
+        &out_dir.join("infer_kernels_gfx942.hsaco"),
     );
 }

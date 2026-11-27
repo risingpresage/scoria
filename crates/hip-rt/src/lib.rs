@@ -253,6 +253,95 @@ impl DeviceBuf {
             "hipMemcpyAsync D2H",
         )
     }
+
+    pub fn zero_async(&mut self, stream: &HipStream) -> HipResult<()> {
+        if self.bytes == 0 {
+            return Ok(());
+        }
+        let hip = get_api("hipMemsetAsync")?;
+        check(
+            hip,
+            unsafe { (hip.hipMemsetAsync)(self.ptr, 0, self.bytes, stream.raw()) },
+            "hipMemsetAsync",
+        )
+    }
+
+    pub fn copy_from_host_at(&mut self, dst_byte_offset: usize, src: &[u8]) -> HipResult<()> {
+        assert!(
+            dst_byte_offset + src.len() <= self.bytes,
+            "offset H2D copy exceeds device buffer"
+        );
+        if src.is_empty() {
+            return Ok(());
+        }
+        let hip = get_api("hipMemcpy H2D offset")?;
+        check(
+            hip,
+            unsafe {
+                (hip.hipMemcpy)(
+                    (self.ptr as *mut u8).add(dst_byte_offset) as *mut c_void,
+                    src.as_ptr() as *const c_void,
+                    src.len(),
+                    HIP_MEMCPY_HOST_TO_DEVICE,
+                )
+            },
+            "hipMemcpy H2D offset",
+        )
+    }
+
+    pub fn copy_to_host_at(&self, src_byte_offset: usize, dst: &mut [u8]) -> HipResult<()> {
+        assert!(
+            src_byte_offset + dst.len() <= self.bytes,
+            "offset D2H copy exceeds device buffer"
+        );
+        if dst.is_empty() {
+            return Ok(());
+        }
+        let hip = get_api("hipMemcpy D2H offset")?;
+        check(
+            hip,
+            unsafe {
+                (hip.hipMemcpy)(
+                    dst.as_mut_ptr() as *mut c_void,
+                    (self.ptr as *const u8).add(src_byte_offset) as *const c_void,
+                    dst.len(),
+                    HIP_MEMCPY_DEVICE_TO_HOST,
+                )
+            },
+            "hipMemcpy D2H offset",
+        )
+    }
+
+    pub fn copy_from_device_async(
+        &mut self,
+        dst_byte_offset: usize,
+        src: &DeviceBuf,
+        src_byte_offset: usize,
+        bytes: usize,
+        stream: &HipStream,
+    ) -> HipResult<()> {
+        assert!(
+            dst_byte_offset + bytes <= self.bytes && src_byte_offset + bytes <= src.bytes,
+            "async D2D copy exceeds device buffer"
+        );
+        if bytes == 0 {
+            return Ok(());
+        }
+        let hip = get_api("hipMemcpyAsync D2D")?;
+        check(
+            hip,
+            unsafe {
+                (hip.hipMemcpyAsync)(
+                    (self.ptr as *mut u8).add(dst_byte_offset) as *mut c_void,
+                    (src.ptr as *const u8).add(src_byte_offset) as *const c_void,
+                    bytes,
+                    HIP_MEMCPY_DEVICE_TO_DEVICE,
+                    stream.raw(),
+                )
+            },
+            "hipMemcpyAsync D2D",
+        )
+    }
 }
 
 impl Drop for DeviceBuf {

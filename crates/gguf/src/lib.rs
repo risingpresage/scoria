@@ -1,10 +1,20 @@
+pub mod dequant;
+pub mod gguf;
+pub mod tokenizer;
+
 use std::fmt;
+
+pub use gguf::{GgmlType, GgufFile, GgufRawLayout, GgufValue, ModelConfig, TensorInfo};
+pub use tokenizer::BpeTokenizer;
 
 pub const GGUF_MAGIC: [u8; 4] = *b"GGUF";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuantCodec {
+    F32,
     F16,
+    BF16,
+    Q5_0,
     Q8_0,
     Q4K,
     Q6K,
@@ -12,6 +22,7 @@ pub enum QuantCodec {
     Q4W32,
     Bitcos,
     QtipW32,
+    Unknown(u32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +52,10 @@ pub enum GgufError {
     TooShort,
     BadMagic([u8; 4]),
     UnsupportedVersion(u32),
+    Io(String),
+    Malformed(String),
+    MissingMetadata(String),
+    UnsupportedQuant(u32),
 }
 
 impl fmt::Display for GgufError {
@@ -49,6 +64,10 @@ impl fmt::Display for GgufError {
             GgufError::TooShort => write!(f, "GGUF header truncated"),
             GgufError::BadMagic(m) => write!(f, "invalid GGUF magic: {:?}", m),
             GgufError::UnsupportedVersion(v) => write!(f, "unsupported GGUF version: {v}"),
+            GgufError::Io(msg) => write!(f, "GGUF I/O error: {msg}"),
+            GgufError::Malformed(msg) => write!(f, "malformed GGUF: {msg}"),
+            GgufError::MissingMetadata(key) => write!(f, "missing GGUF metadata key: {key}"),
+            GgufError::UnsupportedQuant(id) => write!(f, "unsupported GGML quant type id: {id}"),
         }
     }
 }

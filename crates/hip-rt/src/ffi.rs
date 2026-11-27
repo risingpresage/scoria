@@ -62,6 +62,12 @@ pub struct HipApi {
         kind: c_int,
         stream: hipStream_t,
     ) -> hipError_t,
+    pub hipMemsetAsync: unsafe extern "C" fn(
+        dst: *mut c_void,
+        value: c_int,
+        sizeBytes: usize,
+        stream: hipStream_t,
+    ) -> hipError_t,
 
     pub hipStreamCreateWithFlags:
         unsafe extern "C" fn(stream: *mut hipStream_t, flags: c_uint) -> hipError_t,
@@ -159,6 +165,7 @@ unsafe fn load_hip_api() -> Result<HipApi, String> {
         hipHostFree: load_sym(handle, "hipHostFree")?,
         hipMemcpy: load_sym(handle, "hipMemcpy")?,
         hipMemcpyAsync: load_sym(handle, "hipMemcpyAsync")?,
+        hipMemsetAsync: load_sym(handle, "hipMemsetAsync")?,
         hipStreamCreateWithFlags: load_sym(handle, "hipStreamCreateWithFlags")?,
         hipStreamSynchronize: load_sym(handle, "hipStreamSynchronize")?,
         hipStreamDestroy: load_sym(handle, "hipStreamDestroy")?,

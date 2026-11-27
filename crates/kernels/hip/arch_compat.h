@@ -71,3 +71,30 @@ __device__ __forceinline__ unsigned scoria_lut16(unsigned lut_bits, unsigned nib
 #else
 #error "Unsupported AMDGPU target: scoria requires gfx1200/gfx1201 (RDNA4) or gfx90a/gfx942/gfx950 (CDNA)"
 #endif
+
+__device__ __forceinline__ float scoria_wave_sum(float v) {
+    for (int offset = SCORIA_WAVE_SIZE >> 1; offset > 0; offset >>= 1) {
+        v += __shfl_xor(v, offset, SCORIA_WAVE_SIZE);
+    }
+    return v;
+}
+
+__device__ __forceinline__ float scoria_f16_bits_to_f32(unsigned short bits) {
+    union {
+        unsigned short u;
+        _Float16 h;
+    } cvt;
+    cvt.u = bits;
+    return (float)cvt.h;
+}
+
+__device__ __forceinline__ unsigned short scoria_read_u16_unaligned(const unsigned char* p) {
+    return (unsigned short)p[0] | ((unsigned short)p[1] << 8);
+}
+
+__device__ __forceinline__ unsigned scoria_read_u32_unaligned(const unsigned char* p) {
+    return (unsigned)p[0]
+        | ((unsigned)p[1] << 8)
+        | ((unsigned)p[2] << 16)
+        | ((unsigned)p[3] << 24);
+}

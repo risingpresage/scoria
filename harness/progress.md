@@ -17,5 +17,14 @@
   - PCIe pinned DMA: `6.96` H2D / `6.88` D2H GB/s
   - Incompressible `io_uring` `O_DIRECT` (256 MiB): P31 `3.558` GB/s, 980 `2.544` GB/s, Dual `3.494` GB/s
 
+## 2026-11-26 — Phase 1 Complete (GGUF Parser, BPE Tokenizer, Reference HIP Kernels, Parity Verified)
+- Implemented full pure-Rust mmap GGUF v2/v3 parser (`scoria-gguf`), CPU reference dequantizers (`F32`, `F16`, `Q5_0`, `Q8_0`, `Q4_K`, `Q6_K`), and deterministic Qwen2/GPT-2 byte-level BPE tokenizer (`12/12` exact token ID matches against `llama-tokenize` across `Qwen2.5-0.5B` and `DeepSeek-R1-Distill-Qwen-7B`).
+- Added `infer_kernels.hip` (`embed_lookup_*`, `rmsnorm_f32`, `linear_{f32,f16,q5_0,q8_0,q4_k,q6_k}`, `rope_neox_f32`, `kv_cache_append_f32`, `gqa_attn_f32`, `silu_mul_f32`, `add_inplace_f32`) cross-compiled for both `gfx1201` and `gfx942` via `clang++ --offload-device-only`, plus `Qwen2Model` wired onto the `ExecutionGraph`, `TensorStore`, and `LinearKernel` seams.
+- Verified parity against `libllama.so` (`b11050` CPU reference) and recorded `harness/baselines/phase1_parity.json`:
+  - `Qwen2.5-0.5B-Instruct-Q4_K_M.gguf`: `cos = 0.999774`, `max_abs_diff = 0.4590`, `top1_match = true`, `32/32` exact greedy tokens; `1114.52` tok/s prefill, `247.79` tok/s decode.
+  - `DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf`: `cos = 0.999913`, `max_abs_diff = 0.8123`, `top5_match = true`, `21/32` exact greedy prefix (divergence from `Q8_K` activation quantization in `llama.cpp`); `55.41` tok/s prefill, `40.02` tok/s decode (vs `llama.cpp` Vulkan RADV `521.05` / `123.32` tok/s).
+  - `Qwen2.5-3B-Instruct-f16.gguf` (no activation quant): `cos = 0.999999503`, `max_abs_diff = 0.0273`, `mean_abs_diff = 0.003887`, `16/16` exact greedy tokens.
+- Downloaded Phase 2/3 target GGUFs to `/mnt/nuclearmissilesilo/models/{bonsai,inkling}` (symlinked into `~/models/{bonsai,inkling}`): `Ternary-Bonsai-2-2B-{PTQ1_0,Q2_0}`, `Ternary-Bonsai-2.5-27B-{PTQ1_0,Q2_0}-mtp` (`qwen35` hybrid SSM+attn + `prism.hadamard.*`), `dspark-Inkling-2-Mini-Q8_0` (`dflash`), `Inkling-2-Mini-UD-Q3_K_XL` (`inkling2_loop`, 24 layers looped 3x on 6..18, 128-expert MoE).
+
 ## Next Step
-- Phase 1: Full GGUF tensor/metadata/tokenizer loader + reference HIP inference kernels (`Qwen2.5-0.5B-Instruct-Q4_K_M.gguf` -> `DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf`) with greedy logit parity against `llama.cpp`.
+- Phase 2: Load-time Wave32 repacking (`H4F8` / `Q4W32` / `BITCOS` / `PTQ1_0`), `v_wmma` prefill GEMM, `v_permlane16_var_b32` / popcount decode, and `hipGraph` capture targeting `> llama.cpp` Vulkan on RX 9070 XT.

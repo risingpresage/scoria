@@ -4,11 +4,26 @@ pub const GATE_KERNELS_GFX1201_HSACO: &[u8] =
 pub const GATE_KERNELS_GFX942_HSACO: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gate_kernels_gfx942.hsaco"));
 
+pub const INFER_KERNELS_GFX1201_HSACO: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/infer_kernels_gfx1201.hsaco"));
+
+pub const INFER_KERNELS_GFX942_HSACO: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/infer_kernels_gfx942.hsaco"));
+
 pub fn gate_hsaco_for_arch(gcn_arch: &str) -> Option<&'static [u8]> {
     let base = gcn_arch.split(':').next().unwrap_or(gcn_arch);
     match base {
         "gfx1200" | "gfx1201" => Some(GATE_KERNELS_GFX1201_HSACO),
         "gfx942" => Some(GATE_KERNELS_GFX942_HSACO),
+        _ => None,
+    }
+}
+
+pub fn infer_hsaco_for_arch(gcn_arch: &str) -> Option<&'static [u8]> {
+    let base = gcn_arch.split(':').next().unwrap_or(gcn_arch);
+    match base {
+        "gfx1200" | "gfx1201" => Some(INFER_KERNELS_GFX1201_HSACO),
+        "gfx942" => Some(INFER_KERNELS_GFX942_HSACO),
         _ => None,
     }
 }
@@ -31,9 +46,31 @@ pub mod names {
     pub const BITCOS_BENCH: &str = "bitcos_bench";
 }
 
+pub mod infer_names {
+    pub const EMBED_LOOKUP_F32: &str = "embed_lookup_f32";
+    pub const EMBED_LOOKUP_F16: &str = "embed_lookup_f16";
+    pub const EMBED_LOOKUP_Q8_0: &str = "embed_lookup_q8_0";
+    pub const EMBED_LOOKUP_Q4_K: &str = "embed_lookup_q4_k";
+    pub const RMSNORM_F32: &str = "rmsnorm_f32";
+    pub const LINEAR_F32: &str = "linear_f32";
+    pub const LINEAR_F16: &str = "linear_f16";
+    pub const LINEAR_Q5_0: &str = "linear_q5_0";
+    pub const LINEAR_Q8_0: &str = "linear_q8_0";
+    pub const LINEAR_Q4_K: &str = "linear_q4_k";
+    pub const LINEAR_Q6_K: &str = "linear_q6_k";
+    pub const ROPE_NEOX_F32: &str = "rope_neox_f32";
+    pub const KV_CACHE_APPEND_F32: &str = "kv_cache_append_f32";
+    pub const GQA_ATTN_F32: &str = "gqa_attn_f32";
+    pub const SILU_MUL_F32: &str = "silu_mul_f32";
+    pub const ADD_INPLACE_F32: &str = "add_inplace_f32";
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{GATE_KERNELS_GFX1201_HSACO, GATE_KERNELS_GFX942_HSACO};
+    use super::{
+        GATE_KERNELS_GFX1201_HSACO, GATE_KERNELS_GFX942_HSACO, INFER_KERNELS_GFX1201_HSACO,
+        INFER_KERNELS_GFX942_HSACO,
+    };
     use std::fs;
     use std::process::Command;
 
@@ -98,6 +135,45 @@ mod tests {
                 asm.contains(mnem),
                 "expected gfx942 mnemonic `{mnem}` not emitted"
             );
+        }
+    }
+
+    #[test]
+    fn verify_infer_gfx1201_isa() {
+        let asm = disasm(INFER_KERNELS_GFX1201_HSACO, "gfx1201", "infer_rdna4");
+        for sym in [
+            "rmsnorm_f32",
+            "linear_q5_0",
+            "linear_q4_k",
+            "linear_q6_k",
+            "gqa_attn_f32",
+        ] {
+            assert!(asm.contains(sym), "missing symbol `{sym}` in gfx1201 asm");
+        }
+        for banned in [
+            "ds_load_tr",
+            "v_bitop3_b32",
+            "v_cvt_pk_f16_fp8",
+            "v_wmma_scale_",
+        ] {
+            assert!(
+                !asm.contains(banned),
+                "banned gfx1201 mnemonic `{banned}` emitted"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_infer_gfx942_isa() {
+        let asm = disasm(INFER_KERNELS_GFX942_HSACO, "gfx942", "infer_cdna3");
+        for sym in [
+            "rmsnorm_f32",
+            "linear_q5_0",
+            "linear_q4_k",
+            "linear_q6_k",
+            "gqa_attn_f32",
+        ] {
+            assert!(asm.contains(sym), "missing symbol `{sym}` in gfx942 asm");
         }
     }
 }

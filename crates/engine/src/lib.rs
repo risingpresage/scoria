@@ -1,12 +1,15 @@
+pub mod qwen2;
+
 use scoria_gguf::QuantCodec;
 use scoria_hip_rt::{detect_arch, set_device, warp_size, HipModule, HipResult, TargetArch};
-use scoria_kernels::gate_hsaco_for_arch;
+use scoria_kernels::{gate_hsaco_for_arch, infer_hsaco_for_arch};
 
 pub struct EngineContext {
     pub device_id: i32,
     pub arch: TargetArch,
     pub wave_size: u32,
     pub gate_module: HipModule,
+    pub infer_module: HipModule,
 }
 
 impl EngineContext {
@@ -21,11 +24,19 @@ impl EngineContext {
             )
         });
         let gate_module = HipModule::from_hsaco(hsaco)?;
+        let infer_hsaco = infer_hsaco_for_arch(arch.as_str()).unwrap_or_else(|| {
+            panic!(
+                "no compiled inference HSACO kernels for detected AMDGPU arch `{}`",
+                arch.as_str()
+            )
+        });
+        let infer_module = HipModule::from_hsaco(infer_hsaco)?;
         Ok(Self {
             device_id,
             arch,
             wave_size,
             gate_module,
+            infer_module,
         })
     }
 }
