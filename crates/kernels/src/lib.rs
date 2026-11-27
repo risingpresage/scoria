@@ -66,6 +66,10 @@ pub mod infer_names {
     pub const QK_NORM_ROPE_KV_F32: &str = "qk_norm_rope_kv_f32";
     pub const QK_NORM_ROPE_KV_F16: &str = "qk_norm_rope_kv_f16";
     pub const INKLING2_ATTN_DECODE_F32: &str = "inkling2_attn_decode_f32";
+    pub const INKLING2_CONV4_F32: &str = "inkling2_conv4_f32";
+    pub const INKLING2_HEAD_CLIP_F32: &str = "inkling2_head_clip_f32";
+    pub const INKLING2_HEAD_RMSNORM_F32: &str = "inkling2_head_rmsnorm_f32";
+    pub const INKLING2_SIGMOID_F32: &str = "inkling2_sigmoid_f32";
     pub const GQA_ATTN_F32: &str = "gqa_attn_f32";
     pub const GQA_ATTN_F16: &str = "gqa_attn_f16";
     pub const SILU_MUL_F32: &str = "silu_mul_f32";

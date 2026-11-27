@@ -88,6 +88,11 @@
 - `crates/engine/tests/inkling2_attn_gpu.rs` runs the same fixture through `inkling2_attn::decode_head` and the kernel and compares element-wise at `pos = 0, 7, 1100` with windows {none, 8, 3, 1, 1024, 17} — including `pos = 1100` past the 1024 relative extent, where the bias is zero. Tolerance `2e-4 + 2e-3|ref|`. Also asserts an all-masked row is exactly zero rather than NaN, and pins the host-side preprocessing helpers (relative-bias gather with a constant `proj`, 4-tap conv).
 - Result: 3 GPU tests pass, 12 CPU attention tests pass, `./scripts/check.sh` green.
 
+## 2026-11-28 — projection post-processing on device, and a measured long-context answer
+- `inkling2_attn::post_qkv` (CPU) plus four `.hip` kernels now cover everything between the matmuls and attention: `inkling2_conv4_f32` (4-tap causal depthwise conv with the cache advancing in place), `inkling2_head_clip_f32` (per-head `l2_clip(x*scale)`, `scale == nullptr` for K), `inkling2_head_rmsnorm_f32` (unweighted, eps-safe), and `inkling2_sigmoid_f32` (the output gate).
+- GPU-vs-CPU test runs **four chained decode steps** and compares q, k, v, gate **and both conv caches** at every step, so a cache that does not advance (or advances twice) fails immediately. Order is conv → clip/rmsnorm → gate, matching `modeling_inkling2_loop.py`.
+- Long context was answered by measurement, not projection: Qwen3-8B **with FP16 KV assigns 65536 positions and runs**, while the same model at FP32 KV fails `hipMalloc` at 49152; `Scoria plan` shows Inkling needs 8 full-history KV slots (not 24) because 20 of its layers keep a 1024-token window, so 200k costs 3.13 GiB at FP8 against 12.52 GiB at FP32.
+
 ## Parity gate calibration (cosine > 0.999 is prompt-dependent, not an implementation defect)
 - Measured the control that settles it: **llama.cpp's own Vulkan backend vs llama.cpp's own CPU backend** scores `cos = 0.997985` (`maxdiff 1.152`) on the Qwen3-4B harness chat prompt (`151644,872,198,785,…,77091,198`, `m=13`), where scoria scores `0.997652` (`maxdiff 1.103`). Both pick top1 `785`. No GPU implementation reaches 0.999 on that prompt.
 - Forcing prefill onto the scalar FP32 GEMM (`SCORIA_PREFILL_FP32=1`) changes nothing: 4B `0.997614` vs `0.997652` for FP16 WMMA, 8B `0.996415` vs `0.996404`. So the deficit is **not** FP16 WMMA rounding.

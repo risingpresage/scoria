@@ -957,6 +957,92 @@ extern "C" __global__ void qk_norm_rope_kv_f16(float* __restrict__ q,
 }
 
 
+
+// inkling2_loop projection post-processing. Each kernel mirrors the corresponding helper in
+// `inkling2_attn.rs`, which is the CPU oracle: a 4-tap causal depthwise convolution on K
+// and V, a learned per-head-per-dim scale plus L2 clip on Q, an L2 clip on K, an
+// unweighted RMSNorm on V, and a sigmoid gate on the attention output.
+extern "C" __global__ void inkling2_conv4_f32(float* __restrict__ x,
+                                              const float* __restrict__ weight,
+                                              float* __restrict__ cache,
+                                              unsigned channels) {
+    unsigned c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    float h0 = cache[c];
+    float h1 = cache[channels + c];
+    float h2 = cache[2u * channels + c];
+    float h3 = x[c];
+    // Newest tap last, matching `short_conv1d_4tap`.
+    x[c] = weight[c] * h0 + weight[channels + c] * h1 + weight[2u * channels + c] * h2
+         + weight[3u * channels + c] * h3;
+    cache[c] = h1;
+    cache[channels + c] = h2;
+    cache[2u * channels + c] = h3;
+}
+
+// Per-head `l2_clip(x * scale)` with an optional per-element scale (pass `scale == nullptr`
+// for K). One wave per head.
+extern "C" __global__ void inkling2_head_clip_f32(float* __restrict__ x,
+                                                  const float* __restrict__ scale,
+                                                  unsigned n_heads,
+                                                  unsigned head_dim,
+                                                  float threshold) {
+    unsigned h = blockIdx.x;
+    if (h >= n_heads) return;
+    unsigned lane = threadIdx.x;
+    float* vec = x + (size_t)h * head_dim;
+    float local[4];
+    float ss = 0.0f;
+    #pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        unsigned d = lane + (unsigned)e * SCORIA_WAVE_SIZE;
+        float v = (d < head_dim) ? vec[d] : 0.0f;
+        if (d < head_dim && scale != nullptr) v *= scale[(size_t)h * head_dim + d];
+        local[e] = v;
+        ss += v * v;
+    }
+    float norm = sqrtf(scoria_wave_sum(ss));
+    float factor = fminf(threshold / (norm + 1e-6f), 1.0f);
+    #pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        unsigned d = lane + (unsigned)e * SCORIA_WAVE_SIZE;
+        if (d < head_dim) vec[d] = local[e] * factor;
+    }
+}
+
+// Per-head unweighted RMSNorm (V). One wave per head, eps keeps a zero head at zero.
+extern "C" __global__ void inkling2_head_rmsnorm_f32(float* __restrict__ x,
+                                                     unsigned n_heads,
+                                                     unsigned head_dim,
+                                                     float eps) {
+    unsigned h = blockIdx.x;
+    if (h >= n_heads) return;
+    unsigned lane = threadIdx.x;
+    float* vec = x + (size_t)h * head_dim;
+    float ss = 0.0f;
+    #pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        unsigned d = lane + (unsigned)e * SCORIA_WAVE_SIZE;
+        if (d < head_dim) {
+            float v = vec[d];
+            ss += v * v;
+        }
+    }
+    float mean_sq = scoria_wave_sum(ss) / (float)head_dim;
+    float inv = 1.0f / sqrtf(mean_sq + eps);
+    #pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        unsigned d = lane + (unsigned)e * SCORIA_WAVE_SIZE;
+        if (d < head_dim) vec[d] *= inv;
+    }
+}
+
+extern "C" __global__ void inkling2_sigmoid_f32(float* __restrict__ x, unsigned n) {
+    unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    x[i] = 1.0f / (1.0f + expf(-x[i]));
+}
+
 // inkling2_loop decode attention: one wave per query head, online softmax over the KV
 // cache with a hidden-states-conditioned relative bias, a causal sliding-window mask, and
 // a per-head sink logit that absorbs probability mass before normalisation.

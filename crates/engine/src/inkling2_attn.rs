@@ -131,6 +131,69 @@ pub fn apply_output_gate(attn: &mut [f32], gate: &[f32]) {
     }
 }
 
+/// Unweighted RMSNorm, as used on V: divide by the root-mean-square of the head vector
+/// with no learned weight and no mean subtraction.
+pub fn unweighted_rmsnorm(x: &mut [f32], eps: f32) {
+    let mean_sq = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+    let inv = 1.0 / (mean_sq + eps).sqrt();
+    for v in x.iter_mut() {
+        *v *= inv;
+    }
+}
+
+/// Everything that happens to the raw projections after the matmuls and before attention:
+///
+/// * `q`: `scaled_l2_clip(scale_q, qk_clip)` per head,
+/// * `k`: 4-tap causal short convolution, then `l2_clip(qk_clip)` per head,
+/// * `v`: 4-tap causal short convolution, then unweighted RMSNorm per head,
+/// * `gate`: `sigmoid`.
+///
+/// The convolutions run per channel across time and chain through `cache_k`/`cache_v`, so
+/// this is the same code for prefill steps and decode steps. Ordering is transcribed from
+/// the reference: conv *before* the head split, so the head reduction sees convolved
+/// values.
+#[allow(clippy::too_many_arguments)]
+pub fn post_qkv(
+    q: &mut [f32],
+    k: &mut [f32],
+    v: &mut [f32],
+    gate: &mut [f32],
+    scale_q: &[f32],
+    conv_w_k: &[f32],
+    conv_w_v: &[f32],
+    cache_k: &mut [f32],
+    cache_v: &mut [f32],
+    heads: usize,
+    head_dim: usize,
+    kv_dim: usize,
+    qk_clip: f32,
+    eps: f32,
+) {
+    assert_eq!(q.len(), heads * head_dim);
+    assert_eq!(gate.len(), q.len());
+    assert_eq!(k.len(), kv_dim);
+    assert_eq!(v.len(), kv_dim);
+
+    // Per-head reductions first, on the raw projections, then the conv for k/v.
+    for h in 0..heads {
+        scaled_l2_clip(
+            &mut q[h * head_dim..(h + 1) * head_dim],
+            &scale_q[h * head_dim..(h + 1) * head_dim],
+            qk_clip,
+        );
+    }
+    short_conv1d_4tap(k, conv_w_k, cache_k, kv_dim);
+    short_conv1d_4tap(v, conv_w_v, cache_v, kv_dim);
+    let kv_heads = kv_dim / head_dim;
+    for h in 0..kv_heads {
+        l2_clip(&mut k[h * head_dim..(h + 1) * head_dim], qk_clip);
+        unweighted_rmsnorm(&mut v[h * head_dim..(h + 1) * head_dim], eps);
+    }
+    for g in gate.iter_mut() {
+        *g = 1.0 / (1.0 + (-*g).exp());
+    }
+}
+
 /// One query head attending over a KV cache, exactly as the reference orders it:
 /// `q.k^T * head_dim^-0.5 + relative_bias`, masked causal/window, softmax with the sink
 /// absorbing mass, then the weighted sum of `v`.
@@ -194,6 +257,103 @@ pub fn visible(pos_q: usize, pos_k: usize, window: Option<usize>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unweighted_rmsnorm_matches_the_definition() {
+        // RMS of (3,4) is sqrt(12.5); dividing gives (3,4)/sqrt(12.5).
+        let mut x = [3.0f32, 4.0];
+        unweighted_rmsnorm(&mut x, 0.0);
+        let inv = 1.0 / 12.5f32.sqrt();
+        assert!((x[0] - 3.0 * inv).abs() < 1e-6);
+        assert!((x[1] - 4.0 * inv).abs() < 1e-6);
+        // A zero vector stays finite thanks to eps.
+        let mut z = [0.0f32; 4];
+        unweighted_rmsnorm(&mut z, 1e-6);
+        assert!(z.iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn post_qkv_clips_q_scales_and_norms_v_in_the_documented_order() {
+        let (heads, head_dim) = (2usize, 2usize);
+        let kv_dim = 2 * head_dim; // 4 kv heads? no: kv_dim/head_dim = 2 kv heads
+        let mut q = vec![3.0f32, 4.0, 0.0, 0.0]; // head 0 norm 5, head 1 zero
+        let mut k = vec![1.0f32, 2.0, 3.0, 4.0];
+        let mut v = vec![1.0f32, 1.0, 1.0, 1.0];
+        let mut gate = vec![0.0f32, 100.0, -100.0, 0.0];
+        let scale_q = vec![1.0f32; 4];
+        let conv_w_k = vec![0.0f32; 4 * kv_dim]; // zero taps -> k becomes zero
+        let conv_w_v = vec![0.0f32; 4 * kv_dim];
+        let mut cache_k = vec![0.0f32; 3 * kv_dim];
+        let mut cache_v = vec![0.0f32; 3 * kv_dim];
+        post_qkv(
+            &mut q,
+            &mut k,
+            &mut v,
+            &mut gate,
+            &scale_q,
+            &conv_w_k,
+            &conv_w_v,
+            &mut cache_k,
+            &mut cache_v,
+            heads,
+            head_dim,
+            kv_dim,
+            2.0,
+            1e-6,
+        );
+        // q head 0 clipped to norm 2: (3,4)*0.4 = (1.2,1.6); head 1 stays zero and finite.
+        assert!((q[0] - 1.2).abs() < 1e-6 && (q[1] - 1.6).abs() < 1e-6);
+        assert_eq!(&q[2..4], &[0.0, 0.0]);
+        // Zero conv taps wipe k, and l2_clip leaves zero alone.
+        assert!(k.iter().all(|x| *x == 0.0));
+        // v conv yields zero, and RMSNorm of a zero vector is zero, not NaN.
+        assert!(v.iter().all(|x| *x == 0.0));
+        // gate is a sigmoid.
+        assert!((gate[0] - 0.5).abs() < 1e-6);
+        assert!((gate[1] - 1.0).abs() < 1e-6);
+        assert!(gate[2] < 1e-6);
+    }
+
+    #[test]
+    fn post_qkv_convolution_moves_time_forward_through_the_cache() {
+        // One head of width 1, taps [1,2,3,4] newest last, so streamed outputs are
+        // 4x[t] + 3x[t-1] + 2x[t-2] + 1x[t-3].
+        let (heads, head_dim, kv_dim) = (1usize, 1usize, 1usize);
+        let conv_w = vec![1.0f32, 2.0, 3.0, 4.0];
+        let mut cache_k = vec![0.0f32; 3];
+        let mut cache_v = vec![0.0f32; 3];
+        let scale_q = vec![1.0f32];
+        let mut seen = Vec::new();
+        for step in 1..=4 {
+            let mut q = vec![0.0f32];
+            let mut k = vec![step as f32];
+            let mut v = vec![0.0f32];
+            let mut gate = vec![0.0f32];
+            post_qkv(
+                &mut q,
+                &mut k,
+                &mut v,
+                &mut gate,
+                &scale_q,
+                &conv_w,
+                &conv_w,
+                &mut cache_k,
+                &mut cache_v,
+                heads,
+                head_dim,
+                kv_dim,
+                1e9,
+                1e-6,
+            );
+            seen.push(k[0]);
+        }
+        // step 1: 4*1 = 4 (after conv; l2_clip with a huge threshold leaves it).
+        assert!((seen[0] - 4.0).abs() < 1e-5);
+        // step 2: 4*2 + 3*1 = 11.
+        assert!((seen[1] - 11.0).abs() < 1e-5);
+        // step 4: 4*4 + 3*3 + 2*2 + 1*1 = 30.
+        assert!((seen[3] - 30.0).abs() < 1e-5);
+    }
 
     fn reference_decode(
         q: &[f32],
