@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" role="img" aria-labelledby="scoria-title scoria-desc">
+  <title id="scoria-title">scoria</title>
+  <desc id="scoria-desc">A faceted volcanic shard in three planes: the mark of scoria, an AMD-native LLM inference engine written in Rust.</desc>
+  <style>
+    .ink { fill: #14161a }
+    .magma { fill: #ff5a1f }
+  </style>
+  <path class="ink" d="M21.26 2 L43.9 8.04 L26.74 24 L4.1 17.96Z"/>
+  <path class="ink" d="M4.1 17.96 L26.74 24 L32.23 46Z"/>
+  <path class="magma" d="M43.9 8.04 L26.74 24 L32.23 46Z"/>
+</svg>
