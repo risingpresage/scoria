@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::ffi::{c_int, c_void, CString};
+use std::ffi::{CString, c_int, c_void};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr;
@@ -27,7 +27,7 @@ struct Stat {
     _pad1: [u8; 72],
 }
 
-extern "C" {
+unsafe extern "C" {
     fn open(pathname: *const i8, flags: c_int, ...) -> c_int;
     fn fstat(fd: c_int, statbuf: *mut Stat) -> c_int;
     fn close(fd: c_int) -> c_int;
@@ -370,8 +370,14 @@ pub struct TensorInfo {
 }
 
 impl TensorInfo {
-    pub fn n_elements(&self) -> usize {
-        self.dims.iter().map(|&d| d as usize).product()
+    /// Total element count, or `None` if the shape overflows `usize`.
+    ///
+    /// A GGUF header is attacker-controlled input; multiplying its dimensions
+    /// unchecked is a panic waiting for a malformed file.
+    pub fn n_elements(&self) -> Option<usize> {
+        self.dims
+            .iter()
+            .try_fold(1usize, |acc, &d| acc.checked_mul(usize::try_from(d).ok()?))
     }
 }
 
@@ -495,7 +501,11 @@ impl GgufFile {
         let header = GgufHeader::parse(bytes)?;
         let mut cur = Cursor::new(bytes, 24);
 
-        let mut metadata = HashMap::with_capacity(header.metadata_kv_count as usize);
+        // A declared count is a claim, not a fact: a 24-byte file can say `u64::MAX`
+        // entries and the allocator will abort. Bound every pre-allocation by what the
+        // file could physically contain.
+        let kv_cap = (header.metadata_kv_count as usize).min(bytes.len() / 8 + 1);
+        let mut metadata = HashMap::with_capacity(kv_cap);
         for _ in 0..header.metadata_kv_count {
             let key = cur.read_string()?;
             let val_type = cur.read_u32()?;
@@ -510,8 +520,9 @@ impl GgufFile {
             .unwrap_or(32);
 
         let n_tensors = header.tensor_count as usize;
-        let mut tensors = Vec::with_capacity(n_tensors);
-        let mut tensor_index = HashMap::with_capacity(n_tensors);
+        let tensor_cap = n_tensors.min(bytes.len() / 16 + 1);
+        let mut tensors = Vec::with_capacity(tensor_cap);
+        let mut tensor_index = HashMap::with_capacity(tensor_cap);
         for i in 0..n_tensors {
             let name = cur.read_string()?;
             let n_dims = cur.read_u32()? as usize;
@@ -623,7 +634,9 @@ impl GgufFile {
     }
 
     pub fn tensor_bytes(&self, info: &TensorInfo) -> Result<&[u8], GgufError> {
-        let n_elems = info.n_elements();
+        let n_elems = info.n_elements().ok_or_else(|| {
+            GgufError::Malformed(format!("tensor `{}` shape overflows usize", info.name))
+        })?;
         let byte_len = info.ggml_type.tensor_byte_len(n_elems)?;
         let start = self
             .data_offset

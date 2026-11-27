@@ -15,6 +15,27 @@ RDNA 4 (`gfx1201`) AMD-native LLM inference engine in Rust + standalone `.hip` k
 - **Crate DAG:** `scoria-hip-rt` depends on no `scoria-*` crate; `scoria-gguf` has zero GPU dependencies; `scoria-kernels` never depends on `scoria-engine` or `scoria-cli`.
 - **No unverified claims:** Every status update in `harness/features.json` or replies must cite observed output from `./scripts/check.sh` or `scoria gate`.
 
+## Testing & Correctness
+Correctness is enforced by deterministic rules, never by luck or by one green run on one machine.
+
+- **End-to-end tests are a requirement.** A change is not done until something exercises the real path: a
+  GGUF on disk parsed and run, a kernel actually launched, a graph captured and replayed. Unit tests alone
+  are not sufficient, and `./scripts/check.sh` is the floor rather than the goal.
+- **No `#[ignore]`, no sleep-and-hope, no wall-clock assertions, no unseeded RNG.** Every test must produce
+  the same verdict on every run. A flaky test is a bug in the test, not a fact of life.
+- **Tests are adversarial by nature.** For every parser, planner and kernel, attack the boundaries and the
+  hostile cases: empty and one-element inputs, block/size boundaries at ±1, truncated and oversized
+  buffers, counts that overflow, unaligned offsets, NaN/inf/denormal payloads, aliased in/out pointers, and
+  the degenerate shapes the caller will eventually hit.
+- **Assert invariants, not snapshots.** Prefer properties (monotonic, idempotent, round-trip,
+  conservation, "inverse inverts") over a blessed value nobody can re-derive.
+- **Golden values must cite their source**: a spec formula, a reference implementation, or a hand
+  computation written out in the test itself.
+- **Device code is correct only against a CPU reference** that computes the same function the slow way, at a
+  stated tolerance. New kernels ship with one.
+- **A test that cannot fail is not a test.** If reverting the fix would not turn it red, delete it or
+  strengthen it.
+
 ## Writing & Disclosure
 This rule exists because it was violated once and had to be fixed twice.
 
