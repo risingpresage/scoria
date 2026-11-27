@@ -63,6 +63,20 @@ pub mod infer_names {
     pub const GQA_ATTN_F32: &str = "gqa_attn_f32";
     pub const SILU_MUL_F32: &str = "silu_mul_f32";
     pub const ADD_INPLACE_F32: &str = "add_inplace_f32";
+    pub const ADD_RMSNORM_F32: &str = "add_rmsnorm_f32";
+    pub const ARGMAX_STAGE1_F32: &str = "argmax_stage1_f32";
+    pub const ARGMAX_STAGE2_F32: &str = "argmax_stage2_f32";
+    pub const GEMV_F16_F32: &str = "gemv_f16_f32";
+    pub const GEMV_Q5_0_F32: &str = "gemv_q5_0_f32";
+    pub const GEMV_Q8_0_F32: &str = "gemv_q8_0_f32";
+    pub const GEMV_Q4_K_F32: &str = "gemv_q4_k_f32";
+    pub const GEMV_Q6_K_F32: &str = "gemv_q6_k_f32";
+    pub const WMMA_PROBE_F16: &str = "wmma_probe_f16";
+    pub const GEMM_WMMA_F16: &str = "gemm_wmma_f16";
+    pub const GEMM_WMMA_Q5_0: &str = "gemm_wmma_q5_0";
+    pub const GEMM_WMMA_Q8_0: &str = "gemm_wmma_q8_0";
+    pub const GEMM_WMMA_Q4_K: &str = "gemm_wmma_q4_k";
+    pub const GEMM_WMMA_Q6_K: &str = "gemm_wmma_q6_k";
 }
 
 #[cfg(test)]
@@ -147,6 +161,8 @@ mod tests {
             "linear_q4_k",
             "linear_q6_k",
             "gqa_attn_f32",
+            "gemm_wmma_q4_k",
+            "v_wmma_f32_16x16x16_f16",
         ] {
             assert!(asm.contains(sym), "missing symbol `{sym}` in gfx1201 asm");
         }

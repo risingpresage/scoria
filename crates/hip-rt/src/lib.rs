@@ -520,6 +520,14 @@ impl Drop for HipEvent {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct KernelHandle {
+    raw: hipFunction_t,
+}
+
+unsafe impl Send for KernelHandle {}
+unsafe impl Sync for KernelHandle {}
+
 pub struct HipModule {
     raw: hipModule_t,
 }
@@ -537,6 +545,52 @@ impl HipModule {
             "hipModuleLoadData",
         )?;
         Ok(Self { raw })
+    }
+
+    pub fn resolve(&self, name: &str) -> HipResult<KernelHandle> {
+        let hip = get_api("hipModuleGetFunction")?;
+        let cname = CString::new(name).expect("kernel name must not contain NUL");
+        let mut func = ptr::null_mut();
+        check(
+            hip,
+            unsafe { (hip.hipModuleGetFunction)(&mut func, self.raw, cname.as_ptr()) },
+            "hipModuleGetFunction",
+        )?;
+        Ok(KernelHandle { raw: func })
+    }
+
+    /// Launches a pre-resolved kernel handle tied to this module.
+    ///
+    /// # Safety
+    /// Callers must ensure `handle` was resolved from `self`, `params` pointers match the device
+    /// kernel signature, and all buffers outlive execution.
+    pub unsafe fn launch_handle(
+        &self,
+        handle: KernelHandle,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem_bytes: u32,
+        stream: &HipStream,
+        params: &mut [*mut c_void],
+    ) -> HipResult<()> {
+        let hip = get_api("hipModuleLaunchKernel")?;
+        check(
+            hip,
+            (hip.hipModuleLaunchKernel)(
+                handle.raw,
+                grid[0],
+                grid[1],
+                grid[2],
+                block[0],
+                block[1],
+                block[2],
+                shared_mem_bytes,
+                stream.raw(),
+                params.as_mut_ptr(),
+                ptr::null_mut(),
+            ),
+            "hipModuleLaunchKernel",
+        )
     }
 
     pub fn function(&self, name: &str) -> HipResult<HipFunction<'_>> {

@@ -90,6 +90,7 @@ fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(2048);
     let no_bos = rest.iter().any(|a| a == "--no-bos");
     let ignore_eos = rest.iter().any(|a| a == "--ignore-eos");
+    let profile = rest.iter().any(|a| a == "--profile");
     let dump_logits = arg_val(rest, "--dump-logits").map(PathBuf::from);
     let tap_layer: Option<usize> = arg_val(rest, "--tap-layer")
         .map(|s| s.parse())
@@ -167,6 +168,25 @@ fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         res.prefill_ms, res.decode_ms
     );
     println!("decoded: {decoded}");
+    if profile {
+        let tok0 = res.generated.first().copied().unwrap_or(1);
+        let prof = model.profile_decode_step(&ctx, tok0)?;
+        let gpu_sum = prof.gemv_other_ms
+            + prof.q6k_ms
+            + prof.lm_head_ms
+            + prof.rmsnorm_ms
+            + prof.attn_ms
+            + prof.other_ms;
+        println!(
+            "profile_1step_ms: gpu_sum={gpu_sum:.3} gemv_q4k/other={:.3} q6k_layers={:.3} lm_head={:.3} rmsnorm={:.3} attn={:.3} other={:.3}",
+            prof.gemv_other_ms,
+            prof.q6k_ms,
+            prof.lm_head_ms,
+            prof.rmsnorm_ms,
+            prof.attn_ms,
+            prof.other_ms
+        );
+    }
     Ok(())
 }
 

@@ -60,9 +60,17 @@
       "observed": "12/12 tokenizer exact match vs llama-tokenize; Qwen2.5-0.5B-Q4_K_M cos=0.999774 top1=true greedy_32=32/32 (1114.52 prefill / 247.79 decode tok/s); DeepSeek-R1-Distill-Qwen-7B-Q4_K_M cos=0.999913 top5_exact=true greedy_prefix=21/32 (55.41 prefill / 40.02 decode tok/s); Qwen2.5-3B-F16 cos=0.9999995 max_abs_diff=0.0273 greedy_16=16/16"
     },
     {
+      "id": "phase2a-gfx1201-perf",
+      "phase": 2,
+      "title": "Phase 2A RX 9070 XT kernels: KernelHandle, GPU argmax, uint4 Split-K GEMV, 4-wave float4 FlashDecoding, fused add_rmsnorm, and v_wmma FP16 prefill GEMM",
+      "status": "verified",
+      "verify": "./scripts/check.sh && python3 scripts/bench_cac.py --tag phase2a_final --trials 3",
+      "observed": "DeepSeek-R1-Distill-Qwen-7B-Q4_K_M: decode=111.94 tok/s (2.83x Phase 1), prefill(20)=673.11 tok/s (1.29x llama.cpp Vulkan 521.05), prefill(128)=2079.89 tok/s (31.27x Phase 1); Qwen2.5-0.5B-Q4_K_M: decode=386.22 tok/s, prefill(26)=4356.28 tok/s, prefill(128)=15534.62 tok/s; parity cos=0.999413 (0.5B, 32/32) and 0.999913 (7B, 21/32, top5 exact)"
+    },
+    {
       "id": "phase2-amd-repack-wmma",
       "phase": 2,
-      "title": "Load-time Wave32 repacking (H4F8/Q4W32), WMMA GEMM, LDS LM head, hipGraph",
+      "title": "Load-time Wave32 repacking (H4F8/Q4W32), Q8_1 dot4 GEMV, and hipGraph capture",
       "status": "pending",
       "verify": "cargo test --workspace"
     },

@@ -1,0 +1,85 @@
+{
+  "phase": "2a",
+  "arch": "gfx1201",
+  "gpu": "AMD Radeon RX 9070 XT (16 GiB GDDR6, 64 CUs, Wave32)",
+  "ledger": "harness/ledger.jsonl",
+  "benchmark_script": "scripts/bench_cac.py",
+  "decode_tokens": 64,
+  "trials": 3,
+  "phase1_baseline": {
+    "tag": "phase1_baseline",
+    "qwen2.5-0.5b-q4_k_m": {
+      "short_prompt_tokens": 26,
+      "short_prefill_tok_s_median": 1133.69,
+      "prefill_128_tok_s_median": 1452.91,
+      "short_decode_tok_s_median": 249.13
+    },
+    "deepseek-r1-distill-qwen-7b-q4_k_m": {
+      "short_prompt_tokens": 20,
+      "short_prefill_tok_s_median": 57.38,
+      "prefill_128_tok_s_median": 66.51,
+      "short_decode_tok_s_median": 39.49
+    }
+  },
+  "phase2a_final": {
+    "tag": "phase2a_final",
+    "qwen2.5-0.5b-q4_k_m": {
+      "short_prompt_tokens": 26,
+      "short_prefill_tok_s_median": 4356.28,
+      "prefill_128_tok_s_median": 15534.62,
+      "short_decode_tok_s_median": 386.22,
+      "speedup_vs_phase1": {
+        "prefill_short": 3.84,
+        "prefill_128": 10.69,
+        "decode": 1.55
+      }
+    },
+    "deepseek-r1-distill-qwen-7b-q4_k_m": {
+      "short_prompt_tokens": 20,
+      "short_prefill_tok_s_median": 673.11,
+      "prefill_128_tok_s_median": 2079.89,
+      "short_decode_tok_s_median": 111.94,
+      "speedup_vs_phase1": {
+        "prefill_short": 11.73,
+        "prefill_128": 31.27,
+        "decode": 2.83
+      }
+    },
+    "deepseek_7b_decode_1step_profile_ms": {
+      "gpu_sum": 10.854,
+      "gemv_q4k_other": 6.655,
+      "q6k_layers": 1.581,
+      "lm_head": 0.746,
+      "rmsnorm": 0.581,
+      "attn": 0.602,
+      "other": 0.689
+    }
+  },
+  "llama_cpp_vulkan_radv_reference": {
+    "qwen2.5-0.5b-q4_k_m": {
+      "eval_tok_s": 622.72
+    },
+    "deepseek-r1-distill-qwen-7b-q4_k_m": {
+      "prompt_eval_tok_s": 521.05,
+      "eval_tok_s": 123.32
+    }
+  },
+  "parity_vs_llama_cpp_cpu": {
+    "qwen2.5-0.5b-chat": {
+      "prompt_tokens": 26,
+      "cosine_sim": 0.999413,
+      "max_abs_diff": 0.8010,
+      "top1_match": true,
+      "top5_exact_match": true,
+      "greedy_prefix_match": "32/32"
+    },
+    "deepseek-7b-chat": {
+      "prompt_tokens": 20,
+      "cosine_sim": 0.999913,
+      "max_abs_diff": 0.8101,
+      "top1_match": true,
+      "top5_exact_match": true,
+      "greedy_prefix_match": "21/32"
+    }
+  }
+}

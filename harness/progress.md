@@ -26,5 +26,14 @@
   - `Qwen2.5-3B-Instruct-f16.gguf` (no activation quant): `cos = 0.999999503`, `max_abs_diff = 0.0273`, `mean_abs_diff = 0.003887`, `16/16` exact greedy tokens.
 - Downloaded Phase 2/3 target GGUFs to `/mnt/nuclearmissilesilo/models/{bonsai,inkling}` (symlinked into `~/models/{bonsai,inkling}`): `Ternary-Bonsai-2-2B-{PTQ1_0,Q2_0}`, `Ternary-Bonsai-2.5-27B-{PTQ1_0,Q2_0}-mtp` (`qwen35` hybrid SSM+attn + `prism.hadamard.*`), `dspark-Inkling-2-Mini-Q8_0` (`dflash`), `Inkling-2-Mini-UD-Q3_K_XL` (`inkling2_loop`, 24 layers looped 3x on 6..18, 128-expert MoE).
 
+## 2026-11-26 — Phase 2A Complete (`gfx1201` Decode & WMMA Prefill Optimization)
+- Recorded ceilings & C-A-C experiment ledger in `harness/THEORY.md`, `harness/PLAN.md`, `harness/ledger.jsonl`, and `harness/baselines/phase2a_gfx1201.json` via `scripts/bench_cac.py` (`--trials 3`).
+- Eliminated host bottlenecks and added declarative Rust metaprogramming: `KernelHandle` cache + `define_infer_kernels!` in `crates/engine/src/lib.rs`, `KernelArg` + `hip_launch!` in `crates/engine/src/qwen2.rs`, 2-stage GPU `argmax_stage{1,2}_f32`, and `--profile` instrumentation in `scoria run`.
+- Rewrote hot decode kernels: fused `add_rmsnorm_f32` (`float4`), 4-wave split-T `gqa_attn_f32` (`float4`/`float2` coalesced KV loads; 7B attention dropped `2.844 -> 0.602 ms`), and 2-row/WG Split-K `gemv_q4_k_f32` (`12` `global_load_b128` loads, `0` byte loads) + `gemv_q6_k_f32` (`lm_head` at `597 GB/s`).
+- Verified exact `v_wmma_f32_16x16x16_f16` fragment layout on `gfx1201` (`wmma_probe_f16`: `err_a=0.000000`) and shipped shared templated `gemm_wmma_{f16,q5_0,q8_0,q4_k,q6_k}` (`BM=32, BN=64, BK=32`) with `gpu_wmma_prefill_parity` unit tests (`M=20, 64`) and `gfx942` portability preserved.
+- Phase 2A 3-trial medians on RX 9070 XT (`harness/baselines/phase2a_gfx1201.json`):
+  - `DeepSeek-R1-Distill-Qwen-7B-Q4_K_M`: decode `111.94 tok/s` (`2.83x` Phase 1 `39.49`), prefill(20) `673.11 tok/s` (`1.29x` `llama.cpp` Vulkan `521.05`), prefill(128) `2079.89 tok/s` (`31.27x` Phase 1 `66.51`). Parity vs `libllama.so` CPU: `cos=0.999913`, `top1=true`, `top5=true`, `21/32` greedy prefix.
+  - `Qwen2.5-0.5B-Instruct-Q4_K_M`: decode `386.22 tok/s` (`1.55x` Phase 1), prefill(26) `4356.28 tok/s` (`3.84x`), prefill(128) `15534.62 tok/s` (`10.69x`). Parity vs `libllama.so` CPU: `cos=0.999413`, `top1=true`, `top5=true`, `32/32` greedy tokens.
+
 ## Next Step
-- Phase 2: Load-time Wave32 repacking (`H4F8` / `Q4W32` / `BITCOS` / `PTQ1_0`), `v_wmma` prefill GEMM, `v_permlane16_var_b32` / popcount decode, and `hipGraph` capture targeting `> llama.cpp` Vulkan on RX 9070 XT.
+- Phase 2B / Phase 3: `hipGraph` capture + `Q8_1` `v_dot4_i32_i8` / Wave32 repacked GEMV to surpass `123.32 tok/s` decode, then Bonsai 2.5 (`qwen35` + Hadamard + `PTQ1_0` ternary popcount) & Inkling 2 Mini (`inkling2_loop` + `io_uring` `O_DIRECT` MoE), plus Remotion ASCII/audio demo video from `phase2a_gfx1201.json`.
