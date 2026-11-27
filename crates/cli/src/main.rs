@@ -969,6 +969,23 @@ fn cmd_logits(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    if rest.iter().any(|a| a == "--proj-selftest") {
+        let mut model = Model::open_with_router(path, router)?;
+        if !rest.iter().any(|a| a == "--no-gpu") {
+            model.enable_gpu().map_err(|e| format!("gpu: {e}"))?;
+        }
+        let m = arg_val(rest, "--proj-m")
+            .map(|v| v.parse::<usize>().unwrap_or(8))
+            .unwrap_or(8);
+        for (layer, worst) in model.projection_selftest(m) {
+            println!(
+                "layer {layer:>2} (m={m}): q {:.5} k {:.5} v {:.5} rel {:.5} gate {:.5} sink {:.5}",
+                worst[0], worst[1], worst[2], worst[3], worst[4], worst[5]
+            );
+        }
+        return Ok(());
+    }
+
     if bench {
         // Pure host measurement: no VRAM, so it cannot collide with anything else.
         report_dequant(&model);

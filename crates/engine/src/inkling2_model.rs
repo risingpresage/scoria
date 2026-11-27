@@ -730,6 +730,98 @@ impl Gpu {
         }
     }
 
+    /// The six projections for a whole chunk: one upload per distinct input (`qn` feeds q,
+    /// gate, rel and sink), one launch per projection with `m = chunk`, and a single
+    /// synchronisation.
+    #[allow(clippy::too_many_arguments)]
+    fn run_projections_chunk(
+        &mut self,
+        bufs: GpuPtrs,
+        qn: &[f32],
+        kn: &[f32],
+        vn: &[f32],
+        m: usize,
+        n_heads: usize,
+        head_dim: usize,
+        kv_dim: usize,
+        d_rel: usize,
+    ) -> [Vec<f32>; 6] {
+        let n_embd = qn.len() / m;
+        let q_dim = n_heads * head_dim;
+        let dims = [q_dim, kv_dim, kv_dim, n_heads * d_rel, q_dim, n_heads];
+        // Input regions in the upload buffer: qn, then kn, then vn. All three inputs are
+        // `n_embd` wide -- `kv_dim` is the *output* width of the k/v projections, and using
+        // it as the input stride was the bug that made only k and v wrong.
+        let x_off = [0usize, m * n_embd, 2 * m * n_embd, 0, 0, 0];
+        let in_dim = [n_embd, n_embd, n_embd, n_embd, n_embd, n_embd];
+        let weights = [bufs.q, bufs.k, bufs.v, bufs.rel, bufs.gate, bufs.sink];
+
+        let mut flat = Vec::with_capacity(3 * m * n_embd);
+        flat.extend_from_slice(qn);
+        flat.extend_from_slice(kn);
+        flat.extend_from_slice(vn);
+        let bytes =
+            unsafe { std::slice::from_raw_parts(flat.as_ptr() as *const u8, flat.len() * 4) };
+        self.x.copy_from_host(bytes).expect("H2D chunk projections");
+
+        let mut offsets = [0usize; 6];
+        let mut total = 0usize;
+        for (i, d) in dims.iter().enumerate() {
+            offsets[i] = total;
+            total += d * m;
+        }
+        let waves_per_wg = 256u32 / self.wave_size.max(1);
+        for i in 0..6 {
+            let mut arg_w = weights[i];
+            let mut arg_x =
+                unsafe { (self.x.as_ptr() as *mut u8).add(x_off[i] * 4) as *mut c_void };
+            let mut arg_bias: *mut c_void = std::ptr::null_mut();
+            let mut arg_y =
+                unsafe { (self.y.as_ptr() as *mut u8).add(offsets[i] * 4) as *mut c_void };
+            let mut arg_m = m as u32;
+            let mut arg_n = dims[i] as u32;
+            let mut arg_k = in_dim[i] as u32;
+            let mut args: [*mut c_void; 7] = [
+                &mut arg_w as *mut *mut c_void as *mut c_void,
+                &mut arg_x as *mut *mut c_void as *mut c_void,
+                &mut arg_bias as *mut *mut c_void as *mut c_void,
+                &mut arg_y as *mut *mut c_void as *mut c_void,
+                &mut arg_m as *mut u32 as *mut c_void,
+                &mut arg_n as *mut u32 as *mut c_void,
+                &mut arg_k as *mut u32 as *mut c_void,
+            ];
+            unsafe {
+                self.ctx
+                    .infer_module
+                    .launch_handle(
+                        self.ctx.infer.linear_f32,
+                        [
+                            ((dims[i] as u32).div_ceil(waves_per_wg)).max(1),
+                            m as u32,
+                            1,
+                        ],
+                        [256, 1, 1],
+                        0,
+                        &self.stream,
+                        &mut args,
+                    )
+                    .expect("chunked projection launch");
+            }
+        }
+        self.stream.synchronize().expect("projection sync");
+        let mut all = vec![0f32; total];
+        let out_bytes =
+            unsafe { std::slice::from_raw_parts_mut(all.as_mut_ptr() as *mut u8, total * 4) };
+        self.y
+            .copy_to_host(out_bytes)
+            .expect("D2H chunk projections");
+        let mut out: [Vec<f32>; 6] = Default::default();
+        for i in 0..6 {
+            out[i] = all[offsets[i]..offsets[i] + dims[i] * m].to_vec();
+        }
+        out
+    }
+
     /// One launch per group, one synchronisation: `groups` is
     /// `(expert, offset, count)` and `x_flat`/`y_flat` are indexed at
     /// `offset * k` / `offset * n_out`. This is how a batched prefill runs the experts: the
@@ -1766,6 +1858,104 @@ impl Model {
         (residual, moe_in)
     }
 
+    /// The six projections for a whole chunk, split back into one set per position.
+    fn project_chunk(&mut self, layer: usize, ins: &[AttnInputs]) -> Vec<[Vec<f32>; 6]> {
+        let m = ins.len();
+        let lw = &self.layers[layer];
+        let (n_heads, head_dim, kv_dim, d_rel) = (lw.n_heads, lw.head_dim, lw.kv_dim, lw.d_rel);
+        let bufs = self.gpu.as_ref().map(|g| {
+            let gl = &g.layers[layer];
+            GpuPtrs {
+                q: gl.q.as_ptr(),
+                k: gl.k.as_ptr(),
+                v: gl.v.as_ptr(),
+                gate: gl.gate.as_ptr(),
+                rel: gl.rel.as_ptr(),
+                sink: gl.sink.as_ptr(),
+                o: gl.o.as_ptr(),
+            }
+        });
+        let Some(bufs) = bufs.filter(|_| m > 1) else {
+            return ins
+                .iter()
+                .map(|i| self.project_position(layer, i))
+                .collect();
+        };
+
+        let mut qn = Vec::with_capacity(m * self.cfg.n_embd);
+        let mut kn = Vec::new();
+        let mut vn = Vec::new();
+        for i in ins {
+            qn.extend_from_slice(&i.qn);
+            kn.extend_from_slice(&i.kn);
+            vn.extend_from_slice(&i.vn);
+        }
+        let t = std::time::Instant::now();
+        let flat = self
+            .gpu
+            .as_mut()
+            .expect("gpu")
+            .run_projections_chunk(bufs, &qn, &kn, &vn, m, n_heads, head_dim, kv_dim, d_rel);
+        self.profile.gpu_proj += t.elapsed().as_secs_f64();
+
+        let dims = [
+            n_heads * head_dim,
+            kv_dim,
+            kv_dim,
+            n_heads * d_rel,
+            n_heads * head_dim,
+            n_heads,
+        ];
+        (0..m)
+            .map(|p| {
+                let mut per: [Vec<f32>; 6] = Default::default();
+                for j in 0..6 {
+                    let d = dims[j];
+                    per[j] = flat[j][p * d..(p + 1) * d].to_vec();
+                }
+                per
+            })
+            .collect()
+    }
+
+    /// Compare the batched projection launch against the verified per-position path. Used by
+    /// `--proj-selftest`: the batched path produced wrong logits once, and this is the
+    /// smallest possible reproduction of that failure.
+    pub fn projection_selftest(&mut self, m: usize) -> Vec<(usize, [f32; 6])> {
+        let mut worst = Vec::new();
+        let n_embd = self.cfg.n_embd;
+        for layer in [0usize, 5, 12, 23] {
+            let ins: Vec<AttnInputs> = (0..m)
+                .map(|p| {
+                    let mk = |salt: usize| -> Vec<f32> {
+                        (0..n_embd)
+                            .map(|i| (((i + salt) * 37 % 211) as f32 - 105.0) * 1e-3)
+                            .collect()
+                    };
+                    AttnInputs {
+                        block_residual: vec![0.0; n_embd],
+                        qn: mk(p),
+                        kn: mk(p + 1),
+                        vn: mk(p + 2),
+                        tau: 1.0,
+                    }
+                })
+                .collect();
+            let batched = self.project_chunk(layer, &ins);
+            let mut layer_worst = [0f32; 6];
+            for (p, i) in ins.iter().enumerate() {
+                let single = self.project_position(layer, i);
+                for j in 0..6 {
+                    for (a, b) in batched[p][j].iter().zip(&single[j]) {
+                        layer_worst[j] = layer_worst[j].max((a - b).abs());
+                    }
+                }
+            }
+            worst.push((layer, layer_worst));
+        }
+        worst
+    }
+
     /// One position through a visit: inputs, projections, then the rest.
     fn attention_half(
         &mut self,
@@ -2101,13 +2291,28 @@ impl Model {
         self.profile.visits += n;
         let mut residuals: Vec<Vec<f32>> = Vec::with_capacity(n);
         let mut moe_ins: Vec<Vec<f32>> = Vec::with_capacity(n);
+        let mut msgs: Vec<Option<Vec<Vec<f32>>>> = Vec::with_capacity(n);
+        let mut ins_all: Vec<AttnInputs> = Vec::with_capacity(n);
         for i in 0..n {
             // The log-scale uses the token's absolute position.
             self.pos = base_pos + i + 1;
             let msg = prev.map(|(pb, ph)| self.messages(layer, &pb[i], &ph[i], i));
+            ins_all.push(self.attn_inputs(layer, &h[i], &blocks[i], msg.as_deref()));
+            msgs.push(msg);
+        }
+        let mut proj_all = self.project_chunk(layer, &ins_all);
+        for i in 0..n {
             let mut blk = std::mem::take(&mut blocks[i]);
-            let (residual, moe_in) =
-                self.attention_half(layer, &h[i], &mut blk, msg.as_deref(), visit);
+            let proj = std::mem::take(&mut proj_all[i]);
+            let (residual, moe_in) = self.attn_finish(
+                layer,
+                &h[i],
+                &ins_all[i],
+                proj,
+                &mut blk,
+                visit,
+                msgs[i].as_deref(),
+            );
             blocks[i] = blk;
             residuals.push(residual);
             moe_ins.push(moe_in);

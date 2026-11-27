@@ -7,6 +7,15 @@
   ],
   "features": [
     {
+      "id": "phase3-inkling2-batched-projections",
+      "phase": 3,
+      "title": "m=chunk projection GEMVs: exact, but prefill still slower than decode",
+      "status": "partial",
+      "verify": "scoria logits <gguf> --proj-selftest --proj-m 8 && scoria logits <gguf> --perp <text> --prefill-chunk 8 --compare-single",
+      "observed": "Batched projection launch matches the per-position path exactly (0.00000 per projection at m=2 and m=8); model-level 3.8e-5 with argmax matching at every position; perplexity 7.598. Root cause of the earlier garbage was kn/vn being n_embd wide while kv_dim was used as the input stride. Prefill is still slower: chunk 1 = 40.6 s/token, chunk 32 = 7.7 s/token, against decode 0.60 s/token.",
+      "note": "The chunk path spends 0.641 s of GPU expert time per visit versus 0.0035 s for the same call in decode (170x). Earlier 0.97-1.82 s/token prefill figures came from runs where residency had collapsed to 2.76 GiB and the MoE ran on the host, so the chunk path is faster without GPU experts than with them. That pathology is not isolated yet."
+    },
+    {
       "id": "phase3-inkling2-iq3xxs",
       "phase": 3,
       "title": "IQ3_XXS device codec (generated tables), 16 of 24 layers resident",

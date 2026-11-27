@@ -303,6 +303,28 @@ Rather than ship it, I reverted to the verified per-position path. What survives
 
 **Honest state:** decode 0.39-0.47 s/token, prefill ~1.6 s/token at chunk 8, no encode win, no projection batching, largest context run 1100 tokens.
 
+## 2026-11-28 — batched projections fixed and exact; prefill still loses, and now for a different reason
+**The fix.** The m=chunk projection launch was wrong because `kn` and `vn` are `n_embd` wide while I used `kv_dim` — the *output* width of the k/v projections — as both the upload stride and the dot length. Only k and v were wrong, and at m=1 the batched path silently fell back to the per-position one, so the earlier "verification" never exercised it. That is the second time this turn has been bitten by a test that could not fail.
+
+`--proj-selftest` now compares the batched launch against the per-position path per projection:
+
+| m | q | k | v | rel | gate | sink |
+| 2 | 0.00000 | 0.00000 | 0.00000 | 0.00000 | 0.00000 | 0.00000 |
+| 8 | 0.00000 | 0.00000 | 0.00000 | 0.00000 | 0.00000 | 0.00000 |
+
+and the model-level check agrees with the single-position oracle at 3.8e-5 with the argmax matching at every position, perplexity 7.598.
+
+**But prefill is slower, not faster, and the reason is not the projections.** With all 16 resident layers actually resident (12.16 GiB), the chunk path spends **0.641 s of GPU expert time per visit** where the identical `moe_forward_parts` call in decode spends 0.0035 s — a 170x difference in code I believed shared:
+
+| path | per visit | per token |
+| decode (`--length 5`) | 0.0073 s | 0.60 s |
+| prefill chunk 1 | 0.818 s | 40.6 s |
+| prefill chunk 32 | — | 7.7 s |
+
+The telling detail: the earlier 0.97-1.82 s/token prefill figures came from runs where VRAM was held by stale processes, residency had collapsed to 2.76 GiB, and the MoE therefore ran on the **host**. The chunk path is ~25x faster *without* GPU experts than with them, which points at something in how the chunk orchestration drives the GPU expert path (launch/synchronise interaction, or the batched buffers) rather than at the expert code itself. I did not isolate it.
+
+**So: encode is not faster.** It is correct, and the projection batching it needed is now proven exact, but the chunk path needs that GPU-expert pathology found before prefill can be measured meaningfully.
+
 ## Parity gate calibration (cosine > 0.999 is prompt-dependent, not an implementation defect)
 - Measured the control that settles it: **llama.cpp's own Vulkan backend vs llama.cpp's own CPU backend** scores `cos = 0.997985` (`maxdiff 1.152`) on the Qwen3-4B harness chat prompt (`151644,872,198,785,…,77091,198`, `m=13`), where scoria scores `0.997652` (`maxdiff 1.103`). Both pick top1 `785`. No GPU implementation reaches 0.999 on that prompt.
 - Forcing prefill onto the scalar FP32 GEMM (`SCORIA_PREFILL_FP32=1`) changes nothing: 4B `0.997614` vs `0.997652` for FP16 WMMA, 8B `0.996415` vs `0.996404`. So the deficit is **not** FP16 WMMA rounding.
