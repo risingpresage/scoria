@@ -145,6 +145,13 @@ pub enum GgmlType {
     Q6K,
     Q8K,
     BF16,
+    IQ2XXS,
+    IQ2XS,
+    IQ3XXS,
+    IQ4NL,
+    IQ3S,
+    IQ2S,
+    NVFP4,
     Unknown(u32),
 }
 
@@ -165,7 +172,14 @@ impl GgmlType {
             13 => Self::Q5K,
             14 => Self::Q6K,
             15 => Self::Q8K,
+            16 => Self::IQ2XXS,
+            17 => Self::IQ2XS,
+            18 => Self::IQ3XXS,
+            20 => Self::IQ4NL,
+            21 => Self::IQ3S,
+            22 => Self::IQ2S,
             30 => Self::BF16,
+            40 => Self::NVFP4,
             other => Self::Unknown(other),
         }
     }
@@ -186,6 +200,13 @@ impl GgmlType {
             Self::Q5K => 13,
             Self::Q6K => 14,
             Self::Q8K => 15,
+            Self::IQ2XXS => 16,
+            Self::IQ2XS => 17,
+            Self::IQ3XXS => 18,
+            Self::IQ4NL => 20,
+            Self::IQ3S => 21,
+            Self::IQ2S => 22,
+            Self::NVFP4 => 40,
             Self::BF16 => 30,
             Self::Unknown(v) => v,
         }
@@ -196,7 +217,14 @@ impl GgmlType {
             Self::F32 | Self::F16 | Self::BF16 => Some(1),
             Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_1 => Some(32),
             Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => Some(256),
-            Self::Unknown(_) => None,
+            Self::IQ4NL => Some(32),
+            Self::NVFP4 => Some(64),
+            Self::IQ2XXS
+            | Self::IQ2XS
+            | Self::IQ3XXS
+            | Self::IQ3S
+            | Self::IQ2S
+            | Self::Unknown(_) => None,
         }
     }
 
@@ -216,7 +244,14 @@ impl GgmlType {
             Self::Q5K => Some(176),
             Self::Q6K => Some(210),
             Self::Q8K => Some(292),
-            Self::Unknown(_) => None,
+            Self::IQ4NL => Some(18),
+            Self::NVFP4 => Some(36),
+            Self::IQ2XXS
+            | Self::IQ2XS
+            | Self::IQ3XXS
+            | Self::IQ3S
+            | Self::IQ2S
+            | Self::Unknown(_) => None,
         }
     }
 

@@ -278,10 +278,15 @@ pub fn engine_supports(t: GgmlType) -> bool {
         t,
         GgmlType::F32
             | GgmlType::F16
+            | GgmlType::BF16
             | GgmlType::Q5_0
             | GgmlType::Q8_0
+            | GgmlType::Q3K
             | GgmlType::Q4K
+            | GgmlType::Q5K
             | GgmlType::Q6K
+            | GgmlType::IQ4NL
+            | GgmlType::NVFP4
     )
 }
 

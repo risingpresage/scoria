@@ -38,10 +38,10 @@ fn compile_arch(hip_src: &Path, arch: &str, out_path: &Path) {
     }
     // Nixpkgs ships clang and the OCML/OCKL device bitcode as separate outputs, so the
     // device library path has to be passed explicitly or `cosf`/`expf` fail to link.
-    if let Some(libs) = env::var_os("SCORIA_ROCM_DEVICE_LIB").map(PathBuf::from) {
-        if libs.is_dir() {
-            cmd.arg(format!("--rocm-device-lib-path={}", libs.display()));
-        }
+    if let Some(libs) = env::var_os("SCORIA_ROCM_DEVICE_LIB").map(PathBuf::from)
+        && libs.is_dir()
+    {
+        cmd.arg(format!("--rocm-device-lib-path={}", libs.display()));
     }
     let output = cmd
         .arg(hip_src)

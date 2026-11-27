@@ -7,6 +7,15 @@
   ],
   "features": [
     {
+      "id": "phase3-dequant-five-types",
+      "phase": 3,
+      "title": "Dequantise BF16, Q5_K, Q3_K, IQ4_NL and NVFP4; identify GGML type 40 as NVFP4",
+      "status": "verified",
+      "verify": "cargo test -p scoria-gguf && ./target/release/scoria arch-check /home/noorm/models/inkling/Inkling-2-Mini-UD-Q3_K_XL.gguf",
+      "observed": "14 lib tests + 10 adversarial integration tests pass. arch-check on Inkling-2-Mini-UD-Q3_K_XL now lists only four unsupported types (IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S) instead of nine; every other role reports `ok`. Type 40 is 4.5 bits/weight = 8 bytes E2M1 + 1 byte UE4M3 scale per 16 values, i.e. NVFP4, matching ggml's `block_nvfp4` (36 bytes / 64 elements).",
+      "note": "The four remaining IQ types need ggml's grid/codebook tables (256-1024 entries each), which is data entry rather than arithmetic."
+    },
+    {
       "id": "phase3-inkling2-contract",
       "phase": 3,
       "title": "inkling2_loop architecture contract: 42 tensor roles, layer variants, loop schedule, checked against the checkpoint",
