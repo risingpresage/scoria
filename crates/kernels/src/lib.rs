@@ -62,6 +62,7 @@ pub mod infer_names {
     pub const LINEAR_Q6_K: &str = "linear_q6_k";
     pub const ROPE_NEOX_F32: &str = "rope_neox_f32";
     pub const KV_CACHE_APPEND_F32: &str = "kv_cache_append_f32";
+    pub const QK_NORM_ROPE_KV_F32: &str = "qk_norm_rope_kv_f32";
     pub const GQA_ATTN_F32: &str = "gqa_attn_f32";
     pub const SILU_MUL_F32: &str = "silu_mul_f32";
     pub const ADD_INPLACE_F32: &str = "add_inplace_f32";
@@ -75,6 +76,10 @@ pub mod infer_names {
     pub const GEMV_Q4_K_F32: &str = "gemv_q4_k_f32";
     pub const GEMV_Q4_K_R4_F32: &str = "gemv_q4_k_r4_f32";
     pub const GEMV_Q4_K_R8_F32: &str = "gemv_q4_k_r8_f32";
+    pub const GEMV_Q4_K_GATE_UP_SILU_F32: &str = "gemv_q4_k_gate_up_silu_f32";
+    pub const QUANTIZE_Q8_1_F32: &str = "quantize_q8_1_f32";
+    pub const GEMV_Q4_K_Q8_1_F32: &str = "gemv_q4_k_q8_1_f32";
+    pub const GEMV_Q4_K_GATE_UP_SILU_Q8_1_F32: &str = "gemv_q4_k_gate_up_silu_q8_1_f32";
     pub const GEMV_Q6_K_F32: &str = "gemv_q6_k_f32";
     pub const WMMA_PROBE_F16: &str = "wmma_probe_f16";
     pub const GEMM_WMMA_F16: &str = "gemm_wmma_f16";
@@ -175,6 +180,8 @@ mod tests {
             "linear_q6_k",
             "gemv_q4_k_r4_f32",
             "gemv_q4_k_r8_f32",
+            "gemv_q4_k_q8_1_f32",
+            "v_dot4_i32_iu8",
             "gqa_attn_f32",
             "gemm_wmma_q4_k",
             "gemm_wmma_narrow_q4_k",

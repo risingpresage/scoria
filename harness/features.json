@@ -68,6 +68,15 @@
       "observed": "DeepSeek-R1-Distill-Qwen-7B-Q4_K_M: decode=111.94 tok/s (2.83x Phase 1), prefill(20)=673.11 tok/s (1.29x llama.cpp Vulkan 521.05), prefill(128)=2079.89 tok/s (31.27x Phase 1); Qwen2.5-0.5B-Q4_K_M: decode=386.22 tok/s, prefill(26)=4356.28 tok/s, prefill(128)=15534.62 tok/s; parity cos=0.999413 (0.5B, 32/32) and 0.999913 (7B, 21/32, top5 exact)"
     },
     {
+      "id": "phase2c-fuse-q8-wmma-dbuf",
+      "phase": 2,
+      "title": "Fused qk-norm+RoPE+KV-append, Q8_1 integer-dot Q4_K GEMV with fused gate/up/SiLU, and double-buffered WMMA prefill",
+      "status": "verified",
+      "verify": "./scripts/check.sh && python3 scripts/bench_cac.py --tag phase2c_final --trials 3",
+      "observed": "fmt/clippy -D warnings/lint-arch/workspace tests pass (ISA assertion includes `v_dot4_i32_iu8` on gfx1201). harness/ledger.jsonl phase2c_final 3-trial medians: 4B decode 156.02 / pp128 3946.02, 8B 99.19 / 2328.48, 7B 113.52 / 2767.62, 0.5B 413.24 / 15619.19. Versus the phase2b record this is prefill +9% (4B), +29% (7B), +4% (8B) and decode roughly flat (+1% 4B, +1% 7B, -0.7% 8B).",
+      "note": "Targets still unmet: 4B needs >189.32 decode / >5826.04 pp128, 8B needs >111.73 / >3902.77."
+    },
+    {
       "id": "phase2b-qwen3-baselines",
       "phase": 2,
       "title": "Qwen3 architecture support, hipGraph decode capture, adaptive Q4_K GEMV rows, and 64x128 prefill WMMA",

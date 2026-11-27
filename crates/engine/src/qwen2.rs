@@ -242,6 +242,7 @@ struct ScratchBuffers {
     pos: DeviceBuf,
     hidden: DeviceBuf,
     normed: DeviceBuf,
+    x_q8_1: DeviceBuf,
     q: DeviceBuf,
     k: DeviceBuf,
     v: DeviceBuf,
@@ -261,12 +262,14 @@ impl ScratchBuffers {
         let f32_sz = std::mem::size_of::<f32>();
         let q_dim = cfg.n_heads * cfg.head_dim;
         let kv_dim = cfg.n_kv_heads * cfg.head_dim;
+        let max_q8_k = cfg.n_embd.max(q_dim).max(cfg.n_ff);
         Ok(Self {
             max_batch,
             token_ids: DeviceBuf::alloc(max_batch * std::mem::size_of::<u32>())?,
             pos: DeviceBuf::alloc(std::mem::size_of::<u32>())?,
             hidden: DeviceBuf::alloc(max_batch * cfg.n_embd * f32_sz)?,
             normed: DeviceBuf::alloc(max_batch * cfg.n_embd * f32_sz)?,
+            x_q8_1: DeviceBuf::alloc(max_q8_k.div_ceil(32) * 48)?,
             q: DeviceBuf::alloc(max_batch * q_dim * f32_sz)?,
             k: DeviceBuf::alloc(max_batch * kv_dim * f32_sz)?,
             v: DeviceBuf::alloc(max_batch * kv_dim * f32_sz)?,
@@ -289,6 +292,7 @@ pub struct Qwen2Model {
     pub store: VramTensorStore,
     pub kv_cache: KvCache,
     pub pos: usize,
+    decode_graph: Option<HipGraphExec>,
     stream: HipStream,
     token_embd: usize,
     output_norm: usize,
@@ -420,6 +424,7 @@ impl Qwen2Model {
             store,
             kv_cache,
             pos: 0,
+            decode_graph: None,
             stream,
             token_embd,
             output_norm,
@@ -555,105 +560,150 @@ impl Qwen2Model {
                     .map(|i| self.store.get(i).buf.as_ptr())
                     .unwrap_or(ptr::null_mut());
 
-                launch_linear(
-                    ctx,
-                    &self.stream,
-                    self.store.get(lw.attn_q),
-                    self.scratch.normed.as_ptr(),
-                    q_bias,
-                    self.scratch.q.as_ptr(),
-                    m,
-                    q_dim,
-                    self.config.n_embd,
-                )?;
-                launch_linear(
-                    ctx,
-                    &self.stream,
-                    self.store.get(lw.attn_k),
-                    self.scratch.normed.as_ptr(),
-                    k_bias,
-                    self.scratch.k.as_ptr(),
-                    m,
-                    kv_dim,
-                    self.config.n_embd,
-                )?;
-                launch_linear(
-                    ctx,
-                    &self.stream,
-                    self.store.get(lw.attn_v),
-                    self.scratch.normed.as_ptr(),
-                    v_bias,
-                    self.scratch.v.as_ptr(),
-                    m,
-                    kv_dim,
-                    self.config.n_embd,
-                )?;
-
-                if let (Some(qn), Some(kn)) = (lw.attn_q_norm, lw.attn_k_norm) {
-                    launch_qk_rmsnorm(
+                let w_q = self.store.get(lw.attn_q);
+                let w_k = self.store.get(lw.attn_k);
+                let w_v = self.store.get(lw.attn_v);
+                let use_q8_qkv = m == 1
+                    && self.config.n_embd.is_multiple_of(256)
+                    && [w_q, w_k, w_v].iter().any(|w| w.ggml_type == GgmlType::Q4K);
+                if use_q8_qkv {
+                    launch_quantize_q8_1(
                         ctx,
                         &self.stream,
-                        self.scratch.q.as_ptr(),
-                        self.scratch.k.as_ptr(),
-                        self.store.get(qn).buf.as_ptr(),
-                        self.store.get(kn).buf.as_ptr(),
-                        m,
-                        self.config.n_heads,
-                        self.config.n_kv_heads,
-                        self.config.head_dim,
-                        self.config.rms_eps,
+                        self.scratch.normed.as_ptr(),
+                        self.scratch.x_q8_1.as_ptr(),
+                        self.config.n_embd,
                     )?;
                 }
 
-                launch_rope_neox(
-                    ctx,
-                    &self.stream,
-                    self.scratch.q.as_ptr(),
-                    self.scratch.k.as_ptr(),
-                    self.scratch.pos.as_ptr(),
-                    m,
-                    self.config.n_heads,
-                    self.config.n_kv_heads,
-                    self.config.head_dim,
-                    self.config.rope_freq_base,
-                )?;
-                maybe_tap(
-                    tap,
-                    &self.stream,
-                    &format!("Qcur-{l}"),
-                    &self.scratch.q,
-                    m * q_dim,
-                )?;
-                maybe_tap(
-                    tap,
-                    &self.stream,
-                    &format!("Kcur-{l}"),
-                    &self.scratch.k,
-                    m * kv_dim,
-                )?;
-                maybe_tap(
-                    tap,
-                    &self.stream,
-                    &format!("Vcur-{l}"),
-                    &self.scratch.v,
-                    m * kv_dim,
-                )?;
+                for (wt, bias_p, out_p, out_dim) in [
+                    (w_q, q_bias, self.scratch.q.as_ptr(), q_dim),
+                    (w_k, k_bias, self.scratch.k.as_ptr(), kv_dim),
+                    (w_v, v_bias, self.scratch.v.as_ptr(), kv_dim),
+                ] {
+                    if m == 1
+                        && wt.ggml_type == GgmlType::Q4K
+                        && self.config.n_embd.is_multiple_of(256)
+                    {
+                        launch_linear_q4_k_q8_1(
+                            ctx,
+                            &self.stream,
+                            wt.buf.as_ptr(),
+                            self.scratch.x_q8_1.as_ptr(),
+                            bias_p,
+                            out_p,
+                            out_dim,
+                            self.config.n_embd,
+                        )?;
+                    } else {
+                        launch_linear(
+                            ctx,
+                            &self.stream,
+                            wt,
+                            self.scratch.normed.as_ptr(),
+                            bias_p,
+                            out_p,
+                            m,
+                            out_dim,
+                            self.config.n_embd,
+                        )?;
+                    }
+                }
 
                 let (k_cache, v_cache) = self
                     .kv_cache
                     .get_mut(step.kv_key)
                     .expect("missing KV slot for layer");
-                launch_kv_append(
-                    ctx,
-                    &self.stream,
-                    self.scratch.k.as_ptr(),
-                    self.scratch.v.as_ptr(),
-                    k_cache.as_ptr(),
-                    v_cache.as_ptr(),
-                    self.scratch.pos.as_ptr(),
-                    m,
-                    kv_dim,
-                )?;
+                if tap.is_none() {
+                    let qn_ptr = lw
+                        .attn_q_norm
+                        .map(|i| self.store.get(i).buf.as_ptr())
+                        .unwrap_or(ptr::null_mut());
+                    let kn_ptr = lw
+                        .attn_k_norm
+                        .map(|i| self.store.get(i).buf.as_ptr())
+                        .unwrap_or(ptr::null_mut());
+                    launch_qk_norm_rope_kv(
+                        ctx,
+                        &self.stream,
+                        self.scratch.q.as_ptr(),
+                        self.scratch.k.as_ptr(),
+                        self.scratch.v.as_ptr(),
+                        qn_ptr,
+                        kn_ptr,
+                        k_cache.as_ptr(),
+                        v_cache.as_ptr(),
+                        self.scratch.pos.as_ptr(),
+                        m,
+                        self.config.n_heads,
+                        self.config.n_kv_heads,
+                        self.config.head_dim,
+                        self.config.rope_freq_base,
+                        self.config.rms_eps,
+                    )?;
+                } else {
+                    if let (Some(qn), Some(kn)) = (lw.attn_q_norm, lw.attn_k_norm) {
+                        launch_qk_rmsnorm(
+                            ctx,
+                            &self.stream,
+                            self.scratch.q.as_ptr(),
+                            self.scratch.k.as_ptr(),
+                            self.store.get(qn).buf.as_ptr(),
+                            self.store.get(kn).buf.as_ptr(),
+                            m,
+                            self.config.n_heads,
+                            self.config.n_kv_heads,
+                            self.config.head_dim,
+                            self.config.rms_eps,
+                        )?;
+                    }
+
+                    launch_rope_neox(
+                        ctx,
+                        &self.stream,
+                        self.scratch.q.as_ptr(),
+                        self.scratch.k.as_ptr(),
+                        self.scratch.pos.as_ptr(),
+                        m,
+                        self.config.n_heads,
+                        self.config.n_kv_heads,
+                        self.config.head_dim,
+                        self.config.rope_freq_base,
+                    )?;
+                    maybe_tap(
+                        tap,
+                        &self.stream,
+                        &format!("Qcur-{l}"),
+                        &self.scratch.q,
+                        m * q_dim,
+                    )?;
+                    maybe_tap(
+                        tap,
+                        &self.stream,
+                        &format!("Kcur-{l}"),
+                        &self.scratch.k,
+                        m * kv_dim,
+                    )?;
+                    maybe_tap(
+                        tap,
+                        &self.stream,
+                        &format!("Vcur-{l}"),
+                        &self.scratch.v,
+                        m * kv_dim,
+                    )?;
+
+                    launch_kv_append(
+                        ctx,
+                        &self.stream,
+                        self.scratch.k.as_ptr(),
+                        self.scratch.v.as_ptr(),
+                        k_cache.as_ptr(),
+                        v_cache.as_ptr(),
+                        self.scratch.pos.as_ptr(),
+                        m,
+                        kv_dim,
+                    )?;
+                }
 
                 launch_gqa_attn(
                     ctx,
@@ -669,17 +719,38 @@ impl Qwen2Model {
                     self.config.head_dim,
                 )?;
 
-                launch_linear(
-                    ctx,
-                    &self.stream,
-                    self.store.get(lw.attn_output),
-                    self.scratch.attn_out.as_ptr(),
-                    ptr::null_mut(),
-                    self.scratch.proj_out.as_ptr(),
-                    m,
-                    self.config.n_embd,
-                    q_dim,
-                )?;
+                let wo = self.store.get(lw.attn_output);
+                if m == 1 && wo.ggml_type == GgmlType::Q4K && q_dim.is_multiple_of(256) {
+                    launch_quantize_q8_1(
+                        ctx,
+                        &self.stream,
+                        self.scratch.attn_out.as_ptr(),
+                        self.scratch.x_q8_1.as_ptr(),
+                        q_dim,
+                    )?;
+                    launch_linear_q4_k_q8_1(
+                        ctx,
+                        &self.stream,
+                        wo.buf.as_ptr(),
+                        self.scratch.x_q8_1.as_ptr(),
+                        ptr::null_mut(),
+                        self.scratch.proj_out.as_ptr(),
+                        self.config.n_embd,
+                        q_dim,
+                    )?;
+                } else {
+                    launch_linear(
+                        ctx,
+                        &self.stream,
+                        wo,
+                        self.scratch.attn_out.as_ptr(),
+                        ptr::null_mut(),
+                        self.scratch.proj_out.as_ptr(),
+                        m,
+                        self.config.n_embd,
+                        q_dim,
+                    )?;
+                }
 
                 launch_add_rmsnorm(
                     ctx,
@@ -700,47 +771,94 @@ impl Qwen2Model {
                     m * self.config.n_embd,
                 )?;
 
-                launch_linear(
-                    ctx,
-                    &self.stream,
-                    self.store.get(lw.ffn_gate),
-                    self.scratch.normed.as_ptr(),
-                    ptr::null_mut(),
-                    self.scratch.gate.as_ptr(),
-                    m,
-                    self.config.n_ff,
-                    self.config.n_embd,
-                )?;
-                launch_linear(
-                    ctx,
-                    &self.stream,
-                    self.store.get(lw.ffn_up),
-                    self.scratch.normed.as_ptr(),
-                    ptr::null_mut(),
-                    self.scratch.up.as_ptr(),
-                    m,
-                    self.config.n_ff,
-                    self.config.n_embd,
-                )?;
-                launch_silu_mul(
-                    ctx,
-                    &self.stream,
-                    self.scratch.gate.as_ptr(),
-                    self.scratch.up.as_ptr(),
-                    self.scratch.gate.as_ptr(),
-                    m * self.config.n_ff,
-                )?;
-                launch_linear(
-                    ctx,
-                    &self.stream,
-                    self.store.get(lw.ffn_down),
-                    self.scratch.gate.as_ptr(),
-                    ptr::null_mut(),
-                    self.scratch.ffn_out.as_ptr(),
-                    m,
-                    self.config.n_embd,
-                    self.config.n_ff,
-                )?;
+                let w_gate = self.store.get(lw.ffn_gate);
+                let w_up = self.store.get(lw.ffn_up);
+                if m == 1
+                    && w_gate.ggml_type == GgmlType::Q4K
+                    && w_up.ggml_type == GgmlType::Q4K
+                    && self.config.n_embd.is_multiple_of(256)
+                {
+                    launch_quantize_q8_1(
+                        ctx,
+                        &self.stream,
+                        self.scratch.normed.as_ptr(),
+                        self.scratch.x_q8_1.as_ptr(),
+                        self.config.n_embd,
+                    )?;
+                    launch_gemv_q4_k_gate_up_silu_q8_1(
+                        ctx,
+                        &self.stream,
+                        w_gate.buf.as_ptr(),
+                        w_up.buf.as_ptr(),
+                        self.scratch.x_q8_1.as_ptr(),
+                        self.scratch.gate.as_ptr(),
+                        self.config.n_ff,
+                        self.config.n_embd,
+                    )?;
+                } else {
+                    launch_linear(
+                        ctx,
+                        &self.stream,
+                        w_gate,
+                        self.scratch.normed.as_ptr(),
+                        ptr::null_mut(),
+                        self.scratch.gate.as_ptr(),
+                        m,
+                        self.config.n_ff,
+                        self.config.n_embd,
+                    )?;
+                    launch_linear(
+                        ctx,
+                        &self.stream,
+                        w_up,
+                        self.scratch.normed.as_ptr(),
+                        ptr::null_mut(),
+                        self.scratch.up.as_ptr(),
+                        m,
+                        self.config.n_ff,
+                        self.config.n_embd,
+                    )?;
+                    launch_silu_mul(
+                        ctx,
+                        &self.stream,
+                        self.scratch.gate.as_ptr(),
+                        self.scratch.up.as_ptr(),
+                        self.scratch.gate.as_ptr(),
+                        m * self.config.n_ff,
+                    )?;
+                }
+                let wd = self.store.get(lw.ffn_down);
+                if m == 1 && wd.ggml_type == GgmlType::Q4K && self.config.n_ff.is_multiple_of(256) {
+                    launch_quantize_q8_1(
+                        ctx,
+                        &self.stream,
+                        self.scratch.gate.as_ptr(),
+                        self.scratch.x_q8_1.as_ptr(),
+                        self.config.n_ff,
+                    )?;
+                    launch_linear_q4_k_q8_1(
+                        ctx,
+                        &self.stream,
+                        wd.buf.as_ptr(),
+                        self.scratch.x_q8_1.as_ptr(),
+                        ptr::null_mut(),
+                        self.scratch.ffn_out.as_ptr(),
+                        self.config.n_embd,
+                        self.config.n_ff,
+                    )?;
+                } else {
+                    launch_linear(
+                        ctx,
+                        &self.stream,
+                        wd,
+                        self.scratch.gate.as_ptr(),
+                        ptr::null_mut(),
+                        self.scratch.ffn_out.as_ptr(),
+                        m,
+                        self.config.n_embd,
+                        self.config.n_ff,
+                    )?;
+                }
 
                 if step_idx + 1 < n_steps {
                     let next_l = steps[step_idx + 1].kv_key.layer_id;
@@ -959,24 +1077,36 @@ impl Qwen2Model {
         let mut next_tok = argmax_f32(&prefill_logits);
         generated.push(next_tok);
 
-        let t_decode0 = Instant::now();
-        if max_new_tokens > 1 {
-            // Seed the on-device input slot with the prefill sample, then replay one
-            // captured decode step per token.
+        if max_new_tokens > 1 && self.decode_graph.is_none() {
             self.scratch
                 .token_ids
                 .copy_from_host_at(0, &next_tok.to_le_bytes())?;
-            let graph = self.capture_decode_graph(ctx)?;
-            while generated.len() < max_new_tokens {
-                if !ignore_eos && eos_token_id == Some(next_tok) {
-                    break;
+            self.decode_graph = Some(self.capture_decode_graph(ctx)?);
+        }
+
+        let t_decode0 = Instant::now();
+        if max_new_tokens > 1 {
+            // Seed the on-device input + pos slots, then replay the cached decode graph.
+            self.scratch
+                .token_ids
+                .copy_from_host_at(0, &next_tok.to_le_bytes())?;
+            self.write_device_pos()?;
+            let graph = self.decode_graph.take().expect("cached decode graph");
+            let loop_res = (|| -> HipResult<()> {
+                while generated.len() < max_new_tokens {
+                    if !ignore_eos && eos_token_id == Some(next_tok) {
+                        break;
+                    }
+                    let Some(tok) = self.decode_graph_next(&graph, self.kv_cache.max_seq)? else {
+                        break;
+                    };
+                    next_tok = tok;
+                    generated.push(next_tok);
                 }
-                let Some(tok) = self.decode_graph_next(&graph, self.kv_cache.max_seq)? else {
-                    break;
-                };
-                next_tok = tok;
-                generated.push(next_tok);
-            }
+                Ok(())
+            })();
+            self.decode_graph = Some(graph);
+            loop_res?;
         }
         let decode_ms = t_decode0.elapsed().as_secs_f64() * 1000.0;
 
@@ -1062,14 +1192,29 @@ impl Qwen2Model {
                 .map(|i| self.store.get(i).buf.as_ptr())
                 .unwrap_or(ptr::null_mut());
 
-            for (w_idx, bias_p, out_p, out_dim) in [
-                (lw.attn_q, q_bias, self.scratch.q.as_ptr(), q_dim),
-                (lw.attn_k, k_bias, self.scratch.k.as_ptr(), kv_dim),
-                (lw.attn_v, v_bias, self.scratch.v.as_ptr(), kv_dim),
+            let w_q = self.store.get(lw.attn_q);
+            let w_k = self.store.get(lw.attn_k);
+            let w_v = self.store.get(lw.attn_v);
+            let use_q8_qkv = self.config.n_embd.is_multiple_of(256)
+                && [w_q, w_k, w_v].iter().any(|w| w.ggml_type == GgmlType::Q4K);
+            if use_q8_qkv {
+                timed!(
+                    gemv_other_ms,
+                    launch_quantize_q8_1(
+                        ctx,
+                        &self.stream,
+                        self.scratch.normed.as_ptr(),
+                        self.scratch.x_q8_1.as_ptr(),
+                        self.config.n_embd,
+                    )
+                );
+            }
+            for (wt, bias_p, out_p, out_dim) in [
+                (w_q, q_bias, self.scratch.q.as_ptr(), q_dim),
+                (w_k, k_bias, self.scratch.k.as_ptr(), kv_dim),
+                (w_v, v_bias, self.scratch.v.as_ptr(), kv_dim),
             ] {
-                let wt = self.store.get(w_idx);
-                let is_q6 = wt.ggml_type == GgmlType::Q6K;
-                if is_q6 {
+                if wt.ggml_type == GgmlType::Q6K {
                     timed!(
                         q6k_ms,
                         launch_linear(
@@ -1080,6 +1225,20 @@ impl Qwen2Model {
                             bias_p,
                             out_p,
                             1,
+                            out_dim,
+                            self.config.n_embd,
+                        )
+                    );
+                } else if wt.ggml_type == GgmlType::Q4K && self.config.n_embd.is_multiple_of(256) {
+                    timed!(
+                        gemv_other_ms,
+                        launch_linear_q4_k_q8_1(
+                            ctx,
+                            &self.stream,
+                            wt.buf.as_ptr(),
+                            self.scratch.x_q8_1.as_ptr(),
+                            bias_p,
+                            out_p,
                             out_dim,
                             self.config.n_embd,
                         )
@@ -1102,54 +1261,34 @@ impl Qwen2Model {
                 }
             }
 
-            if let (Some(qn), Some(kn)) = (lw.attn_q_norm, lw.attn_k_norm) {
-                timed!(
-                    other_ms,
-                    launch_qk_rmsnorm(
-                        ctx,
-                        &self.stream,
-                        self.scratch.q.as_ptr(),
-                        self.scratch.k.as_ptr(),
-                        self.store.get(qn).buf.as_ptr(),
-                        self.store.get(kn).buf.as_ptr(),
-                        1,
-                        self.config.n_heads,
-                        self.config.n_kv_heads,
-                        self.config.head_dim,
-                        self.config.rms_eps,
-                    )
-                );
-            }
-
+            let (k_cache, v_cache) = self.kv_cache.get_mut(step.kv_key).unwrap();
+            let qn_ptr = lw
+                .attn_q_norm
+                .map(|i| self.store.get(i).buf.as_ptr())
+                .unwrap_or(ptr::null_mut());
+            let kn_ptr = lw
+                .attn_k_norm
+                .map(|i| self.store.get(i).buf.as_ptr())
+                .unwrap_or(ptr::null_mut());
             timed!(
                 other_ms,
-                launch_rope_neox(
+                launch_qk_norm_rope_kv(
                     ctx,
                     &self.stream,
                     self.scratch.q.as_ptr(),
                     self.scratch.k.as_ptr(),
+                    self.scratch.v.as_ptr(),
+                    qn_ptr,
+                    kn_ptr,
+                    k_cache.as_ptr(),
+                    v_cache.as_ptr(),
                     self.scratch.pos.as_ptr(),
                     1,
                     self.config.n_heads,
                     self.config.n_kv_heads,
                     self.config.head_dim,
                     self.config.rope_freq_base,
-                )
-            );
-
-            let (k_cache, v_cache) = self.kv_cache.get_mut(step.kv_key).unwrap();
-            timed!(
-                other_ms,
-                launch_kv_append(
-                    ctx,
-                    &self.stream,
-                    self.scratch.k.as_ptr(),
-                    self.scratch.v.as_ptr(),
-                    k_cache.as_ptr(),
-                    v_cache.as_ptr(),
-                    self.scratch.pos.as_ptr(),
-                    1,
-                    kv_dim,
+                    self.config.rms_eps,
                 )
             );
 
@@ -1171,20 +1310,46 @@ impl Qwen2Model {
             );
 
             let wo = self.store.get(lw.attn_output);
-            timed!(
-                gemv_other_ms,
-                launch_linear(
-                    ctx,
-                    &self.stream,
-                    wo,
-                    self.scratch.attn_out.as_ptr(),
-                    ptr::null_mut(),
-                    self.scratch.proj_out.as_ptr(),
-                    1,
-                    self.config.n_embd,
-                    q_dim,
-                )
-            );
+            if wo.ggml_type == GgmlType::Q4K && q_dim.is_multiple_of(256) {
+                timed!(
+                    gemv_other_ms,
+                    launch_quantize_q8_1(
+                        ctx,
+                        &self.stream,
+                        self.scratch.attn_out.as_ptr(),
+                        self.scratch.x_q8_1.as_ptr(),
+                        q_dim,
+                    )
+                );
+                timed!(
+                    gemv_other_ms,
+                    launch_linear_q4_k_q8_1(
+                        ctx,
+                        &self.stream,
+                        wo.buf.as_ptr(),
+                        self.scratch.x_q8_1.as_ptr(),
+                        ptr::null_mut(),
+                        self.scratch.proj_out.as_ptr(),
+                        self.config.n_embd,
+                        q_dim,
+                    )
+                );
+            } else {
+                timed!(
+                    gemv_other_ms,
+                    launch_linear(
+                        ctx,
+                        &self.stream,
+                        wo,
+                        self.scratch.attn_out.as_ptr(),
+                        ptr::null_mut(),
+                        self.scratch.proj_out.as_ptr(),
+                        1,
+                        self.config.n_embd,
+                        q_dim,
+                    )
+                );
+            }
             timed!(
                 rmsnorm_ms,
                 launch_add_rmsnorm(
@@ -1200,37 +1365,67 @@ impl Qwen2Model {
                 )
             );
 
-            for (w_idx, out_p) in [
-                (lw.ffn_gate, self.scratch.gate.as_ptr()),
-                (lw.ffn_up, self.scratch.up.as_ptr()),
-            ] {
-                let wt = self.store.get(w_idx);
+            let w_gate = self.store.get(lw.ffn_gate);
+            let w_up = self.store.get(lw.ffn_up);
+            if w_gate.ggml_type == GgmlType::Q4K
+                && w_up.ggml_type == GgmlType::Q4K
+                && self.config.n_embd.is_multiple_of(256)
+            {
                 timed!(
                     gemv_other_ms,
-                    launch_linear(
+                    launch_quantize_q8_1(
                         ctx,
                         &self.stream,
-                        wt,
                         self.scratch.normed.as_ptr(),
-                        ptr::null_mut(),
-                        out_p,
-                        1,
+                        self.scratch.x_q8_1.as_ptr(),
+                        self.config.n_embd,
+                    )
+                );
+                timed!(
+                    gemv_other_ms,
+                    launch_gemv_q4_k_gate_up_silu_q8_1(
+                        ctx,
+                        &self.stream,
+                        w_gate.buf.as_ptr(),
+                        w_up.buf.as_ptr(),
+                        self.scratch.x_q8_1.as_ptr(),
+                        self.scratch.gate.as_ptr(),
                         self.config.n_ff,
                         self.config.n_embd,
                     )
                 );
+            } else {
+                for (wt, out_p) in [
+                    (w_gate, self.scratch.gate.as_ptr()),
+                    (w_up, self.scratch.up.as_ptr()),
+                ] {
+                    timed!(
+                        gemv_other_ms,
+                        launch_linear(
+                            ctx,
+                            &self.stream,
+                            wt,
+                            self.scratch.normed.as_ptr(),
+                            ptr::null_mut(),
+                            out_p,
+                            1,
+                            self.config.n_ff,
+                            self.config.n_embd,
+                        )
+                    );
+                }
+                timed!(
+                    other_ms,
+                    launch_silu_mul(
+                        ctx,
+                        &self.stream,
+                        self.scratch.gate.as_ptr(),
+                        self.scratch.up.as_ptr(),
+                        self.scratch.gate.as_ptr(),
+                        self.config.n_ff,
+                    )
+                );
             }
-            timed!(
-                other_ms,
-                launch_silu_mul(
-                    ctx,
-                    &self.stream,
-                    self.scratch.gate.as_ptr(),
-                    self.scratch.up.as_ptr(),
-                    self.scratch.gate.as_ptr(),
-                    self.config.n_ff,
-                )
-            );
             let wd = self.store.get(lw.ffn_down);
             if wd.ggml_type == GgmlType::Q6K {
                 timed!(
@@ -1243,6 +1438,30 @@ impl Qwen2Model {
                         ptr::null_mut(),
                         self.scratch.ffn_out.as_ptr(),
                         1,
+                        self.config.n_embd,
+                        self.config.n_ff,
+                    )
+                );
+            } else if wd.ggml_type == GgmlType::Q4K && self.config.n_ff.is_multiple_of(256) {
+                timed!(
+                    gemv_other_ms,
+                    launch_quantize_q8_1(
+                        ctx,
+                        &self.stream,
+                        self.scratch.gate.as_ptr(),
+                        self.scratch.x_q8_1.as_ptr(),
+                        self.config.n_ff,
+                    )
+                );
+                timed!(
+                    gemv_other_ms,
+                    launch_linear_q4_k_q8_1(
+                        ctx,
+                        &self.stream,
+                        wd.buf.as_ptr(),
+                        self.scratch.x_q8_1.as_ptr(),
+                        ptr::null_mut(),
+                        self.scratch.ffn_out.as_ptr(),
                         self.config.n_embd,
                         self.config.n_ff,
                     )
@@ -1435,6 +1654,13 @@ fn launch_rmsnorm(
     )
 }
 
+/// `SCORIA_PREFILL_FP32=1` forces prefill onto the scalar FP32 GEMM path, bypassing
+/// the FP16 WMMA tile. Used to attribute parity deltas to FP16 prefill rounding.
+fn prefill_fp32_forced() -> bool {
+    static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCED.get_or_init(|| std::env::var("SCORIA_PREFILL_FP32").is_ok_and(|v| v != "0"))
+}
+
 /// `SCORIA_Q4K_ROWS=2|4|8` forces the Q4_K GEMV rows per workgroup; unset keeps the
 /// adaptive default. Used by the C-A-C sweep in `harness/ledger.jsonl`.
 fn q4k_rows_override() -> Option<u32> {
@@ -1519,7 +1745,7 @@ fn launch_linear(
     // NB: the m < 8 scalar path is kept deliberately. WMMA rounds activations and
     // weights to FP16, which costs ~1.5e-3 cosine on 2-7 token prompts (0.9999 ->
     // 0.9984 on the 7B) even though greedy tokens still match; the parity gate wins.
-    if m >= 8 && k.is_multiple_of(32) && ctx.arch.is_rdna4() {
+    if m >= 8 && !prefill_fp32_forced() && k.is_multiple_of(32) && ctx.arch.is_rdna4() {
         // Wide 64x128 tile has ~2x the arithmetic intensity, but needs >=128 blocks to
         // fill the 64 CUs; smaller matrices keep the 32x64 tile instead. A 128x64 tile
         // was measured too: it halves weight re-reads at m=128 but is exactly as fast,
@@ -1588,6 +1814,150 @@ fn launch_linear(
         m as u32,
         n as u32,
         k as u32
+    )
+}
+
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+fn launch_gemv_q4_k_gate_up_silu(
+    ctx: &EngineContext,
+    stream: &HipStream,
+    w_gate_ptr: *mut c_void,
+    w_up_ptr: *mut c_void,
+    x_ptr: *mut c_void,
+    y_out_ptr: *mut c_void,
+    n: usize,
+    k: usize,
+) -> HipResult<()> {
+    hip_launch!(
+        ctx,
+        stream,
+        ctx.infer.gemv_q4_k_gate_up_silu_f32,
+        [n as u32, 1, 1],
+        [ctx.wave_size, 1, 1];
+        w_gate_ptr,
+        w_up_ptr,
+        x_ptr,
+        y_out_ptr,
+        n as u32,
+        k as u32
+    )
+}
+
+fn launch_quantize_q8_1(
+    ctx: &EngineContext,
+    stream: &HipStream,
+    x_ptr: *mut c_void,
+    out_q8_ptr: *mut c_void,
+    k: usize,
+) -> HipResult<()> {
+    let nb32 = (k / 32) as u32;
+    hip_launch!(
+        ctx,
+        stream,
+        ctx.infer.quantize_q8_1_f32,
+        [nb32.div_ceil(4), 1, 1],
+        [128, 1, 1];
+        x_ptr,
+        out_q8_ptr,
+        k as u32
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_linear_q4_k_q8_1(
+    ctx: &EngineContext,
+    stream: &HipStream,
+    w_ptr: *mut c_void,
+    x_q8_ptr: *mut c_void,
+    bias_ptr: *mut c_void,
+    y_ptr: *mut c_void,
+    n: usize,
+    k: usize,
+) -> HipResult<()> {
+    let waves_per_wg = 128u32 / ctx.wave_size;
+    let rows_per_wg = waves_per_wg * 2u32;
+    hip_launch!(
+        ctx,
+        stream,
+        ctx.infer.gemv_q4_k_q8_1_f32,
+        [(n as u32).div_ceil(rows_per_wg), 1, 1],
+        [128, 1, 1];
+        w_ptr,
+        x_q8_ptr,
+        bias_ptr,
+        y_ptr,
+        n as u32,
+        k as u32
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_gemv_q4_k_gate_up_silu_q8_1(
+    ctx: &EngineContext,
+    stream: &HipStream,
+    w_gate_ptr: *mut c_void,
+    w_up_ptr: *mut c_void,
+    x_q8_ptr: *mut c_void,
+    y_out_ptr: *mut c_void,
+    n: usize,
+    k: usize,
+) -> HipResult<()> {
+    let waves_per_wg = 128u32 / ctx.wave_size;
+    hip_launch!(
+        ctx,
+        stream,
+        ctx.infer.gemv_q4_k_gate_up_silu_q8_1_f32,
+        [(n as u32).div_ceil(waves_per_wg), 1, 1],
+        [128, 1, 1];
+        w_gate_ptr,
+        w_up_ptr,
+        x_q8_ptr,
+        y_out_ptr,
+        n as u32,
+        k as u32
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_qk_norm_rope_kv(
+    ctx: &EngineContext,
+    stream: &HipStream,
+    q_ptr: *mut c_void,
+    k_in_ptr: *mut c_void,
+    v_in_ptr: *mut c_void,
+    q_w_ptr: *mut c_void,
+    k_w_ptr: *mut c_void,
+    k_cache_ptr: *mut c_void,
+    v_cache_ptr: *mut c_void,
+    pos_ptr: *mut c_void,
+    n_tokens: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    freq_base: f32,
+    eps: f32,
+) -> HipResult<()> {
+    hip_launch!(
+        ctx,
+        stream,
+        ctx.infer.qk_norm_rope_kv_f32,
+        [n_tokens as u32, (n_heads + n_kv_heads) as u32, 1],
+        [ctx.wave_size, 1, 1];
+        q_ptr,
+        k_in_ptr,
+        v_in_ptr,
+        q_w_ptr,
+        k_w_ptr,
+        k_cache_ptr,
+        v_cache_ptr,
+        pos_ptr,
+        n_tokens as u32,
+        n_heads as u32,
+        n_kv_heads as u32,
+        head_dim as u32,
+        freq_base,
+        eps
     )
 }
 
@@ -1909,6 +2279,34 @@ mod tests {
                     "linear parity failed for {tname} ({:?}): max_diff={max_diff}",
                     info.ggml_type
                 );
+
+                if info.ggml_type == GgmlType::Q4K {
+                    let d_q8 = DeviceBuf::alloc(k.div_ceil(32) * 48).unwrap();
+                    launch_quantize_q8_1(&ctx, &stream, d_in.as_ptr(), d_q8.as_ptr(), k).unwrap();
+                    launch_linear_q4_k_q8_1(
+                        &ctx,
+                        &stream,
+                        store.get(tid).buf.as_ptr(),
+                        d_q8.as_ptr(),
+                        ptr::null_mut(),
+                        d_y.as_ptr(),
+                        n_rows,
+                        k,
+                    )
+                    .unwrap();
+                    stream.synchronize().unwrap();
+                    let mut gpu_q8_y = vec![0f32; n_rows];
+                    d_y.copy_to_host(to_bytes_mut(&mut gpu_q8_y)).unwrap();
+                    let max_diff_q8 = cpu_y
+                        .iter()
+                        .zip(&gpu_q8_y)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0f32, f32::max);
+                    assert!(
+                        max_diff_q8 < 5e-2,
+                        "Q8_1 Q4_K dot4 parity failed for {tname}: max_diff_q8={max_diff_q8}"
+                    );
+                }
             }
         }
     }
@@ -2159,6 +2557,96 @@ mod tests {
                         info.ggml_type
                     );
                 }
+            }
+
+            // 3. Direct wide double-buffered 64x128 WMMA parity check (Q4_K + Q6_K, m=64)
+            let q4k_name = gguf
+                .tensors
+                .iter()
+                .find(|t| t.ggml_type == GgmlType::Q4K && t.dims[1] >= 128)
+                .map(|t| t.name.as_str());
+            let q6k_name = gguf
+                .tensors
+                .iter()
+                .find(|t| t.ggml_type == GgmlType::Q6K && t.dims[1] >= 128)
+                .map(|t| t.name.as_str());
+            for (tname_opt, wide_handle) in [
+                (q4k_name, ctx.infer.gemm_wmma_q4_k),
+                (q6k_name, ctx.infer.gemm_wmma_q6_k),
+            ] {
+                let (Some(tname), Some(handle)) = (tname_opt, wide_handle) else {
+                    continue;
+                };
+                let Some(info) = gguf.tensor(tname) else {
+                    continue;
+                };
+                let k = info.dims[0] as usize;
+                let n_rows = (info.dims[1] as usize).min(128);
+                let m = 64usize;
+                if !k.is_multiple_of(64) {
+                    continue;
+                }
+                let row_bytes = info.ggml_type.tensor_byte_len(k).unwrap();
+                let raw = &gguf.tensor_bytes(info).unwrap()[..n_rows * row_bytes];
+                let x_in: Vec<f32> = (0..m * k)
+                    .map(|i| (((i * 13 + 5) % 23) as f32 - 11.0) * 0.02)
+                    .collect();
+
+                let mut deq_w = vec![0f32; n_rows * k];
+                for r in 0..n_rows {
+                    dequant_row(
+                        info.ggml_type,
+                        &raw[r * row_bytes..(r + 1) * row_bytes],
+                        &mut deq_w[r * k..(r + 1) * k],
+                    )
+                    .unwrap();
+                }
+                let mut cpu_y = vec![0f32; m * n_rows];
+                for tok in 0..m {
+                    let x_row = &x_in[tok * k..(tok + 1) * k];
+                    for r in 0..n_rows {
+                        let w_row = &deq_w[r * k..(r + 1) * k];
+                        cpu_y[tok * n_rows + r] = w_row.iter().zip(x_row).map(|(a, b)| a * b).sum();
+                    }
+                }
+
+                let mut store = VramTensorStore::new();
+                let mut sub_info = info.clone();
+                sub_info.dims = vec![k as u64, n_rows as u64];
+                let tid = store.upload(tname, &sub_info, raw).unwrap();
+                let mut d_x = DeviceBuf::alloc(m * k * 4).unwrap();
+                let d_y = DeviceBuf::alloc(m * n_rows * 4).unwrap();
+                d_x.copy_from_host(to_bytes(&x_in)).unwrap();
+
+                hip_launch!(
+                    &ctx,
+                    &stream,
+                    handle,
+                    [(n_rows as u32).div_ceil(128), (m as u32).div_ceil(64), 1],
+                    [256, 1, 1];
+                    store.get(tid).buf.as_ptr(),
+                    d_x.as_ptr(),
+                    ptr::null_mut(),
+                    d_y.as_ptr(),
+                    m as u32,
+                    n_rows as u32,
+                    k as u32
+                )
+                .unwrap();
+                stream.synchronize().unwrap();
+
+                let mut gpu_y = vec![0f32; m * n_rows];
+                d_y.copy_to_host(to_bytes_mut(&mut gpu_y)).unwrap();
+                let max_diff = cpu_y
+                    .iter()
+                    .zip(&gpu_y)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    max_diff < 5e-2,
+                    "Wide double-buffered WMMA parity failed for {tname} ({:?}): max_diff={max_diff}",
+                    info.ggml_type
+                );
             }
         }
     }

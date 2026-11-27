@@ -52,6 +52,7 @@ define_infer_kernels! {
         linear_q6_k => infer_names::LINEAR_Q6_K,
         rope_neox_f32 => infer_names::ROPE_NEOX_F32,
         kv_cache_append_f32 => infer_names::KV_CACHE_APPEND_F32,
+        qk_norm_rope_kv_f32 => infer_names::QK_NORM_ROPE_KV_F32,
         gqa_attn_f32 => infer_names::GQA_ATTN_F32,
         silu_mul_f32 => infer_names::SILU_MUL_F32,
         add_inplace_f32 => infer_names::ADD_INPLACE_F32,
@@ -65,6 +66,10 @@ define_infer_kernels! {
         gemv_q4_k_f32 => infer_names::GEMV_Q4_K_F32,
         gemv_q4_k_r4_f32 => infer_names::GEMV_Q4_K_R4_F32,
         gemv_q4_k_r8_f32 => infer_names::GEMV_Q4_K_R8_F32,
+        gemv_q4_k_gate_up_silu_f32 => infer_names::GEMV_Q4_K_GATE_UP_SILU_F32,
+        quantize_q8_1_f32 => infer_names::QUANTIZE_Q8_1_F32,
+        gemv_q4_k_q8_1_f32 => infer_names::GEMV_Q4_K_Q8_1_F32,
+        gemv_q4_k_gate_up_silu_q8_1_f32 => infer_names::GEMV_Q4_K_GATE_UP_SILU_Q8_1_F32,
         gemv_q6_k_f32 => infer_names::GEMV_Q6_K_F32,
     }
     rdna4_optional {

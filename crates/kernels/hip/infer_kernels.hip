@@ -549,6 +549,137 @@ extern "C" __global__ void kv_cache_append_f32(const float* __restrict__ k_in,
     v_cache[dst_idx] = v_in[idx];
 }
 
+// Fused optional per-head Q/K RMSNorm + NeoX RoPE + KV cache append.
+// Uses float2 vectorized loads and warp reductions on Wave32 when head_dim == 128.
+extern "C" __global__ void qk_norm_rope_kv_f32(float* __restrict__ q,
+                                               const float* __restrict__ k_in,
+                                               const float* __restrict__ v_in,
+                                               const float* __restrict__ q_norm_w,
+                                               const float* __restrict__ k_norm_w,
+                                               float* __restrict__ k_cache,
+                                               float* __restrict__ v_cache,
+                                               const unsigned* __restrict__ pos_ptr,
+                                               unsigned m,
+                                               unsigned n_heads,
+                                               unsigned n_kv_heads,
+                                               unsigned head_dim,
+                                               float freq_base,
+                                               float eps) {
+    unsigned tok = blockIdx.x;
+    unsigned h = blockIdx.y;
+    if (tok >= m || h >= (n_heads + n_kv_heads)) return;
+    unsigned lane = threadIdx.x;
+    if (lane >= SCORIA_WAVE_SIZE) return;
+
+    unsigned pos = *pos_ptr + tok;
+    bool is_q = h < n_heads;
+
+#ifdef SCORIA_RDNA4
+    if (head_dim == 128u) {
+        unsigned i0 = lane * 2u;
+        float inv_f0 = powf(freq_base, -2.0f * (float)i0 / 128.0f);
+        float inv_f1 = powf(freq_base, -2.0f * (float)(i0 + 1u) / 128.0f);
+        float t0 = (float)pos * inv_f0;
+        float t1 = (float)pos * inv_f1;
+        float c0 = cosf(t0), s0 = sinf(t0);
+        float c1 = cosf(t1), s1 = sinf(t1);
+
+        if (is_q) {
+            float* qv = q + ((size_t)tok * n_heads + h) * 128u;
+            float2 lo = *(const float2*)(qv + i0);
+            float2 hi = *(const float2*)(qv + 64u + i0);
+            if (q_norm_w != nullptr) {
+                float ss = lo.x * lo.x + lo.y * lo.y + hi.x * hi.x + hi.y * hi.y;
+                float inv = rsqrtf(scoria_wave_sum(ss) * (1.0f / 128.0f) + eps);
+                float2 wlo = *(const float2*)(q_norm_w + i0);
+                float2 whi = *(const float2*)(q_norm_w + 64u + i0);
+                lo.x *= inv * wlo.x;
+                lo.y *= inv * wlo.y;
+                hi.x *= inv * whi.x;
+                hi.y *= inv * whi.y;
+            }
+            float2 out_lo = {lo.x * c0 - hi.x * s0, lo.y * c1 - hi.y * s1};
+            float2 out_hi = {lo.x * s0 + hi.x * c0, lo.y * s1 + hi.y * c1};
+            *(float2*)(qv + i0) = out_lo;
+            *(float2*)(qv + 64u + i0) = out_hi;
+        } else {
+            unsigned kvh = h - n_heads;
+            const float* kv = k_in + ((size_t)tok * n_kv_heads + kvh) * 128u;
+            const float* vv = v_in + ((size_t)tok * n_kv_heads + kvh) * 128u;
+            float* kc = k_cache + ((size_t)pos * n_kv_heads + kvh) * 128u;
+            float* vc = v_cache + ((size_t)pos * n_kv_heads + kvh) * 128u;
+
+            float2 lo = *(const float2*)(kv + i0);
+            float2 hi = *(const float2*)(kv + 64u + i0);
+            float2 vlo = *(const float2*)(vv + i0);
+            float2 vhi = *(const float2*)(vv + 64u + i0);
+            *(float2*)(vc + i0) = vlo;
+            *(float2*)(vc + 64u + i0) = vhi;
+
+            if (k_norm_w != nullptr) {
+                float ss = lo.x * lo.x + lo.y * lo.y + hi.x * hi.x + hi.y * hi.y;
+                float inv = rsqrtf(scoria_wave_sum(ss) * (1.0f / 128.0f) + eps);
+                float2 wlo = *(const float2*)(k_norm_w + i0);
+                float2 whi = *(const float2*)(k_norm_w + 64u + i0);
+                lo.x *= inv * wlo.x;
+                lo.y *= inv * wlo.y;
+                hi.x *= inv * whi.x;
+                hi.y *= inv * whi.y;
+            }
+            float2 out_lo = {lo.x * c0 - hi.x * s0, lo.y * c1 - hi.y * s1};
+            float2 out_hi = {lo.x * s0 + hi.x * c0, lo.y * s1 + hi.y * c1};
+            *(float2*)(kc + i0) = out_lo;
+            *(float2*)(kc + 64u + i0) = out_hi;
+        }
+        return;
+    }
+#endif
+
+    unsigned half_dim = head_dim >> 1;
+    const float* src = is_q
+        ? (q + ((size_t)tok * n_heads + h) * head_dim)
+        : (k_in + ((size_t)tok * n_kv_heads + (h - n_heads)) * head_dim);
+    const float* norm_w = is_q ? q_norm_w : k_norm_w;
+    float* dst = is_q
+        ? (q + ((size_t)tok * n_heads + h) * head_dim)
+        : (k_cache + ((size_t)pos * n_kv_heads + (h - n_heads)) * head_dim);
+
+    float inv = 1.0f;
+    if (norm_w != nullptr) {
+        float ss = 0.0f;
+        for (unsigned i = lane; i < half_dim; i += SCORIA_WAVE_SIZE) {
+            float x0 = src[i];
+            float x1 = src[i + half_dim];
+            ss += x0 * x0 + x1 * x1;
+        }
+        inv = rsqrtf(scoria_wave_sum(ss) / (float)head_dim + eps);
+    }
+
+    for (unsigned i = lane; i < half_dim; i += SCORIA_WAVE_SIZE) {
+        float x0 = src[i];
+        float x1 = src[i + half_dim];
+        if (norm_w != nullptr) {
+            x0 *= inv * norm_w[i];
+            x1 *= inv * norm_w[i + half_dim];
+        }
+        float inv_freq = powf(freq_base, -2.0f * (float)i / (float)head_dim);
+        float theta = (float)pos * inv_freq;
+        float c = cosf(theta);
+        float s = sinf(theta);
+        dst[i] = x0 * c - x1 * s;
+        dst[i + half_dim] = x0 * s + x1 * c;
+    }
+
+    if (!is_q) {
+        unsigned kvh = h - n_heads;
+        const float* vv = v_in + ((size_t)tok * n_kv_heads + kvh) * head_dim;
+        float* vc = v_cache + ((size_t)pos * n_kv_heads + kvh) * head_dim;
+        for (unsigned i = lane; i < head_dim; i += SCORIA_WAVE_SIZE) {
+            vc[i] = vv[i];
+        }
+    }
+}
+
 extern "C" __global__ void gqa_attn_f32(const float* __restrict__ q,
                                         const float* __restrict__ k_cache,
                                         const float* __restrict__ v_cache,
@@ -1275,6 +1406,308 @@ extern "C" __global__ void gemv_q4_k_r8_f32(const unsigned char* __restrict__ we
     gemv_q4_k_rows_impl<8u>(weight, x, bias, y, n, k);
 }
 
+// Fused Q4_K gate + up GEMV + SiLU*up for m=1 decode.
+// One wavefront per output row computes gate & up simultaneously while reading `x` once,
+// eliminating 2 kernel launches + the intermediate `up` DRAM roundtrip per layer.
+extern "C" __global__ void gemv_q4_k_gate_up_silu_f32(const unsigned char* __restrict__ w_gate,
+                                                      const unsigned char* __restrict__ w_up,
+                                                      const float* __restrict__ x,
+                                                      float* __restrict__ y_out,
+                                                      unsigned n,
+                                                      unsigned k) {
+    unsigned row = blockIdx.x;
+    if (row >= n) return;
+    unsigned lane = threadIdx.x;
+    if (lane >= SCORIA_WAVE_SIZE) return;
+
+    unsigned grp = lane >> 3;
+    unsigned lane_in_blk = lane & 7u;
+    unsigned grp_stride = SCORIA_WAVE_SIZE >> 3;
+    unsigned chunk = lane_in_blk >> 1;
+    unsigned half_c = lane_in_blk & 1u;
+    unsigned nb = k / 256u;
+    size_t row_bytes = (size_t)nb * 144u;
+
+    const unsigned char* wg = w_gate + (size_t)row * row_bytes;
+    const unsigned char* wu = w_up + (size_t)row * row_bytes;
+    float acc_g = 0.0f;
+    float acc_u = 0.0f;
+
+    for (unsigned b = grp; b < nb; b += grp_stride) {
+        const unsigned char* bg = wg + (size_t)b * 144u;
+        const unsigned char* bu = wu + (size_t)b * 144u;
+        uint4 hdr_g = *(const uint4*)bg;
+        uint4 q_g = *(const uint4*)(bg + 16u + (size_t)lane_in_blk * 16u);
+        uint4 hdr_u = *(const uint4*)bu;
+        uint4 q_u = *(const uint4*)(bu + 16u + (size_t)lane_in_blk * 16u);
+
+        const float* xp = x + (size_t)b * 256u + chunk * 64u + half_c * 16u;
+        float4 x_lo0 = *(const float4*)(xp + 0u);
+        float4 x_lo1 = *(const float4*)(xp + 4u);
+        float4 x_lo2 = *(const float4*)(xp + 8u);
+        float4 x_lo3 = *(const float4*)(xp + 12u);
+        float4 x_hi0 = *(const float4*)(xp + 32u);
+        float4 x_hi1 = *(const float4*)(xp + 36u);
+        float4 x_hi2 = *(const float4*)(xp + 40u);
+        float4 x_hi3 = *(const float4*)(xp + 44u);
+
+        float xs_lo = (x_lo0.x + x_lo0.y + x_lo0.z + x_lo0.w)
+                    + (x_lo1.x + x_lo1.y + x_lo1.z + x_lo1.w)
+                    + (x_lo2.x + x_lo2.y + x_lo2.z + x_lo2.w)
+                    + (x_lo3.x + x_lo3.y + x_lo3.z + x_lo3.w);
+        float xs_hi = (x_hi0.x + x_hi0.y + x_hi0.z + x_hi0.w)
+                    + (x_hi1.x + x_hi1.y + x_hi1.z + x_hi1.w)
+                    + (x_hi2.x + x_hi2.y + x_hi2.z + x_hi2.w)
+                    + (x_hi3.x + x_hi3.y + x_hi3.z + x_hi3.w);
+
+        float d1g, m1g, d2g, m2g;
+        scoria_q4k_unpack_scales(hdr_g, chunk, &d1g, &m1g, &d2g, &m2g);
+        float s_lo_g = 0.0f, s_hi_g = 0.0f;
+        scoria_q4k_dot_word(q_g.x, x_lo0, x_hi0, &s_lo_g, &s_hi_g);
+        scoria_q4k_dot_word(q_g.y, x_lo1, x_hi1, &s_lo_g, &s_hi_g);
+        scoria_q4k_dot_word(q_g.z, x_lo2, x_hi2, &s_lo_g, &s_hi_g);
+        scoria_q4k_dot_word(q_g.w, x_lo3, x_hi3, &s_lo_g, &s_hi_g);
+        acc_g += (d1g * s_lo_g - m1g * xs_lo) + (d2g * s_hi_g - m2g * xs_hi);
+
+        float d1u, m1u, d2u, m2u;
+        scoria_q4k_unpack_scales(hdr_u, chunk, &d1u, &m1u, &d2u, &m2u);
+        float s_lo_u = 0.0f, s_hi_u = 0.0f;
+        scoria_q4k_dot_word(q_u.x, x_lo0, x_hi0, &s_lo_u, &s_hi_u);
+        scoria_q4k_dot_word(q_u.y, x_lo1, x_hi1, &s_lo_u, &s_hi_u);
+        scoria_q4k_dot_word(q_u.z, x_lo2, x_hi2, &s_lo_u, &s_hi_u);
+        scoria_q4k_dot_word(q_u.w, x_lo3, x_hi3, &s_lo_u, &s_hi_u);
+        acc_u += (d1u * s_lo_u - m1u * xs_lo) + (d2u * s_hi_u - m2u * xs_hi);
+    }
+
+    float sg = scoria_wave_sum(acc_g);
+    float su = scoria_wave_sum(acc_u);
+    if (lane == 0) {
+        float silu = sg / (1.0f + expf(-sg));
+        y_out[row] = silu * su;
+    }
+}
+
+// 48-byte 16B-aligned Q8_1 block per 32 floats:
+// [0..31] int8 qs[32], [32..35] float d, [36..39] float s (d * sum(qs)), [40..47] pad.
+extern "C" __global__ void quantize_q8_1_f32(const float* __restrict__ x,
+                                             unsigned char* __restrict__ out_q8,
+                                             unsigned k) {
+    unsigned blk_id = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (blk_id * 32u >= k) return;
+    unsigned lane = threadIdx.x & 31u;
+
+    float v = x[(size_t)blk_id * 32u + lane];
+    float amax = fabsf(v);
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        amax = fmaxf(amax, __shfl_xor(amax, off, 32));
+    }
+    float d = amax * (1.0f / 127.0f);
+    float inv_d = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+    int q = (int)rintf(v * inv_d);
+    if (q > 127) q = 127;
+    if (q < -127) q = -127;
+
+    int q0 = q;
+    int q1 = __shfl_xor(q, 1, 32);
+    int q2 = __shfl_xor(q, 2, 32);
+    int q3 = __shfl_xor(q, 3, 32);
+
+    int sum_q = q;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        sum_q += __shfl_xor(sum_q, off, 32);
+    }
+
+    unsigned char* dst = out_q8 + (size_t)blk_id * 48u;
+    if ((lane & 3u) == 0u) {
+        int packed = (q0 & 0xFF)
+                   | ((q1 & 0xFF) << 8)
+                   | ((q2 & 0xFF) << 16)
+                   | ((q3 & 0xFF) << 24);
+        ((int*)dst)[lane >> 2] = packed;
+    }
+    if (lane == 0u) {
+        float2 hdr = {d, d * (float)sum_q};
+        *(float2*)(dst + 32u) = hdr;
+    }
+}
+
+extern "C" __global__ void gemv_q4_k_q8_1_f32(const unsigned char* __restrict__ weight,
+                                              const unsigned char* __restrict__ x_q8,
+                                              const float* __restrict__ bias,
+                                              float* __restrict__ y,
+                                              unsigned n,
+                                              unsigned k) {
+    unsigned wave_id = threadIdx.x / SCORIA_WAVE_SIZE;
+    unsigned lane = threadIdx.x & (SCORIA_WAVE_SIZE - 1u);
+    unsigned waves_per_wg = blockDim.x / SCORIA_WAVE_SIZE;
+    unsigned row0 = (blockIdx.x * waves_per_wg + wave_id) * 2u;
+    if (row0 >= n) return;
+    unsigned row1 = row0 + 1u;
+    bool has_r1 = row1 < n;
+
+    unsigned grp = lane >> 3;
+    unsigned lane_in_blk = lane & 7u;
+    unsigned grp_stride = SCORIA_WAVE_SIZE >> 3;
+    unsigned chunk = lane_in_blk >> 1;
+    unsigned half_c = lane_in_blk & 1u;
+    unsigned nb = k / 256u;
+    size_t row_bytes = (size_t)nb * 144u;
+
+    const unsigned char* w0 = weight + (size_t)row0 * row_bytes;
+    const unsigned char* w1 = w0 + row_bytes;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    for (unsigned b = grp; b < nb; b += grp_stride) {
+        const unsigned char* blk0 = w0 + (size_t)b * 144u;
+        uint4 hdr0 = *(const uint4*)blk0;
+        uint4 q0 = *(const uint4*)(blk0 + 16u + (size_t)lane_in_blk * 16u);
+        uint4 hdr1 = {0u, 0u, 0u, 0u};
+        uint4 q1 = {0u, 0u, 0u, 0u};
+        if (has_r1) {
+            const unsigned char* blk1 = w1 + (size_t)b * 144u;
+            hdr1 = *(const uint4*)blk1;
+            q1 = *(const uint4*)(blk1 + 16u + (size_t)lane_in_blk * 16u);
+        }
+
+        const unsigned char* x_lo_blk = x_q8 + ((size_t)b * 8u + chunk * 2u) * 48u;
+        const unsigned char* x_hi_blk = x_lo_blk + 48u;
+        int4 qx_lo = *(const int4*)(x_lo_blk + (size_t)half_c * 16u);
+        int4 qx_hi = *(const int4*)(x_hi_blk + (size_t)half_c * 16u);
+        float2 ds_lo = *(const float2*)(x_lo_blk + 32u);
+        float2 ds_hi = *(const float2*)(x_hi_blk + 32u);
+
+        float d1_0, m1_0, d2_0, m2_0;
+        scoria_q4k_unpack_scales(hdr0, chunk, &d1_0, &m1_0, &d2_0, &m2_0);
+        int dot_lo0 = 0;
+        dot_lo0 = scoria_dot4_u8_i8(q0.x & 0x0F0F0F0Fu, qx_lo.x, dot_lo0);
+        dot_lo0 = scoria_dot4_u8_i8(q0.y & 0x0F0F0F0Fu, qx_lo.y, dot_lo0);
+        dot_lo0 = scoria_dot4_u8_i8(q0.z & 0x0F0F0F0Fu, qx_lo.z, dot_lo0);
+        dot_lo0 = scoria_dot4_u8_i8(q0.w & 0x0F0F0F0Fu, qx_lo.w, dot_lo0);
+        int dot_hi0 = 0;
+        dot_hi0 = scoria_dot4_u8_i8((q0.x >> 4) & 0x0F0F0F0Fu, qx_hi.x, dot_hi0);
+        dot_hi0 = scoria_dot4_u8_i8((q0.y >> 4) & 0x0F0F0F0Fu, qx_hi.y, dot_hi0);
+        dot_hi0 = scoria_dot4_u8_i8((q0.z >> 4) & 0x0F0F0F0Fu, qx_hi.z, dot_hi0);
+        dot_hi0 = scoria_dot4_u8_i8((q0.w >> 4) & 0x0F0F0F0Fu, qx_hi.w, dot_hi0);
+        acc0 += d1_0 * ds_lo.x * (float)dot_lo0 + d2_0 * ds_hi.x * (float)dot_hi0;
+        if (half_c == 0u) {
+            acc0 -= (m1_0 * ds_lo.y + m2_0 * ds_hi.y);
+        }
+
+        if (has_r1) {
+            float d1_1, m1_1, d2_1, m2_1;
+            scoria_q4k_unpack_scales(hdr1, chunk, &d1_1, &m1_1, &d2_1, &m2_1);
+            int dot_lo1 = 0;
+            dot_lo1 = scoria_dot4_u8_i8(q1.x & 0x0F0F0F0Fu, qx_lo.x, dot_lo1);
+            dot_lo1 = scoria_dot4_u8_i8(q1.y & 0x0F0F0F0Fu, qx_lo.y, dot_lo1);
+            dot_lo1 = scoria_dot4_u8_i8(q1.z & 0x0F0F0F0Fu, qx_lo.z, dot_lo1);
+            dot_lo1 = scoria_dot4_u8_i8(q1.w & 0x0F0F0F0Fu, qx_lo.w, dot_lo1);
+            int dot_hi1 = 0;
+            dot_hi1 = scoria_dot4_u8_i8((q1.x >> 4) & 0x0F0F0F0Fu, qx_hi.x, dot_hi1);
+            dot_hi1 = scoria_dot4_u8_i8((q1.y >> 4) & 0x0F0F0F0Fu, qx_hi.y, dot_hi1);
+            dot_hi1 = scoria_dot4_u8_i8((q1.z >> 4) & 0x0F0F0F0Fu, qx_hi.z, dot_hi1);
+            dot_hi1 = scoria_dot4_u8_i8((q1.w >> 4) & 0x0F0F0F0Fu, qx_hi.w, dot_hi1);
+            acc1 += d1_1 * ds_lo.x * (float)dot_lo1 + d2_1 * ds_hi.x * (float)dot_hi1;
+            if (half_c == 0u) {
+                acc1 -= (m1_1 * ds_lo.y + m2_1 * ds_hi.y);
+            }
+        }
+    }
+
+    float s0 = scoria_wave_sum(acc0);
+    float s1 = scoria_wave_sum(acc1);
+    if (lane == 0u) {
+        y[row0] = s0 + (bias ? bias[row0] : 0.0f);
+        if (has_r1) {
+            y[row1] = s1 + (bias ? bias[row1] : 0.0f);
+        }
+    }
+}
+
+extern "C" __global__ void gemv_q4_k_gate_up_silu_q8_1_f32(const unsigned char* __restrict__ w_gate,
+                                                           const unsigned char* __restrict__ w_up,
+                                                           const unsigned char* __restrict__ x_q8,
+                                                           float* __restrict__ y_out,
+                                                           unsigned n,
+                                                           unsigned k) {
+    unsigned wave_id = threadIdx.x / SCORIA_WAVE_SIZE;
+    unsigned lane = threadIdx.x & (SCORIA_WAVE_SIZE - 1u);
+    unsigned waves_per_wg = blockDim.x / SCORIA_WAVE_SIZE;
+    unsigned row = blockIdx.x * waves_per_wg + wave_id;
+    if (row >= n) return;
+
+    unsigned grp = lane >> 3;
+    unsigned lane_in_blk = lane & 7u;
+    unsigned grp_stride = SCORIA_WAVE_SIZE >> 3;
+    unsigned chunk = lane_in_blk >> 1;
+    unsigned half_c = lane_in_blk & 1u;
+    unsigned nb = k / 256u;
+    size_t row_bytes = (size_t)nb * 144u;
+
+    const unsigned char* wg = w_gate + (size_t)row * row_bytes;
+    const unsigned char* wu = w_up + (size_t)row * row_bytes;
+    float acc_g = 0.0f;
+    float acc_u = 0.0f;
+
+    for (unsigned b = grp; b < nb; b += grp_stride) {
+        const unsigned char* bg = wg + (size_t)b * 144u;
+        const unsigned char* bu = wu + (size_t)b * 144u;
+        uint4 hdr_g = *(const uint4*)bg;
+        uint4 q_g = *(const uint4*)(bg + 16u + (size_t)lane_in_blk * 16u);
+        uint4 hdr_u = *(const uint4*)bu;
+        uint4 q_u = *(const uint4*)(bu + 16u + (size_t)lane_in_blk * 16u);
+
+        const unsigned char* x_lo_blk = x_q8 + ((size_t)b * 8u + chunk * 2u) * 48u;
+        const unsigned char* x_hi_blk = x_lo_blk + 48u;
+        int4 qx_lo = *(const int4*)(x_lo_blk + (size_t)half_c * 16u);
+        int4 qx_hi = *(const int4*)(x_hi_blk + (size_t)half_c * 16u);
+        float2 ds_lo = *(const float2*)(x_lo_blk + 32u);
+        float2 ds_hi = *(const float2*)(x_hi_blk + 32u);
+
+        float d1g, m1g, d2g, m2g;
+        scoria_q4k_unpack_scales(hdr_g, chunk, &d1g, &m1g, &d2g, &m2g);
+        int dot_lo_g = 0;
+        dot_lo_g = scoria_dot4_u8_i8(q_g.x & 0x0F0F0F0Fu, qx_lo.x, dot_lo_g);
+        dot_lo_g = scoria_dot4_u8_i8(q_g.y & 0x0F0F0F0Fu, qx_lo.y, dot_lo_g);
+        dot_lo_g = scoria_dot4_u8_i8(q_g.z & 0x0F0F0F0Fu, qx_lo.z, dot_lo_g);
+        dot_lo_g = scoria_dot4_u8_i8(q_g.w & 0x0F0F0F0Fu, qx_lo.w, dot_lo_g);
+        int dot_hi_g = 0;
+        dot_hi_g = scoria_dot4_u8_i8((q_g.x >> 4) & 0x0F0F0F0Fu, qx_hi.x, dot_hi_g);
+        dot_hi_g = scoria_dot4_u8_i8((q_g.y >> 4) & 0x0F0F0F0Fu, qx_hi.y, dot_hi_g);
+        dot_hi_g = scoria_dot4_u8_i8((q_g.z >> 4) & 0x0F0F0F0Fu, qx_hi.z, dot_hi_g);
+        dot_hi_g = scoria_dot4_u8_i8((q_g.w >> 4) & 0x0F0F0F0Fu, qx_hi.w, dot_hi_g);
+        acc_g += d1g * ds_lo.x * (float)dot_lo_g + d2g * ds_hi.x * (float)dot_hi_g;
+
+        float d1u, m1u, d2u, m2u;
+        scoria_q4k_unpack_scales(hdr_u, chunk, &d1u, &m1u, &d2u, &m2u);
+        int dot_lo_u = 0;
+        dot_lo_u = scoria_dot4_u8_i8(q_u.x & 0x0F0F0F0Fu, qx_lo.x, dot_lo_u);
+        dot_lo_u = scoria_dot4_u8_i8(q_u.y & 0x0F0F0F0Fu, qx_lo.y, dot_lo_u);
+        dot_lo_u = scoria_dot4_u8_i8(q_u.z & 0x0F0F0F0Fu, qx_lo.z, dot_lo_u);
+        dot_lo_u = scoria_dot4_u8_i8(q_u.w & 0x0F0F0F0Fu, qx_lo.w, dot_lo_u);
+        int dot_hi_u = 0;
+        dot_hi_u = scoria_dot4_u8_i8((q_u.x >> 4) & 0x0F0F0F0Fu, qx_hi.x, dot_hi_u);
+        dot_hi_u = scoria_dot4_u8_i8((q_u.y >> 4) & 0x0F0F0F0Fu, qx_hi.y, dot_hi_u);
+        dot_hi_u = scoria_dot4_u8_i8((q_u.z >> 4) & 0x0F0F0F0Fu, qx_hi.z, dot_hi_u);
+        dot_hi_u = scoria_dot4_u8_i8((q_u.w >> 4) & 0x0F0F0F0Fu, qx_hi.w, dot_hi_u);
+        acc_u += d1u * ds_lo.x * (float)dot_lo_u + d2u * ds_hi.x * (float)dot_hi_u;
+
+        if (half_c == 0u) {
+            acc_g -= (m1g * ds_lo.y + m2g * ds_hi.y);
+            acc_u -= (m1u * ds_lo.y + m2u * ds_hi.y);
+        }
+    }
+
+    float sg = scoria_wave_sum(acc_g);
+    float su = scoria_wave_sum(acc_u);
+    if (lane == 0u) {
+        float silu = sg / (1.0f + expf(-sg));
+        y_out[row] = silu * su;
+    }
+}
+
 extern "C" __global__ void gemv_q6_k_f32(const unsigned char* __restrict__ weight,
                                          const float* __restrict__ x,
                                          const float* __restrict__ bias,
@@ -1399,7 +1832,54 @@ extern "C" __global__ void wmma_probe_f16(const _Float16* __restrict__ A,
     }
 }
 
+__device__ __forceinline__ uint2 scoria_pack_h4(_Float16 h0, _Float16 h1, _Float16 h2, _Float16 h3) {
+    union {
+        _Float16 h[4];
+        uint2 u;
+    } p;
+    p.h[0] = h0;
+    p.h[1] = h1;
+    p.h[2] = h2;
+    p.h[3] = h3;
+    return p.u;
+}
+
 struct WmmaLoaderF16 {
+    struct Regs {
+        uint4 v;
+        bool valid;
+    };
+
+    static __device__ __forceinline__ Regs fetch(const unsigned char* __restrict__ weight,
+                                                unsigned k,
+                                                unsigned n,
+                                                unsigned n0,
+                                                unsigned k0,
+                                                unsigned tid) {
+        Regs r;
+        unsigned rw = tid >> 2;
+        unsigned l0 = (tid & 3u) * 8u;
+        unsigned gn = n0 + rw;
+        r.valid = gn < n;
+        if (r.valid) {
+            r.v = *(const uint4*)(weight + ((size_t)gn * k + k0 + l0) * 2u);
+        } else {
+            r.v = make_uint4(0u, 0u, 0u, 0u);
+        }
+        return r;
+    }
+
+    static __device__ __forceinline__ void store(const Regs& r,
+                                                 unsigned /*k0*/,
+                                                 unsigned tid,
+                                                 _Float16 s_w[64][36]) {
+        unsigned rw = tid >> 2;
+        unsigned l0 = (tid & 3u) * 8u;
+        uint2* dst = (uint2*)(&s_w[rw][l0]);
+        dst[0] = make_uint2(r.v.x, r.v.y);
+        dst[1] = make_uint2(r.v.z, r.v.w);
+    }
+
     static __device__ __forceinline__ void load(const unsigned char* __restrict__ weight,
                                                 unsigned k,
                                                 unsigned n,
@@ -1407,102 +1887,231 @@ struct WmmaLoaderF16 {
                                                 unsigned k0,
                                                 unsigned tid,
                                                 _Float16 s_w[64][36]) {
-        unsigned rw = tid >> 2;
-        unsigned t4 = tid & 3u;
-        unsigned l0 = t4 * 8u;
-        unsigned gn = n0 + rw;
-        if (gn >= n) {
-            #pragma unroll
-            for (int i = 0; i < 8; ++i) s_w[rw][l0 + (unsigned)i] = (_Float16)0.0f;
-            return;
-        }
-        const unsigned char* ptr = weight + ((size_t)gn * k + k0 + l0) * 2u;
-        uint4 v = *(const uint4*)ptr;
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            unsigned word = (i == 0) ? v.x : ((i == 1) ? v.y : ((i == 2) ? v.z : v.w));
-            union {
-                unsigned short u;
-                _Float16 h;
-            } lo_c, hi_c;
-            lo_c.u = (unsigned short)(word & 0xFFFFu);
-            hi_c.u = (unsigned short)(word >> 16);
-            s_w[rw][l0 + (unsigned)i * 2u] = lo_c.h;
-            s_w[rw][l0 + (unsigned)i * 2u + 1u] = hi_c.h;
-        }
+        Regs r = fetch(weight, k, n, n0, k0, tid);
+        store(r, k0, tid, s_w);
     }
 };
 
 struct WmmaLoaderQ8_0 {
-    static __device__ __forceinline__ void load(const unsigned char* __restrict__ weight,
+    struct Regs {
+        float d;
+        unsigned q_lo;
+        unsigned q_hi;
+        bool valid;
+    };
+
+    static __device__ __forceinline__ Regs fetch(const unsigned char* __restrict__ weight,
                                                 unsigned k,
                                                 unsigned n,
                                                 unsigned n0,
                                                 unsigned k0,
-                                                unsigned tid,
-                                                _Float16 s_w[64][36]) {
+                                                unsigned tid) {
+        Regs r;
         unsigned rw = tid >> 2;
-        unsigned t4 = tid & 3u;
-        unsigned l0 = t4 * 8u;
+        unsigned l0 = (tid & 3u) * 8u;
         unsigned gn = n0 + rw;
-        if (gn >= n) {
-            #pragma unroll
-            for (int i = 0; i < 8; ++i) s_w[rw][l0 + (unsigned)i] = (_Float16)0.0f;
-            return;
+        r.valid = gn < n;
+        if (!r.valid) {
+            r.d = 0.0f;
+            r.q_lo = 0u;
+            r.q_hi = 0u;
+            return r;
         }
         unsigned nb = k / 32u;
         unsigned b = k0 >> 5;
         const unsigned char* blk = weight + ((size_t)gn * nb + b) * 34u;
-        float d = scoria_f16_bits_to_f32(*(const unsigned short*)blk);
-        const signed char* qs = (const signed char*)(blk + 2u + l0);
-        #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            s_w[rw][l0 + (unsigned)i] = (_Float16)(d * (float)qs[i]);
+        r.d = scoria_f16_bits_to_f32(*(const unsigned short*)blk);
+        const unsigned short* qs16 = (const unsigned short*)(blk + 2u + l0);
+        r.q_lo = (unsigned)qs16[0] | ((unsigned)qs16[1] << 16);
+        r.q_hi = (unsigned)qs16[2] | ((unsigned)qs16[3] << 16);
+        return r;
+    }
+
+    static __device__ __forceinline__ void store(const Regs& r,
+                                                 unsigned /*k0*/,
+                                                 unsigned tid,
+                                                 _Float16 s_w[64][36]) {
+        unsigned rw = tid >> 2;
+        unsigned l0 = (tid & 3u) * 8u;
+        uint2* dst = (uint2*)(&s_w[rw][l0]);
+        if (!r.valid) {
+            dst[0] = make_uint2(0u, 0u);
+            dst[1] = make_uint2(0u, 0u);
+            return;
         }
+        float d = r.d;
+        dst[0] = scoria_pack_h4(
+            (_Float16)(d * (float)(signed char)(r.q_lo & 0xFFu)),
+            (_Float16)(d * (float)(signed char)((r.q_lo >> 8) & 0xFFu)),
+            (_Float16)(d * (float)(signed char)((r.q_lo >> 16) & 0xFFu)),
+            (_Float16)(d * (float)(signed char)(r.q_lo >> 24)));
+        dst[1] = scoria_pack_h4(
+            (_Float16)(d * (float)(signed char)(r.q_hi & 0xFFu)),
+            (_Float16)(d * (float)(signed char)((r.q_hi >> 8) & 0xFFu)),
+            (_Float16)(d * (float)(signed char)((r.q_hi >> 16) & 0xFFu)),
+            (_Float16)(d * (float)(signed char)(r.q_hi >> 24)));
+    }
+
+    static __device__ __forceinline__ void load(const unsigned char* __restrict__ weight,
+                                                unsigned k,
+                                                unsigned n,
+                                                unsigned n0,
+                                                unsigned k0,
+                                                unsigned tid,
+                                                _Float16 s_w[64][36]) {
+        Regs r = fetch(weight, k, n, n0, k0, tid);
+        store(r, k0, tid, s_w);
     }
 };
 
 struct WmmaLoaderQ5_0 {
-    static __device__ __forceinline__ void load(const unsigned char* __restrict__ weight,
+    struct Regs {
+        float d;
+        unsigned qh;
+        unsigned q4bytes;
+        bool valid;
+    };
+
+    static __device__ __forceinline__ Regs fetch(const unsigned char* __restrict__ weight,
                                                 unsigned k,
                                                 unsigned n,
                                                 unsigned n0,
                                                 unsigned k0,
-                                                unsigned tid,
-                                                _Float16 s_w[64][36]) {
+                                                unsigned tid) {
+        Regs r;
         unsigned rw = tid >> 2;
         unsigned t4 = tid & 3u;
         unsigned j0 = t4 * 4u;
         unsigned gn = n0 + rw;
-        if (gn >= n) {
-            #pragma unroll
-            for (unsigned u = 0; u < 4u; ++u) {
-                s_w[rw][j0 + u] = (_Float16)0.0f;
-                s_w[rw][j0 + 16u + u] = (_Float16)0.0f;
-            }
-            return;
+        r.valid = gn < n;
+        if (!r.valid) {
+            r.d = 0.0f;
+            r.qh = 0u;
+            r.q4bytes = 0u;
+            return r;
         }
         unsigned nb = k / 32u;
         unsigned b = k0 >> 5;
         const unsigned char* blk = weight + ((size_t)gn * nb + b) * 22u;
-        float d = scoria_f16_bits_to_f32(*(const unsigned short*)blk);
-        unsigned qh = (unsigned)(*(const unsigned short*)(blk + 2u))
-                    | ((unsigned)(*(const unsigned short*)(blk + 4u)) << 16);
+        r.d = scoria_f16_bits_to_f32(*(const unsigned short*)blk);
+        r.qh = (unsigned)(*(const unsigned short*)(blk + 2u))
+             | ((unsigned)(*(const unsigned short*)(blk + 4u)) << 16);
+        const unsigned short* qs16 = (const unsigned short*)(blk + 6u + j0);
+        r.q4bytes = (unsigned)qs16[0] | ((unsigned)qs16[1] << 16);
+        return r;
+    }
+
+    static __device__ __forceinline__ void store(const Regs& r,
+                                                 unsigned /*k0*/,
+                                                 unsigned tid,
+                                                 _Float16 s_w[64][36]) {
+        unsigned rw = tid >> 2;
+        unsigned j0 = (tid & 3u) * 4u;
+        if (!r.valid) {
+            *(uint2*)(&s_w[rw][j0]) = make_uint2(0u, 0u);
+            *(uint2*)(&s_w[rw][j0 + 16u]) = make_uint2(0u, 0u);
+            return;
+        }
+        _Float16 h0[4], h1[4];
         #pragma unroll
         for (unsigned u = 0; u < 4u; ++u) {
             unsigned j = j0 + u;
-            unsigned char qb = blk[6u + j];
-            unsigned xh_0 = ((qh >> j) << 4) & 0x10u;
-            unsigned xh_1 = (qh >> (j + 12u)) & 0x10u;
+            unsigned qb = (r.q4bytes >> (u * 8u)) & 0xFFu;
+            unsigned xh_0 = ((r.qh >> j) << 4) & 0x10u;
+            unsigned xh_1 = (r.qh >> (j + 12u)) & 0x10u;
             int q0 = (int)((qb & 0x0Fu) | xh_0) - 16;
             int q1 = (int)((qb >> 4) | xh_1) - 16;
-            s_w[rw][j] = (_Float16)(d * (float)q0);
-            s_w[rw][j + 16u] = (_Float16)(d * (float)q1);
+            h0[u] = (_Float16)(r.d * (float)q0);
+            h1[u] = (_Float16)(r.d * (float)q1);
         }
+        *(uint2*)(&s_w[rw][j0]) = scoria_pack_h4(h0[0], h0[1], h0[2], h0[3]);
+        *(uint2*)(&s_w[rw][j0 + 16u]) = scoria_pack_h4(h1[0], h1[1], h1[2], h1[3]);
+    }
+
+    static __device__ __forceinline__ void load(const unsigned char* __restrict__ weight,
+                                                unsigned k,
+                                                unsigned n,
+                                                unsigned n0,
+                                                unsigned k0,
+                                                unsigned tid,
+                                                _Float16 s_w[64][36]) {
+        Regs r = fetch(weight, k, n, n0, k0, tid);
+        store(r, k0, tid, s_w);
     }
 };
 
 struct WmmaLoaderQ4_K {
+    struct Regs {
+        uint4 hdr;
+        uint2 q8;
+        bool valid;
+    };
+
+    static __device__ __forceinline__ Regs fetch(const unsigned char* __restrict__ weight,
+                                                unsigned k,
+                                                unsigned n,
+                                                unsigned n0,
+                                                unsigned k0,
+                                                unsigned tid) {
+        Regs r;
+        unsigned rw = tid >> 2;
+        unsigned l0 = (tid & 3u) * 8u;
+        unsigned gn = n0 + rw;
+        r.valid = gn < n;
+        if (!r.valid) {
+            r.hdr = make_uint4(0u, 0u, 0u, 0u);
+            r.q8 = make_uint2(0u, 0u);
+            return r;
+        }
+        unsigned nb = k / 256u;
+        unsigned b = k0 >> 8;
+        unsigned chunk = (k0 >> 6) & 3u;
+        const unsigned char* blk = weight + ((size_t)gn * nb + b) * 144u;
+        r.hdr = *(const uint4*)blk;
+        r.q8 = *(const uint2*)(blk + 16u + chunk * 32u + l0);
+        return r;
+    }
+
+    static __device__ __forceinline__ void store_half(const Regs& r,
+                                                      unsigned chunk,
+                                                      unsigned hi,
+                                                      unsigned tid,
+                                                      _Float16 s_w[64][36]) {
+        unsigned rw = tid >> 2;
+        unsigned l0 = (tid & 3u) * 8u;
+        uint2* dst = (uint2*)(&s_w[rw][l0]);
+        if (!r.valid) {
+            dst[0] = make_uint2(0u, 0u);
+            dst[1] = make_uint2(0u, 0u);
+            return;
+        }
+        float d1, m1, d2, m2;
+        scoria_q4k_unpack_scales(r.hdr, chunk, &d1, &m1, &d2, &m2);
+        float d_eff = hi ? d2 : d1;
+        float m_eff = hi ? m2 : m1;
+
+        _Float16 lo_h[4], hi_h[4];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            unsigned b_lo = (r.q8.x >> (i * 8)) & 0xFFu;
+            unsigned b_hi = (r.q8.y >> (i * 8)) & 0xFFu;
+            unsigned nib_lo = hi ? (b_lo >> 4) : (b_lo & 0x0Fu);
+            unsigned nib_hi = hi ? (b_hi >> 4) : (b_hi & 0x0Fu);
+            lo_h[i] = (_Float16)(d_eff * (float)nib_lo - m_eff);
+            hi_h[i] = (_Float16)(d_eff * (float)nib_hi - m_eff);
+        }
+        dst[0] = scoria_pack_h4(lo_h[0], lo_h[1], lo_h[2], lo_h[3]);
+        dst[1] = scoria_pack_h4(hi_h[0], hi_h[1], hi_h[2], hi_h[3]);
+    }
+
+    static __device__ __forceinline__ void store(const Regs& r,
+                                                 unsigned k0,
+                                                 unsigned tid,
+                                                 _Float16 s_w[64][36]) {
+        unsigned sub32 = (k0 >> 5) & 7u;
+        store_half(r, sub32 >> 1, sub32 & 1u, tid, s_w);
+    }
+
     static __device__ __forceinline__ void load(const unsigned char* __restrict__ weight,
                                                 unsigned k,
                                                 unsigned n,
@@ -1510,56 +2119,36 @@ struct WmmaLoaderQ4_K {
                                                 unsigned k0,
                                                 unsigned tid,
                                                 _Float16 s_w[64][36]) {
-        unsigned rw = tid >> 2;
-        unsigned t4 = tid & 3u;
-        unsigned l0 = t4 * 8u;
-        unsigned gn = n0 + rw;
-        if (gn >= n) {
-            #pragma unroll
-            for (int i = 0; i < 8; ++i) s_w[rw][l0 + (unsigned)i] = (_Float16)0.0f;
-            return;
-        }
-        unsigned nb = k / 256u;
-        unsigned b = k0 >> 8;
-        unsigned sub32 = (k0 >> 5) & 7u;
-        unsigned chunk = sub32 >> 1;
-        unsigned hi = sub32 & 1u;
-        const unsigned char* blk = weight + ((size_t)gn * nb + b) * 144u;
-        uint4 hdr = *(const uint4*)blk;
-        float d1, m1, d2, m2;
-        scoria_q4k_unpack_scales(hdr, chunk, &d1, &m1, &d2, &m2);
-        float d_eff = hi ? d2 : d1;
-        float m_eff = hi ? m2 : m1;
-
-        uint2 q8 = *(const uint2*)(blk + 16u + chunk * 32u + l0);
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            unsigned b_lo = (q8.x >> (i * 8)) & 0xFFu;
-            unsigned b_hi = (q8.y >> (i * 8)) & 0xFFu;
-            unsigned nib_lo = hi ? (b_lo >> 4) : (b_lo & 0x0Fu);
-            unsigned nib_hi = hi ? (b_hi >> 4) : (b_hi & 0x0Fu);
-            s_w[rw][l0 + (unsigned)i] = (_Float16)(d_eff * (float)nib_lo - m_eff);
-            s_w[rw][l0 + 4u + (unsigned)i] = (_Float16)(d_eff * (float)nib_hi - m_eff);
-        }
+        Regs r = fetch(weight, k, n, n0, k0, tid);
+        store(r, k0, tid, s_w);
     }
 };
 
 struct WmmaLoaderQ6_K {
-    static __device__ __forceinline__ void load(const unsigned char* __restrict__ weight,
+    struct Regs {
+        float d_sc;
+        unsigned ql0;
+        unsigned ql1;
+        unsigned qh0;
+        unsigned qh1;
+        bool valid;
+    };
+
+    static __device__ __forceinline__ Regs fetch(const unsigned char* __restrict__ weight,
                                                 unsigned k,
                                                 unsigned n,
                                                 unsigned n0,
                                                 unsigned k0,
-                                                unsigned tid,
-                                                _Float16 s_w[64][36]) {
+                                                unsigned tid) {
+        Regs r;
         unsigned rw = tid >> 2;
-        unsigned t4 = tid & 3u;
-        unsigned l0 = t4 * 8u;
+        unsigned l0 = (tid & 3u) * 8u;
         unsigned gn = n0 + rw;
-        if (gn >= n) {
-            #pragma unroll
-            for (int i = 0; i < 8; ++i) s_w[rw][l0 + (unsigned)i] = (_Float16)0.0f;
-            return;
+        r.valid = gn < n;
+        if (!r.valid) {
+            r.d_sc = 0.0f;
+            r.ql0 = r.ql1 = r.qh0 = r.qh1 = 0u;
+            return r;
         }
         unsigned nb = k / 256u;
         unsigned b = k0 >> 8;
@@ -1570,32 +2159,119 @@ struct WmmaLoaderQ6_K {
         const unsigned char* blk = weight + ((size_t)gn * nb + b) * 210u;
         float d = scoria_f16_bits_to_f32(*(const unsigned short*)(blk + 208u));
         float sc = (float)(signed char)blk[192u + h * 8u + is + q_part * 2u];
-        float d_sc = d * sc;
+        r.d_sc = d * sc;
 
-        unsigned ql_off = h * 64u + ((q_part & 1u) ? 32u : 0u) + l0;
-        unsigned qh_off = 128u + h * 32u + l0;
+        const unsigned short* ql_ptr =
+            (const unsigned short*)(blk + h * 64u + ((q_part & 1u) ? 32u : 0u) + l0);
+        const unsigned short* qh_ptr = (const unsigned short*)(blk + 128u + h * 32u + l0);
+        r.ql0 = (unsigned)ql_ptr[0] | ((unsigned)ql_ptr[1] << 16);
+        r.ql1 = (unsigned)ql_ptr[2] | ((unsigned)ql_ptr[3] << 16);
+        r.qh0 = (unsigned)qh_ptr[0] | ((unsigned)qh_ptr[1] << 16);
+        r.qh1 = (unsigned)qh_ptr[2] | ((unsigned)qh_ptr[3] << 16);
+        return r;
+    }
+
+    static __device__ __forceinline__ void store(const Regs& r,
+                                                 unsigned k0,
+                                                 unsigned tid,
+                                                 _Float16 s_w[64][36]) {
+        unsigned rw = tid >> 2;
+        unsigned l0 = (tid & 3u) * 8u;
+        uint2* dst = (uint2*)(&s_w[rw][l0]);
+        if (!r.valid) {
+            dst[0] = make_uint2(0u, 0u);
+            dst[1] = make_uint2(0u, 0u);
+            return;
+        }
+        unsigned sub32 = (k0 >> 5) & 7u;
+        unsigned q_part = sub32 & 3u;
         unsigned ql_shift = (q_part >= 2u) ? 4u : 0u;
         unsigned qh_shift = q_part * 2u;
+
+        _Float16 h0[4], h1[4];
         #pragma unroll
-        for (unsigned pair = 0; pair < 4u; ++pair) {
-            unsigned short ql16 = *(const unsigned short*)(blk + ql_off + pair * 2u);
-            unsigned short qh16 = *(const unsigned short*)(blk + qh_off + pair * 2u);
-            unsigned qla = ql16 & 0xFFu;
-            unsigned qha = qh16 & 0xFFu;
+        for (unsigned i = 0; i < 4u; ++i) {
+            unsigned qla = (r.ql0 >> (i * 8u)) & 0xFFu;
+            unsigned qha = (r.qh0 >> (i * 8u)) & 0xFFu;
             int qa = (int)(((qla >> ql_shift) & 0x0Fu) | (((qha >> qh_shift) & 0x03u) << 4)) - 32;
-            unsigned qlb = ql16 >> 8;
-            unsigned qhb = qh16 >> 8;
+            h0[i] = (_Float16)(r.d_sc * (float)qa);
+
+            unsigned qlb = (r.ql1 >> (i * 8u)) & 0xFFu;
+            unsigned qhb = (r.qh1 >> (i * 8u)) & 0xFFu;
             int qb = (int)(((qlb >> ql_shift) & 0x0Fu) | (((qhb >> qh_shift) & 0x03u) << 4)) - 32;
-            s_w[rw][l0 + pair * 2u] = (_Float16)(d_sc * (float)qa);
-            s_w[rw][l0 + pair * 2u + 1u] = (_Float16)(d_sc * (float)qb);
+            h1[i] = (_Float16)(r.d_sc * (float)qb);
         }
+        dst[0] = scoria_pack_h4(h0[0], h0[1], h0[2], h0[3]);
+        dst[1] = scoria_pack_h4(h1[0], h1[1], h1[2], h1[3]);
+    }
+
+    static __device__ __forceinline__ void load(const unsigned char* __restrict__ weight,
+                                                unsigned k,
+                                                unsigned n,
+                                                unsigned n0,
+                                                unsigned k0,
+                                                unsigned tid,
+                                                _Float16 s_w[64][36]) {
+        Regs r = fetch(weight, k, n, n0, k0, tid);
+        store(r, k0, tid, s_w);
     }
 };
 
-// Prefill GEMM: 64x128 macro-tile, 32-deep K step, four 16x16 WMMA accumulators per
-// wave. Eight waves cover the tile as 2 (m) x 4 (n) wave-tile pairs of 2x2 fragments,
-// which doubles arithmetic intensity to ~43 flop/byte over the previous 32x64 tile
-// (21 flop/byte) and halves the LDS traffic per WMMA.
+__device__ __forceinline__ void scoria_fetch_x64(const float* __restrict__ x,
+                                                 unsigned m0,
+                                                 unsigned m,
+                                                 unsigned k,
+                                                 unsigned k0,
+                                                 unsigned rx,
+                                                 unsigned cx,
+                                                 float4* xv0,
+                                                 float4* xv1) {
+    unsigned gm0 = m0 + rx;
+    unsigned gm1 = m0 + 32u + rx;
+    *xv0 = (gm0 < m) ? *(const float4*)(x + (size_t)gm0 * k + k0 + cx)
+                     : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    *xv1 = (gm1 < m) ? *(const float4*)(x + (size_t)gm1 * k + k0 + cx)
+                     : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+}
+
+__device__ __forceinline__ void scoria_store_x64(float4 xv0,
+                                                 float4 xv1,
+                                                 unsigned rx,
+                                                 unsigned cx,
+                                                 _Float16 s_x[64][36]) {
+    *(uint2*)(&s_x[rx][cx]) = scoria_pack_h4(
+        (_Float16)xv0.x, (_Float16)xv0.y, (_Float16)xv0.z, (_Float16)xv0.w);
+    *(uint2*)(&s_x[32u + rx][cx]) = scoria_pack_h4(
+        (_Float16)xv1.x, (_Float16)xv1.y, (_Float16)xv1.z, (_Float16)xv1.w);
+}
+
+__device__ __forceinline__ void scoria_wmma_step64x128(const _Float16 s_x[64][36],
+                                                      const _Float16 s_w[128][36],
+                                                      unsigned wm,
+                                                      unsigned wn,
+                                                      unsigned mn,
+                                                      unsigned k_off,
+                                                      float8_t acc[4]) {
+    #pragma unroll
+    for (unsigned kk = 0u; kk < 32u; kk += 16u) {
+        half8_t a0, a1, b0, b1;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            a0[i] = s_x[(wm * 2u + 0u) * 16u + mn][kk + k_off + (unsigned)i];
+            a1[i] = s_x[(wm * 2u + 1u) * 16u + mn][kk + k_off + (unsigned)i];
+            b0[i] = s_w[(wn * 2u + 0u) * 16u + mn][kk + k_off + (unsigned)i];
+            b1[i] = s_w[(wn * 2u + 1u) * 16u + mn][kk + k_off + (unsigned)i];
+        }
+        acc[0] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a0, b0, acc[0]);
+        acc[1] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a0, b1, acc[1]);
+        acc[2] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a1, b0, acc[2]);
+        acc[3] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a1, b1, acc[3]);
+    }
+}
+
+// Double-buffered prefill GEMM: 64x128 macro-tile, 32-deep K step, four 16x16 WMMA
+// accumulators per wave, split fetch/store loaders with packed 64-bit LDS stores and
+// one barrier per K-step overlapping global loads with WMMA math.
 template <typename WeightLoader>
 __device__ __forceinline__ void gemm_wmma_wide_impl(const unsigned char* __restrict__ weight,
                                                      const float* __restrict__ x,
@@ -1604,6 +2280,7 @@ __device__ __forceinline__ void gemm_wmma_wide_impl(const unsigned char* __restr
                                                      unsigned m,
                                                      unsigned n,
                                                      unsigned k) {
+    if (k == 0u) return;
     unsigned tid = threadIdx.x;
     unsigned wave_id = tid >> 5;
     unsigned lane = tid & 31u;
@@ -1612,8 +2289,8 @@ __device__ __forceinline__ void gemm_wmma_wide_impl(const unsigned char* __restr
     unsigned m0 = blockIdx.y * 64u;
     unsigned n0 = blockIdx.x * 128u;
 
-    __shared__ _Float16 s_x[64][36];
-    __shared__ _Float16 s_w[128][36];
+    __shared__ _Float16 s_x[2][64][36];
+    __shared__ _Float16 s_w[2][128][36];
 
     float8_t acc[4];
     #pragma unroll
@@ -1621,49 +2298,128 @@ __device__ __forceinline__ void gemm_wmma_wide_impl(const unsigned char* __restr
 
     unsigned rx = tid >> 3;
     unsigned cx = (tid & 7u) * 4u;
-
     unsigned mn = lane & 15u;
     unsigned k_off = (lane >> 4) * 8u;
 
-    for (unsigned k0 = 0; k0 < k; k0 += 32u) {
+    float4 xv0, xv1;
+    typename WeightLoader::Regs rw0, rw1;
+    scoria_fetch_x64(x, m0, m, k, 0u, rx, cx, &xv0, &xv1);
+    rw0 = WeightLoader::fetch(weight, k, n, n0, 0u, tid);
+    rw1 = WeightLoader::fetch(weight, k, n, n0 + 64u, 0u, tid);
+    scoria_store_x64(xv0, xv1, rx, cx, s_x[0]);
+    WeightLoader::store(rw0, 0u, tid, s_w[0]);
+    WeightLoader::store(rw1, 0u, tid, s_w[0] + 64);
+    __syncthreads();
+
+    unsigned buf = 0u;
+    for (unsigned k0 = 32u; k0 < k; k0 += 32u) {
+        scoria_fetch_x64(x, m0, m, k, k0, rx, cx, &xv0, &xv1);
+        rw0 = WeightLoader::fetch(weight, k, n, n0, k0, tid);
+        rw1 = WeightLoader::fetch(weight, k, n, n0 + 64u, k0, tid);
+
+        scoria_wmma_step64x128(s_x[buf], s_w[buf], wm, wn, mn, k_off, acc);
+
+        unsigned next_buf = buf ^ 1u;
+        scoria_store_x64(xv0, xv1, rx, cx, s_x[next_buf]);
+        WeightLoader::store(rw0, k0, tid, s_w[next_buf]);
+        WeightLoader::store(rw1, k0, tid, s_w[next_buf] + 64);
+        __syncthreads();
+        buf = next_buf;
+    }
+
+    scoria_wmma_step64x128(s_x[buf], s_w[buf], wm, wn, mn, k_off, acc);
+
+    #pragma unroll
+    for (unsigned im = 0; im < 2u; ++im) {
         #pragma unroll
-        for (unsigned half = 0; half < 2u; ++half) {
-            unsigned gm = m0 + half * 32u + rx;
-            _Float16* dst = &s_x[half * 32u + rx][cx];
-            if (gm < m) {
-                float4 xv = *(const float4*)(x + (size_t)gm * k + k0 + cx);
-                dst[0] = (_Float16)xv.x;
-                dst[1] = (_Float16)xv.y;
-                dst[2] = (_Float16)xv.z;
-                dst[3] = (_Float16)xv.w;
-            } else {
-                dst[0] = (_Float16)0.0f;
-                dst[1] = (_Float16)0.0f;
-                dst[2] = (_Float16)0.0f;
-                dst[3] = (_Float16)0.0f;
+        for (unsigned in = 0; in < 2u; ++in) {
+            float8_t c = acc[im * 2u + in];
+            unsigned out_n = n0 + (wn * 2u + in) * 16u + mn;
+            if (out_n < n) {
+                float b_val = bias ? bias[out_n] : 0.0f;
+                unsigned m_base = m0 + (wm * 2u + im) * 16u + (lane >> 4) * 8u;
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    unsigned out_m = m_base + (unsigned)i;
+                    if (out_m < m) {
+                        y[(size_t)out_m * n + out_n] = c[i] + b_val;
+                    }
+                }
             }
         }
+    }
+}
 
-        WeightLoader::load(weight, k, n, n0, k0, tid, s_w);
-        WeightLoader::load(weight, k, n, n0 + 64u, k0, tid, s_w + 64);
+// Specialized 2-half Q4_K double-buffered GEMM: fetches uint4 hdr + uint2 q8 ONCE per 64
+// K-elements and keeps them resident across both lo (k0) and hi (k0+32) halves.
+__device__ __forceinline__ void gemm_wmma_q4_k_dbuf_impl(const unsigned char* __restrict__ weight,
+                                                         const float* __restrict__ x,
+                                                         const float* __restrict__ bias,
+                                                         float* __restrict__ y,
+                                                         unsigned m,
+                                                         unsigned n,
+                                                         unsigned k) {
+    if (k == 0u) return;
+    unsigned tid = threadIdx.x;
+    unsigned wave_id = tid >> 5;
+    unsigned lane = tid & 31u;
+    unsigned wm = wave_id >> 2;
+    unsigned wn = wave_id & 3u;
+    unsigned m0 = blockIdx.y * 64u;
+    unsigned n0 = blockIdx.x * 128u;
+
+    __shared__ _Float16 s_x[2][64][36];
+    __shared__ _Float16 s_w[2][128][36];
+
+    float8_t acc[4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) acc[i] = (float8_t){0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    unsigned rx = tid >> 3;
+    unsigned cx = (tid & 7u) * 4u;
+    unsigned mn = lane & 15u;
+    unsigned k_off = (lane >> 4) * 8u;
+
+    float4 xv0, xv1;
+    WmmaLoaderQ4_K::Regs rw0 = WmmaLoaderQ4_K::fetch(weight, k, n, n0, 0u, tid);
+    WmmaLoaderQ4_K::Regs rw1 = WmmaLoaderQ4_K::fetch(weight, k, n, n0 + 64u, 0u, tid);
+    scoria_fetch_x64(x, m0, m, k, 0u, rx, cx, &xv0, &xv1);
+    scoria_store_x64(xv0, xv1, rx, cx, s_x[0]);
+    WmmaLoaderQ4_K::store_half(rw0, 0u, 0u, tid, s_w[0]);
+    WmmaLoaderQ4_K::store_half(rw1, 0u, 0u, tid, s_w[0] + 64);
+    __syncthreads();
+
+    unsigned buf = 0u;
+    for (unsigned k0 = 0u; k0 < k; k0 += 64u) {
+        unsigned chunk = (k0 >> 6) & 3u;
+
+        // Half 0 compute on `buf` overlapped with X(k0 + 32) load + W_hi store into `buf ^ 1`.
+        scoria_fetch_x64(x, m0, m, k, k0 + 32u, rx, cx, &xv0, &xv1);
+        scoria_wmma_step64x128(s_x[buf], s_w[buf], wm, wn, mn, k_off, acc);
+        unsigned b_hi = buf ^ 1u;
+        scoria_store_x64(xv0, xv1, rx, cx, s_x[b_hi]);
+        WmmaLoaderQ4_K::store_half(rw0, chunk, 1u, tid, s_w[b_hi]);
+        WmmaLoaderQ4_K::store_half(rw1, chunk, 1u, tid, s_w[b_hi] + 64);
         __syncthreads();
+        buf = b_hi;
 
-        #pragma unroll
-        for (unsigned kk = 0u; kk < 32u; kk += 16u) {
-            half8_t a0, a1, b0, b1;
-            #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                a0[i] = s_x[(wm * 2u + 0u) * 16u + mn][kk + k_off + (unsigned)i];
-                a1[i] = s_x[(wm * 2u + 1u) * 16u + mn][kk + k_off + (unsigned)i];
-                b0[i] = s_w[(wn * 2u + 0u) * 16u + mn][kk + k_off + (unsigned)i];
-                b1[i] = s_w[(wn * 2u + 1u) * 16u + mn][kk + k_off + (unsigned)i];
-            }
-            acc[0] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a0, b0, acc[0]);
-            acc[1] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a0, b1, acc[1]);
-            acc[2] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a1, b0, acc[2]);
-            acc[3] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a1, b1, acc[3]);
+        // Half 1 compute on `buf` overlapped with next 64-K X & W fetch if any remain.
+        if (k0 + 64u < k) {
+            unsigned nk = k0 + 64u;
+            unsigned nchunk = (nk >> 6) & 3u;
+            scoria_fetch_x64(x, m0, m, k, nk, rx, cx, &xv0, &xv1);
+            rw0 = WmmaLoaderQ4_K::fetch(weight, k, n, n0, nk, tid);
+            rw1 = WmmaLoaderQ4_K::fetch(weight, k, n, n0 + 64u, nk, tid);
+            scoria_wmma_step64x128(s_x[buf], s_w[buf], wm, wn, mn, k_off, acc);
+            unsigned b_next = buf ^ 1u;
+            scoria_store_x64(xv0, xv1, rx, cx, s_x[b_next]);
+            WmmaLoaderQ4_K::store_half(rw0, nchunk, 0u, tid, s_w[b_next]);
+            WmmaLoaderQ4_K::store_half(rw1, nchunk, 0u, tid, s_w[b_next] + 64);
+            __syncthreads();
+            buf = b_next;
+        } else {
+            scoria_wmma_step64x128(s_x[buf], s_w[buf], wm, wn, mn, k_off, acc);
         }
-        __syncthreads();
     }
 
     #pragma unroll
@@ -1849,7 +2605,7 @@ extern "C" __global__ void gemm_wmma_q4_k(const unsigned char* __restrict__ weig
                                           unsigned m,
                                           unsigned n,
                                           unsigned k) {
-    gemm_wmma_wide_impl<WmmaLoaderQ4_K>(weight, x, bias, y, m, n, k);
+    gemm_wmma_q4_k_dbuf_impl(weight, x, bias, y, m, n, k);
 }
 
 extern "C" __global__ void gemm_wmma_q6_k(const unsigned char* __restrict__ weight,

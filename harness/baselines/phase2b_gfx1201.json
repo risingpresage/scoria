@@ -60,6 +60,21 @@
     "qwen3-8b-q4_k_m": {"replays": 1000, "free_before_mib": 9610.0, "free_after_mib": 9616.0, "drift_mib": -6.0},
     "qwen3-4b-instruct-2507-q4_k_m": {"replays": 100, "drift_mib": 0.0, "replays_1000_drift_mib": 2.0, "replays_2000_drift_mib": 14.0, "note": "hipMemGetInfo is process-global; drift tracks VRAM held by other GPU clients and stays far under the 64 MiB guard"}
   },
+  "parity_gate_calibration": {
+    "finding": "cosine > 0.999 is a property of the prompt, not of the implementation. On the Qwen3-4B harness chat prompt (m=13) llama.cpp's own Vulkan backend scores cos=0.997985 against its own CPU backend while scoria scores 0.997652, and both pick top1=785.",
+    "scoria_vs_llama_cpu": {"qwen3-4b chat m=13": 0.997652, "qwen3-8b chat m=13": 0.996404},
+    "llama_vulkan_vs_llama_cpu": {"qwen3-4b chat m=13": 0.997985},
+    "fp32_control": {
+      "method": "SCORIA_PREFILL_FP32=1 forces the scalar FP32 GEMM path",
+      "qwen3-4b": {"fp16_wmma": 0.997652, "fp32_scalar": 0.997614},
+      "qwen3-8b": {"fp16_wmma": 0.996404, "fp32_scalar": 0.996415}
+    },
+    "length_sweep_qwen3_4b_chat_prefix": {
+      "2": 0.984667, "4": 0.999560, "5": 0.999680, "6": 0.999242, "7": 0.999574,
+      "8": 0.999713, "10": 0.996138, "11": 0.999437, "12": 0.997650, "13": 0.997652
+    },
+    "recommendation": "gate on top1_match + greedy prefix; use cos>0.999 as a per-prompt sanity check. All four models currently report top1_match=true on both the 5-token probe and the harness chat prompts."
+  },
   "remaining_gap": {
     "decode": "Weights are streamed ~492 GB/s on the 8B (5.02 GB/step) vs a 561.66 GB/s measured stream ceiling; lm_head alone reaches ~600 GB/s on the same kernel, so the loss is per-layer launch/fill work rather than raw GEMV. hipGraph removed the per-token dispatch chain but only bought ~3%, so the residual is inside the small kernels (rmsnorm/rope/kv/silu) plus per-step sync.",
     "prefill": "MEASURED NEGATIVE RESULT: a 128x64 tile that streams each weight once at m=128 instead of twice (BM=64) ran at exactly the same speed (57.29 vs 57.29 ms on Qwen3-8B pp128), so prefill is NOT bound by weight DRAM traffic nor by the Q4_K superblock header re-read. It is bound by LDS fill throughput: per BK=32 step a block writes 12 KB into LDS while doing 262144 MAC, the two phases are serialised by __syncthreads, and the loaders fuse the global load with the LDS store so the load latency is fully exposed. The next step is double-buffered LDS with the loaders split into a fetch phase (register-resident) and a store phase, which should recover the ~2x that the fill currently costs.",
