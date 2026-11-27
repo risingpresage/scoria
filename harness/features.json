@@ -7,6 +7,15 @@
   ],
   "features": [
     {
+      "id": "phase3-inkling2-full-stack",
+      "phase": 3,
+      "title": "Full 48-visit Inkling 2 Mini forward: logits from real weights",
+      "status": "verified",
+      "verify": "./target/release/scoria logits /home/noorm/models/inkling/Inkling-2-Mini-UD-Q3_K_XL.gguf --perp \"<prose>\" && ./scripts/check.sh",
+      "observed": "Held-out prose: 37 tokens -> perplexity 1.317, top-1 34/37; 58 tokens -> perplexity 2.298, top-1 50/58 (misses on the digits of '1969'). Greedy from 'The capital of France is' -> ' Paris.' 200058/200058 logits finite, repeat run bit-identical, 7.6 s/token single-threaded.",
+      "note": "Behavioural verification only: the transformers reference needs the 20.2 GB HF checkpoint and torch/transformers, neither on disk. Speed work not started (no kernels in this path), Strata still a measurement, no 200k-context run."
+    },
+    {
       "id": "phase3-inkling2-output-head",
       "phase": 3,
       "title": "Output head: final block-residual query, output_norm, unpadded unembed matvec, logit softcap",

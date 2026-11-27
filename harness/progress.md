@@ -117,6 +117,28 @@
 - Three tests, and two of them failed first on *my* arithmetic: `tanh(100/30)*30` is 29.92 not 29.99, and a 1-query attention over RMS-normalised snapshots is a convex combination — RMSNorm fixes the RMS, not the norm, so asserting `norm == 1` was wrong. Both now assert structure (bounded by `c`, odd, monotone; output inside the convex hull) plus one comparison against the definition, instead of hand-expanded decimals.
 - 30 engine unit tests green, `./scripts/check.sh` green.
 
+## 2026-11-28 — the full 24-layer stack runs: Inkling 2 Mini now produces correct logits
+`scoria logits` runs all 48 visits (6 pre-loop layers, three passes over 6..17, 6 post-loop layers), the block attention residuals, the message gates, the final block-residual query, the output norm, the 200058-row unembedding and the logit softcap. One token at a time, 7.6 s/token single-threaded, all 200058 logits finite, bit-identical on a re-run.
+
+**Evidence.** Next-token perplexity on held-out prose:
+- 37 tokens of narrative: **1.317**, top-1 **34/37** (`p(" the")=0.95`, `p(" valley")=0.96`, `p(" mill")=0.97`).
+- 58 tokens of factual prose: **2.298**, top-1 **50/58**; the misses are concentrated on the digits of `1969`, which split across tokens.
+
+Greedy from "The capital of France is" gives `" Paris."` and then a multiple-choice scaffold, which is what an instruction-tuned model does with a bare factual prompt.
+
+**Four layout bugs found on the way, all invisible to unit tests written against my own reading of the format:**
+
+1. **Short-convolution taps were transposed and reversed.** The tensor is `PyTorch Conv1d.weight`, i.e. `weight[channel * 4 + tap]`, and it is *cross-correlation*: tap 0 weights the **oldest** token and tap 3 the current one. I had `weight[tap * channels + channel]` with tap 0 on the current token. The trained taps prove the layout: mean |w| per tap for `blk.0.ffn_post_conv` is `0.028, 0.038, 0.096, 0.438` under `channel*4+tap` and a flat `0.15, 0.15, 0.15, 0.15` under the transpose. Fixed in `short_conv1d_4tap`, `short_conv1d_4tap_dynamic` and the HIP kernel.
+2. **`attn_rel_bias` was transposed.** The reference parameter is `[d_rel, rel_extent]`; the GGUF carries it as a GGML matrix with `in = d_rel`, so the flat index of `(r, distance)` is `distance * d_rel + r`. Reading `r * rel_extent + distance` transposed a 16x1024 bank and turned every attention bias into noise. Real data confirms it: column 0 decays smoothly with distance (`-0.02, 0.40, 0.22, 0.12, 0.085, 0.045, ...`).
+3. **The gate/up split is `[gate; up]`, not interleaved.** The source checkpoint interleaves `w13`, but `--fuse-gate-up-exps` fuses the two separate tensors with `torch.cat([gate, up], dim=1)` (`conversion/base.py`), so a half split is correct. I briefly "fixed" it the wrong way and reverted after reading the converter.
+4. **The first loop pass never ran.** `for pass in 1..passes` produced 36 visits, not 48. Caught by the visit count.
+
+Also fixed: the determinism check compared different token positions (it now replays the prefix and compares the same position), and the depth-sweep budget reset the state before checking it.
+
+**Diagnostics kept**: `--max-visits N` (truncate the stack, for localising a bad layer), `--router-softmax` (the checkpoint does not name the router activation; sigmoid is the default because `exp_probs_b.bias` is a noaux-tc feature), per-visit `|out|`, and head-0 attention peak/sink/entropy per visit.
+
+**Honest state:** correctness is now established behaviourally, not against the reference implementation — that needs the 20.2 GB HF checkpoint plus torch/transformers, neither of which is on this machine. Speed is untouched: 7.6 s/token, single-threaded, no kernels involved. There is still no Strata tiering, no 200k-context run, and no measured decode/prefill number for Inkling.
+
 ## Parity gate calibration (cosine > 0.999 is prompt-dependent, not an implementation defect)
 - Measured the control that settles it: **llama.cpp's own Vulkan backend vs llama.cpp's own CPU backend** scores `cos = 0.997985` (`maxdiff 1.152`) on the Qwen3-4B harness chat prompt (`151644,872,198,785,…,77091,198`, `m=13`), where scoria scores `0.997652` (`maxdiff 1.103`). Both pick top1 `785`. No GPU implementation reaches 0.999 on that prompt.
 - Forcing prefill onto the scalar FP32 GEMM (`SCORIA_PREFILL_FP32=1`) changes nothing: 4B `0.997614` vs `0.997652` for FP16 WMMA, 8B `0.996415` vs `0.996404`. So the deficit is **not** FP16 WMMA rounding.

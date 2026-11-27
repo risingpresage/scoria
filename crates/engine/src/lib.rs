@@ -2,6 +2,7 @@ pub mod inkling2;
 pub mod inkling2_attn;
 pub mod inkling2_head;
 pub mod inkling2_layer;
+pub mod inkling2_model;
 pub mod inkling2_moe;
 pub mod qwen2;
 

@@ -51,9 +51,15 @@ pub fn log_scale(pos: usize, alpha: f32, floor: usize) -> f32 {
 /// Relative position bias for one query block against `kv_len` keys.
 ///
 /// `rel_states` is `[heads][d_rel]` for the *last* query position only in the incremental
-/// case; `proj` is `[d_rel][rel_extent]`. The bias for query `pos_q` and key `pos_k` is
-/// `rel_states[h] . proj[:, (pos_q - pos_k)]`, and zero when that distance is outside
+/// case. The bias for query `pos_q` and key `pos_k` is
+/// `rel_states[h] . bank[.., pos_q - pos_k]`, and zero when that distance is outside
 /// `[0, rel_extent)`.
+///
+/// `bank` is the GGUF tensor as stored, which is the **transpose** of the reference's
+/// `proj: [d_rel, rel_extent]`: the file carries it as a GGML matrix with `in = d_rel`
+/// (dims `[d_rel, rel_extent]`, so the flat index of entry `(r, distance)` is
+/// `distance * d_rel + r`). Reading it `[r * rel_extent + distance]` instead transposes a
+/// 16 x 1024 table and turns every attention bias into noise.
 #[allow(clippy::too_many_arguments)]
 pub fn relative_bias(
     rel_states: &[f32],
@@ -74,7 +80,7 @@ pub fn relative_bias(
         for (d, logit) in logits.iter_mut().enumerate() {
             let mut acc = 0.0;
             for r in 0..d_rel {
-                acc += rel_states[h * d_rel + r] * proj[r * rel_extent + d];
+                acc += rel_states[h * d_rel + r] * proj[d * d_rel + r];
             }
             *logit = acc;
         }
@@ -103,23 +109,86 @@ pub fn sink_softmax(logits: &mut [f32], sink: f32) {
     }
 }
 
-/// Depthwise causal convolution with a 4-tap kernel, matching `sconv_kernel_size` and
-/// `shortconv.l_cache` in the checkpoint. `cache` holds the previous `taps - 1` input
-/// values per channel and is updated in place, so decode steps chain correctly.
+/// Depthwise causal convolution with a 4-tap kernel, matching `inkling2_loop`'s **static**
+/// `ShortConvolution`:
+///
+/// ```text
+/// out[t] = (sum_j weight[c][j] * x[t - (3 - j)] + x[t]) / sqrt(kernel + 1)
+/// ```
+///
+/// Every detail here was wrong once, and the tap order is the one that matters most:
+///
+/// * the tensor is a PyTorch `Conv1d` weight, so it is cross-correlation, **not**
+///   convolution: kernel tap `j` multiplies the element `3 - j` back, i.e. tap 0 weights
+///   the **oldest** token and tap 3 the current one. The trained taps confirm it: their
+///   mean magnitudes are `0.03, 0.04, 0.10, 0.44` for `blk.0.ffn_post_conv`, a gradient
+///   that only appears when the tap axis is read as the fastest-varying axis;
+/// * the file layout is `weight[channel * 4 + tap]` (GGML `dims = [4, channels]`);
+/// * the pre-convolution value is added back as a residual and the sum is divided by
+///   `sqrt(kernel + 1)` = `sqrt(5)`. The *dynamic* variant divides by
+///   `sqrt(2*kernel + 1)` instead.
+///
+/// `cache` holds the previous `taps - 1` inputs per channel, newest first, and is updated
+/// in place so decode steps chain.
 pub fn short_conv1d_4tap(x: &mut [f32], weight: &[f32], cache: &mut [f32], channels: usize) {
-    assert_eq!(weight.len(), 4 * channels, "weight is [taps][channels]");
+    assert_eq!(weight.len(), 4 * channels, "weight is [channels][taps]");
     assert_eq!(cache.len(), 3 * channels, "cache is [taps-1][channels]");
+    let scale = (5.0f32).sqrt().recip();
     for c in 0..channels {
-        let history = [cache[c], cache[channels + c], cache[2 * channels + c], x[c]];
-        // Causal: output at t depends on t, t-1, t-2, t-3 with the newest tap last.
-        let mut acc = 0.0;
-        for (tap, &value) in history.iter().enumerate() {
-            acc += weight[tap * channels + c] * value;
-        }
-        cache[c] = history[1];
-        cache[channels + c] = history[2];
-        cache[2 * channels + c] = history[3];
-        x[c] = acc;
+        let current = x[c];
+        let lag1 = cache[c];
+        let lag2 = cache[channels + c];
+        let lag3 = cache[2 * channels + c];
+        let w = &weight[c * 4..c * 4 + 4];
+        let acc = w[0] * lag3 + w[1] * lag2 + w[2] * lag1 + w[3] * current;
+        cache[2 * channels + c] = lag2;
+        cache[channels + c] = lag1;
+        cache[c] = current;
+        x[c] = (acc + current) * scale;
+    }
+}
+
+/// The **dynamic** short convolution used on the full-attention layers' K and V: the taps
+/// are a static per-channel weight plus a per-token weight projected from the same input,
+/// shared within each KV head.
+///
+/// ```text
+/// w[c][j] = static[c * 4 + j] + dyn[(c / head_dim) * 4 + j]
+/// out[t]  = (sum_j w[c][j] * x[t - (3 - j)] + x[t]) / sqrt(2 * kernel + 1)
+/// ```
+///
+/// The same cross-correlation convention as the static convolution: tap 0 weights the
+/// oldest token. `dyn` holds one tap vector per KV head, `kv_heads * 4` values, laid out
+/// `[head][tap]`. The scale is `sqrt(2*kernel + 1)` = 3 for four taps.
+pub fn short_conv1d_4tap_dynamic(
+    x: &mut [f32],
+    static_w: &[f32],
+    dyn_w: &[f32],
+    cache: &mut [f32],
+    channels: usize,
+    head_dim: usize,
+) {
+    assert_eq!(static_w.len(), 4 * channels);
+    assert_eq!(cache.len(), 3 * channels);
+    let kv_heads = channels / head_dim;
+    assert_eq!(dyn_w.len(), 4 * kv_heads);
+    let scale = (9.0f32).sqrt().recip();
+    for c in 0..channels {
+        let head = c / head_dim;
+        let current = x[c];
+        let lag1 = cache[c];
+        let lag2 = cache[channels + c];
+        let lag3 = cache[2 * channels + c];
+        let s = &static_w[c * 4..c * 4 + 4];
+        let d = &dyn_w[head * 4..head * 4 + 4];
+        let acc = (s[0] + d[0]) * lag3
+            + (s[1] + d[1]) * lag2
+            + (s[2] + d[2]) * lag1
+            + (s[3] + d[3]) * current;
+        cache[2 * channels + c] = lag2;
+        cache[channels + c] = lag1;
+        cache[c] = current;
+        x[c] = (acc + current) * scale;
     }
 }
 
@@ -314,10 +383,24 @@ mod tests {
         // q head 0 clipped to norm 2: (3,4)*0.4 = (1.2,1.6); head 1 stays zero and finite.
         assert!((q[0] - 1.2).abs() < 1e-6 && (q[1] - 1.6).abs() < 1e-6);
         assert_eq!(&q[2..4], &[0.0, 0.0]);
-        // Zero conv taps wipe k, and l2_clip leaves zero alone.
-        assert!(k.iter().all(|x| *x == 0.0));
-        // v conv yields zero, and RMSNorm of a zero vector is zero, not NaN.
-        assert!(v.iter().all(|x| *x == 0.0));
+        // With zero taps the conv collapses to (0 + x)/sqrt5; k is then L2-clipped per
+        // head at the threshold 2.0. Head 0 = (1,2)/sqrt5 has norm 1.0 and survives; head 1
+        // = (3,4)/sqrt5 has norm 2.236 and is scaled to norm 2.
+        let inv5 = 1.0 / 5f32.sqrt();
+        assert!((k[0] - 1.0 * inv5).abs() < 1e-6, "k[0]={}", k[0]);
+        assert!((k[1] - 2.0 * inv5).abs() < 1e-6, "k[1]={}", k[1]);
+        let head1_norm = (k[2] * k[2] + k[3] * k[3]).sqrt();
+        assert!(
+            (head1_norm - 2.0).abs() < 1e-5,
+            "clipped head norm {head1_norm}"
+        );
+        assert!(
+            (k[2] / k[3] - 3.0 / 4.0).abs() < 1e-5,
+            "direction preserved"
+        );
+        // v was all ones, so after /sqrt5 and an unweighted RMSNorm (which makes the RMS 1)
+        // every element is exactly 1 again - the normalisation cancels the scaling.
+        assert!(v.iter().all(|x| (*x - 1.0).abs() < 1e-5), "v={v:?}");
         // gate is a sigmoid.
         assert!((gate[0] - 0.5).abs() < 1e-6);
         assert!((gate[1] - 1.0).abs() < 1e-6);
@@ -357,12 +440,14 @@ mod tests {
             );
             seen.push(k[0]);
         }
-        // step 1: 4*1 = 4 (after conv; l2_clip with a huge threshold leaves it).
-        assert!((seen[0] - 4.0).abs() < 1e-5);
-        // step 2: 4*2 + 3*1 = 11.
-        assert!((seen[1] - 11.0).abs() < 1e-5);
-        // step 4: 4*4 + 3*3 + 2*2 + 1*1 = 30.
-        assert!((seen[3] - 30.0).abs() < 1e-5);
+        // Hand computed with tap 0 on the oldest input and /sqrt5:
+        // step 1: (4*1 + 1)/sqrt5 = 5/sqrt5
+        let inv = 1.0 / 5f32.sqrt();
+        assert!((seen[0] - 5.0 * inv).abs() < 1e-5, "{}", seen[0]);
+        // step 2: (3*1 + 4*2 + 2)/sqrt5 = 13/sqrt5
+        assert!((seen[1] - 13.0 * inv).abs() < 1e-5, "{}", seen[1]);
+        // step 4: (1*1 + 2*2 + 3*3 + 4*4 + 4)/sqrt5 = 34/sqrt5
+        assert!((seen[3] - 34.0 * inv).abs() < 1e-5, "{}", seen[3]);
     }
 
     fn reference_decode(
@@ -487,10 +572,13 @@ mod tests {
 
     #[test]
     fn relative_bias_gathers_by_backward_distance_and_zeroes_the_rest() {
-        // Two heads, d_rel = 2, rel_extent = 4. proj[r][d] = r as 1,2 and 3,4.
+        // Two heads, d_rel = 2, rel_extent = 4. The bank is stored distance-major, as the
+        // GGUF stores it: bank[d * d_rel + r].
         let proj = [
-            1.0f32, 2.0, 3.0, 4.0, // r = 0 across distances 0..3
-            10.0, 20.0, 30.0, 40.0, // r = 1
+            1.0f32, 10.0, // distance 0: r = 0, 1
+            2.0, 20.0, // distance 1
+            3.0, 30.0, // distance 2
+            4.0, 40.0, // distance 3
         ];
         let rel_states = [1.0f32, 0.0, 0.0, 1.0]; // head 0 picks r=0, head 1 picks r=1
         let pos_k = [2usize, 1, 0];
@@ -543,10 +631,11 @@ mod tests {
 
     #[test]
     fn short_conv_is_causal_and_chains_through_the_cache() {
-        // One channel, taps [1, 2, 3, 4] newest last: y[t] = x[t]*4 + x[t-1]*3 + ...
+        // Taps [1,2,3,4] on one channel, with tap 0 on the *oldest* input (PyTorch's
+        // cross-correlation), then + residual and / sqrt(4+1) = /sqrt5.
         let weight = [1.0f32, 2.0, 3.0, 4.0];
+        let inv = 1.0 / 5f32.sqrt();
         let mut cache = [0.0f32; 3];
-        // Streaming one step at a time must equal processing a whole sequence at once.
         let seq = [1.0f32, 2.0, 3.0, 4.0, 5.0];
         let mut streamed = Vec::new();
         for &v in &seq {
@@ -554,40 +643,47 @@ mod tests {
             short_conv1d_4tap(&mut x, &weight, &mut cache, 1);
             streamed.push(x[0]);
         }
-        // Hand computed for t=0: 4*1 = 4.
-        assert_eq!(streamed[0], 4.0);
-        // t=1: 4*2 + 3*1 = 11. t=2: 4*3 + 3*2 + 2*1 = 20.
-        assert_eq!(streamed[1], 11.0);
-        assert_eq!(streamed[2], 20.0);
-        // t=4: 4*5 + 3*4 + 2*3 + 1*2 = 40.
-        assert_eq!(streamed[4], 40.0);
+        // t=1: (4*1 + 1)/sqrt5 = 5/sqrt5
+        assert!((streamed[0] - 5.0 * inv).abs() < 1e-6, "{}", streamed[0]);
+        // t=2: (3*1 + 4*2 + 2)/sqrt5 = 13/sqrt5
+        assert!((streamed[1] - 13.0 * inv).abs() < 1e-6, "{}", streamed[1]);
+        // t=3: (2*1 + 3*2 + 4*3 + 3)/sqrt5 = 23/sqrt5
+        assert!((streamed[2] - 23.0 * inv).abs() < 1e-6, "{}", streamed[2]);
+        // t=4: (1*1 + 2*2 + 3*3 + 4*4 + 4)/sqrt5 = 34/sqrt5
+        assert!((streamed[3] - 34.0 * inv).abs() < 1e-6, "{}", streamed[3]);
+        // t=5: (1*2 + 2*3 + 3*4 + 4*5 + 5)/sqrt5 = 45/sqrt5
+        assert!((streamed[4] - 45.0 * inv).abs() < 1e-6, "{}", streamed[4]);
+        // Tap order is observable: with a cold cache the current token is weighted by
+        // tap 3, so a weight of [0,0,0,4] gives (4*x + x)/sqrt5, not x/sqrt5.
+        let mut x = [2.0f32];
+        let mut cold = [0.0f32; 3];
+        short_conv1d_4tap(&mut x, &[0.0, 0.0, 0.0, 4.0], &mut cold, 1);
+        assert!((x[0] - 10.0 * inv).abs() < 1e-6, "{}", x[0]);
     }
 
     #[test]
-    fn output_gate_is_a_sigmoid() {
-        let mut attn = [1.0f32, 1.0];
-        apply_output_gate(&mut attn, &[0.0, 100.0]);
-        assert!((attn[0] - 0.5).abs() < 1e-6);
-        assert!((attn[1] - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn visibility_is_causal_and_bounded_by_the_window() {
-        assert!(visible(5, 5, None));
-        assert!(!visible(5, 6, None));
-        assert!(visible(1023, 0, Some(1024)));
-        assert!(
-            !visible(1024, 0, Some(1024)),
-            "the window excludes distance 1024"
+    fn dynamic_conv_adds_per_head_taps_and_scales_by_three() {
+        // Two channels, head_dim 1, so there are two heads: dyn taps differ per channel.
+        let static_w = [0.0f32; 8];
+        // head 0 tap 3 (the current token) = 1, everything else zero.
+        let dyn_w = [0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
+        let mut cache = [0.0f32; 6];
+        let mut x = [5.0f32, 5.0];
+        short_conv1d_4tap_dynamic(&mut x, &static_w, &dyn_w, &mut cache, 2, 1);
+        // channel 0: (1*5 + 5)/sqrt9 = 10/3; channel 1: (0*5 + 5)/3 = 5/3.
+        assert!((x[0] - 10.0 / 3.0).abs() < 1e-6, "{}", x[0]);
+        assert!((x[1] - 5.0 / 3.0).abs() < 1e-6, "{}", x[1]);
+        assert_eq!(
+            &cache[..2],
+            &[5.0, 5.0],
+            "current token becomes the newest entry"
         );
-        assert!(visible(1024, 1, Some(1024)));
-        // The window never lets a future token in, even when it is close.
-        assert!(!visible(3, 4, Some(1024)));
-    }
-
-    #[test]
-    fn zero_window_hides_everything() {
-        assert!(!visible(0, 0, Some(0)));
-        assert!(!visible(10, 9, Some(0)));
+        // A dynamic tap must change the answer versus the static convolution, which would
+        // divide by sqrt(5) and ignore the projection entirely.
+        let mut s = [5.0f32, 5.0];
+        let mut c2 = [0.0f32; 6];
+        short_conv1d_4tap(&mut s, &static_w, &mut c2, 2);
+        assert!((s[0] - 5.0 * (5.0f32).sqrt().recip()).abs() < 1e-6);
+        assert_ne!(s, x);
     }
 }

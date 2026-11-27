@@ -205,11 +205,11 @@ impl LayerZero {
     /// The FFN half of the layer: `post_attention_layernorm` -> MoE -> `post_mlp_conv` ->
     /// residual add, which is the reference's order. (The block attention residual that
     /// sits between them needs block states, which this probe does not model yet.)
-    pub fn ffn(&mut self, moe: &mut crate::inkling2_moe::Moe) -> FfnOutput {
+    pub fn ffn(&mut self, file: &GgufFile, moe: &mut crate::inkling2_moe::Moe) -> FfnOutput {
         let (residual, x) = self.pending_ffn.clone().expect("attention_step ran first");
         let input_norm = norm(&x);
 
-        let mut y = moe.forward(&x);
+        let mut y = moe.forward(file, &x);
         let moe_norm = norm(&y);
 
         short_conv1d_4tap(

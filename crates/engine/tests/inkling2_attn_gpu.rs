@@ -204,8 +204,13 @@ fn cpu_helpers_agree_with_the_host_preprocessing_the_kernel_expects() {
     let weight = vec![0.25f32; 4];
     let mut cache = vec![0.0f32; 3];
     short_conv1d_4tap(&mut x, &weight, &mut cache, 1);
-    // All taps 0.25: y[0] = 0.25 * (0 + 0 + 0 + 1) = 0.25.
-    assert!((x[0] - 0.25).abs() < 1e-6);
+    // All taps 0.25, cold cache: y[0] = (0.25*1 + 1) / sqrt(5) = 0.55901699. The residual
+    // add and the 1/sqrt(kernel+1) scale are part of the reference's convolution, not
+    // optional decorations.
+    assert!((x[0] - 1.25 / 5f32.sqrt()).abs() < 1e-6, "{}", x[0]);
+    // The cache now carries the current token as the newest entry, so a second step sees
+    // it in tap 1: y[1] = (0.25*(2+1+0+0) + 2) / sqrt(5).
+    assert!((cache[0] - 1.0).abs() < 1e-6, "cache {cache:?}");
 }
 
 fn scaled_l2_clip_in_place(x: &mut [f32], threshold: f32) {

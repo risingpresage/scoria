@@ -14,7 +14,7 @@ use scoria_gguf::{BpeTokenizer, GgufFile, ModelConfig};
 
 fn usage() -> ! {
     eprintln!(
-        "Usage:\n  scoria gate [--quick]\n  scoria inspect <model.gguf>\n  scoria tokenize <model.gguf> <prompt> [--no-bos]\n  scoria run <model.gguf> (--prompt <text> | --tokens <csv>) [--max-tokens <N>] [--max-seq <N>] [--no-bos] [--ignore-eos] [--warmup <N>] [--kv-f16] [--dump-logits <path>] [--tap-layer <L>] [--profile]\n  scoria graph-soak <model.gguf> [--replays <N>] [--tokens <csv>]\n  scoria plan <model.gguf> [--vram-mib <N>] [--ctx <N>]\n  scoria strata <model.gguf> [--top-k <N>] [--tokens <N>] [--qd <N>]\n  scoria arch-check <model.gguf> [--dequant-smoke]\n  scoria layer0 <model.gguf> [--tokens <csv>] [--moe] [--router-softmax]"
+        "Usage:\n  scoria gate [--quick]\n  scoria inspect <model.gguf>\n  scoria tokenize <model.gguf> <prompt> [--no-bos]\n  scoria run <model.gguf> (--prompt <text> | --tokens <csv>) [--max-tokens <N>] [--max-seq <N>] [--no-bos] [--ignore-eos] [--warmup <N>] [--kv-f16] [--dump-logits <path>] [--tap-layer <L>] [--profile]\n  scoria graph-soak <model.gguf> [--replays <N>] [--tokens <csv>]\n  scoria plan <model.gguf> [--vram-mib <N>] [--ctx <N>]\n  scoria strata <model.gguf> [--top-k <N>] [--tokens <N>] [--qd <N>]\n  scoria arch-check <model.gguf> [--dequant-smoke]\n  scoria layer0 <model.gguf> [--tokens <csv>] [--moe] [--router-softmax]\n  scoria logits <model.gguf> [--tokens <csv>] [--top <N>]"
     );
     process::exit(2);
 }
@@ -780,6 +780,208 @@ fn cmd_arch_check(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// attention norm -> projections -> conv/clip/RMSNorm/gate -> relative bias -> attention ->
 /// output gate -> W_o -> post conv -> residual. Prints diagnostics, because the FFN and the
 /// rest of the stack are not wired yet.
+/// One token position through all 48 visits of the full stack, then the output head.
+fn cmd_logits(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use scoria_engine::inkling2_model::Model;
+    if args.is_empty() {
+        usage();
+    }
+    let path = &args[0];
+    let rest = &args[1..];
+    let tokens: Vec<u32> = arg_val(rest, "--tokens")
+        .unwrap_or("785,6722,315,9625,374")
+        .split(',')
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().parse::<u32>())
+        .collect::<Result<Vec<_>, _>>()?;
+    let top = arg_val(rest, "--top")
+        .unwrap_or("5")
+        .parse::<usize>()
+        .unwrap_or(5);
+    let generate = arg_val(rest, "--generate")
+        .map(|v| v.parse::<usize>().unwrap_or(0))
+        .unwrap_or(0);
+    let prompt = arg_val(rest, "--prompt");
+    let perp = arg_val(rest, "--perp");
+    let max_visits = arg_val(rest, "--max-visits")
+        .map(|v| v.parse::<usize>().unwrap_or(usize::MAX))
+        .unwrap_or(usize::MAX);
+
+    let (tok, prompt_tokens) = if let Some(text) = perp.or(prompt) {
+        let g = GgufFile::open(path)?;
+        let t = scoria_gguf::tokenizer::BpeTokenizer::from_gguf(&g)?;
+        let ids = t.encode(text, false);
+        (Some(t), ids)
+    } else {
+        (None, tokens.clone())
+    };
+    let tokens = prompt_tokens;
+    if tokens.is_empty() {
+        return Err("no tokens (empty prompt)".into());
+    }
+
+    let started = std::time::Instant::now();
+    let router = if rest.iter().any(|a| a == "--router-softmax") {
+        scoria_engine::inkling2_moe::RouterScore::Softmax
+    } else {
+        scoria_engine::inkling2_moe::RouterScore::Sigmoid
+    };
+    let mut model = Model::open_with_router(path, router)?;
+    model.max_visits = max_visits;
+    let load = started.elapsed();
+    println!(
+        "model: {} layers, {} visits, vocab {}",
+        model.cfg.n_layers,
+        model.visits().len(),
+        model.cfg.vocab_size
+    );
+    println!("load: {:.1}s", load.as_secs_f64());
+
+    let started = std::time::Instant::now();
+    let mut last = Vec::new();
+    for (step, &tok) in tokens.iter().enumerate() {
+        let logits = model.forward(tok);
+        let finite = logits.iter().filter(|v| v.is_finite()).count();
+        let best = Model::top_k(&logits, top);
+        let top1 = best[0];
+        println!(
+            "  step {step} tok {tok:>6}: |logits|={:.3} finite={finite}/{} argmax={} ({:.4})",
+            logits.iter().map(|v| v * v).sum::<f32>().sqrt(),
+            logits.len(),
+            top1.0,
+            top1.1
+        );
+        if step + 1 == tokens.len() {
+            let report = model.last_report.clone().unwrap();
+            println!(
+                "    final |hidden|={:.3} block snapshots={} visits={}",
+                report.hidden_norm,
+                report.block_snapshots,
+                report.per_visit.len()
+            );
+            let widths: Vec<String> = report
+                .per_visit
+                .iter()
+                .map(|(l, n)| format!("{l}:{n:.1}"))
+                .collect();
+            println!("    per-visit |out|: {}", widths.join(" "));
+            let attn: Vec<String> = report
+                .attention
+                .iter()
+                .map(|t| {
+                    format!(
+                        "{}:pk{:.2}@{} sink{:.2} H{:.1}",
+                        t.layer, t.peak, t.peak_distance, t.sink, t.entropy
+                    )
+                })
+                .collect();
+            println!("    head0 attention: {}", attn.join(" "));
+            println!("    top-{top}:");
+            for (id, value) in &best {
+                println!("      {id:>6}  {value:+.6}");
+            }
+        }
+        last = logits;
+    }
+    let elapsed = started.elapsed();
+    println!(
+        "prefill: {:.2}s total, {:.2}s/token",
+        elapsed.as_secs_f64(),
+        elapsed.as_secs_f64() / tokens.len() as f64
+    );
+
+    if let Some(text) = perp {
+        // Next-token log-likelihood on held-out natural text. A structurally wrong stack
+        // cannot score text well, so mean NLL is the cheapest oracle available when the
+        // reference checkpoint is not on disk.
+        let all = tok
+            .as_ref()
+            .map(|t| t.encode(text, false))
+            .unwrap_or_default();
+        if all.len() < 2 {
+            return Err("--perp text tokenizes to too few tokens".into());
+        }
+        let mut hits = 0usize;
+        let mut nll = 0f64;
+        let mut skipped = 0usize;
+        let mut shown = Vec::new();
+        for i in 0..all.len() - 1 {
+            let logits = model.forward(all[i]);
+            let target = all[i + 1];
+            if (target as usize) >= logits.len() {
+                skipped += 1;
+                continue;
+            }
+            let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+            let sum: f64 = logits.iter().map(|v| ((*v as f64) - max).exp()).sum();
+            let logp = (logits[target as usize] as f64 - max) - sum.ln();
+            if logp > f32::MIN as f64 {
+                nll -= logp;
+            }
+            if Model::top_k(&logits, 1)[0].0 as u32 == target {
+                hits += 1;
+            }
+            if shown.len() < 24 {
+                let want = tok
+                    .as_ref()
+                    .map(|t| t.decode(&[target]))
+                    .unwrap_or_default();
+                let got = tok
+                    .as_ref()
+                    .map(|t| t.decode(&[Model::top_k(&logits, 1)[0].0 as u32]))
+                    .unwrap_or_default();
+                shown.push(format!(
+                    "{i:>3} p={:.4} want {want:?} got {got:?}",
+                    logp.exp()
+                ));
+            }
+        }
+        let scored = all.len() - 1 - skipped;
+        let mean_nll = nll / scored as f64;
+        println!("perplexity over {scored} tokens: {:.3}", mean_nll.exp());
+        println!("  mean NLL {mean_nll:.4} nats, top-1 agreement {hits}/{scored}");
+        for line in shown {
+            println!("    {line}");
+        }
+        return Ok(());
+    }
+
+    if generate > 0 {
+        let started = std::time::Instant::now();
+        let mut produced = Vec::new();
+        let mut next = Model::top_k(&last, 1)[0].0 as u32;
+        for _ in 0..generate {
+            produced.push(next);
+            let logits = model.forward(next);
+            next = Model::top_k(&logits, 1)[0].0 as u32;
+        }
+        let decoded = tok
+            .as_ref()
+            .map(|t| t.decode(&produced))
+            .unwrap_or_else(|| format!("{produced:?}"));
+        let per = started.elapsed().as_secs_f64() / generate as f64;
+        println!("decode: {:.2}s/token", per);
+        println!("--- generated ---\n{decoded}\n-----------------");
+    }
+
+    // Determinism is not optional: a second run of the same token sequence must reproduce
+    // the logits bit for bit, otherwise nothing downstream can be trusted.
+    let mut again = Model::open_with_router(path, router)?;
+    again.max_visits = max_visits;
+    for &tok in &tokens[..tokens.len() - 1] {
+        again.forward(tok);
+    }
+    let repeat = again.forward(tokens[tokens.len() - 1]);
+    let same = repeat == last;
+    println!("deterministic (repeat last token): {same}");
+    if !same {
+        let diff = repeat.iter().zip(&last).filter(|(a, b)| a != b).count();
+        println!("  {diff} logits differ");
+        return Err("non-deterministic logits".into());
+    }
+    Ok(())
+}
+
 fn cmd_layer0(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use scoria_engine::inkling2_layer::LayerZero;
     if args.is_empty() {
@@ -836,7 +1038,7 @@ fn cmd_layer0(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             out.residual_norm
         );
         if let Some(moe) = moe.as_mut() {
-            let ffn = layer.ffn(moe);
+            let ffn = layer.ffn(&gguf, moe);
             let route = moe.last_route.clone().unwrap();
             println!(
                 "    ffn: |w|={:.3} |norm_in|={:.3} experts {:?} weights {:?} |moe_out|={:.3} |layer_out|={:.3}",
@@ -883,6 +1085,7 @@ fn main() {
         Some("strata") => cmd_strata(&args[1..]),
         Some("arch-check") => cmd_arch_check(&args[1..]),
         Some("layer0") => cmd_layer0(&args[1..]),
+        Some("logits") => cmd_logits(&args[1..]),
         _ => usage(),
     };
     if let Err(e) = res {

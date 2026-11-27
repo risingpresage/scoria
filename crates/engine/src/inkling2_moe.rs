@@ -17,7 +17,7 @@
 //! an `e_score_correction_bias` (a noaux-tc router feature) points at sigmoid, so that is
 //! the default and `route_with` lets a caller try the other.
 
-use scoria_gguf::{GgmlType, GgufError, GgufFile, ModelConfig};
+use scoria_gguf::{GgufError, GgufFile, ModelConfig, TensorInfo};
 
 use crate::inkling2::Inkling2Params;
 
@@ -52,9 +52,11 @@ pub fn swiglu_softcapped(gate: &[f32], up: &[f32], gate_cap: f32, up_cap: f32, o
     }
 }
 
+/// One expert-major 3-D tensor. The bytes stay in the GGUF's mmap: 24 layers of experts
+/// is 12.7 GB on disk, so copying them into the process would be the whole model twice.
 struct ExpertTensor {
-    ggml_type: GgmlType,
-    bytes: Vec<u8>,
+    info: TensorInfo,
+    slab_bytes: usize,
     in_dim: usize,
     out_dim: usize,
     experts: usize,
@@ -84,9 +86,13 @@ impl ExpertTensor {
             None => vec![1.0; experts],
         };
         let _ = cfg;
+        let total = info.ggml_type.tensor_byte_len(
+            info.n_elements()
+                .ok_or_else(|| GgufError::Malformed(format!("`{name}` shape overflows")))?,
+        )?;
         Ok(Self {
-            ggml_type: info.ggml_type,
-            bytes: file.tensor_bytes(info)?.to_vec(),
+            slab_bytes: total / experts,
+            info: info.clone(),
             in_dim: info.dims[0] as usize,
             out_dim: info.dims[1] as usize,
             experts,
@@ -94,18 +100,20 @@ impl ExpertTensor {
         })
     }
 
-    fn slab_bytes(&self) -> usize {
-        self.bytes.len() / self.experts
-    }
-
     /// Dequantises expert `e` into `out` (`out_dim * in_dim`) and applies the outer scale.
-    fn expert(&self, e: usize, out: &mut [f32]) {
+    fn expert(&self, file: &GgufFile, e: usize, out: &mut [f32]) {
         assert!(e < self.experts, "expert {e} out of range");
         assert_eq!(out.len(), self.out_dim * self.in_dim);
-        let slab = self.slab_bytes();
-        let start = e * slab;
-        scoria_gguf::dequant::dequant_row(self.ggml_type, &self.bytes[start..start + slab], out)
-            .expect("expert slab dequantises");
+        let bytes = file
+            .tensor_bytes(&self.info)
+            .expect("expert tensor is in the mmap");
+        let start = e * self.slab_bytes;
+        scoria_gguf::dequant::dequant_row(
+            self.info.ggml_type,
+            &bytes[start..start + self.slab_bytes],
+            out,
+        )
+        .expect("expert slab dequantises");
         let k = self.outer[e];
         for v in out.iter_mut() {
             *v *= k;
@@ -131,6 +139,16 @@ pub struct Moe {
 
 impl Moe {
     pub fn load(file: &GgufFile, cfg: &ModelConfig, score: RouterScore) -> Result<Self, GgufError> {
+        Self::load_layer(file, cfg, score, 0)
+    }
+
+    /// Load layer `layer`'s router and expert tensors.
+    pub fn load_layer(
+        file: &GgufFile,
+        cfg: &ModelConfig,
+        score: RouterScore,
+        layer: usize,
+    ) -> Result<Self, GgufError> {
         let params = Inkling2Params::from_gguf(file, cfg);
         let n_experts = cfg.n_experts.unwrap_or(0);
         let top_k = cfg.n_experts_used.unwrap_or(0);
@@ -149,8 +167,9 @@ impl Moe {
                 .map(|c| f32::from_le_bytes(*c))
                 .collect())
         };
-        let gate_up = ExpertTensor::load(file, "blk.0.ffn_gate_up_exps.weight", cfg)?;
-        let down = ExpertTensor::load(file, "blk.0.ffn_down_exps.weight", cfg)?;
+        let t = |name: &str| format!("blk.{layer}.{name}");
+        let gate_up = ExpertTensor::load(file, &t("ffn_gate_up_exps.weight"), cfg)?;
+        let down = ExpertTensor::load(file, &t("ffn_down_exps.weight"), cfg)?;
         Ok(Self {
             n_embd: cfg.n_embd,
             n_experts,
@@ -162,8 +181,8 @@ impl Moe {
             up_cap: params.situ_linear_beta,
             routed_scale: params.expert_weights_scale,
             score,
-            w_gate_inp: read_f32("blk.0.ffn_gate_inp.weight")?,
-            e_score_bias: read_f32("blk.0.exp_probs_b.bias")?,
+            w_gate_inp: read_f32(&t("ffn_gate_inp.weight"))?,
+            e_score_bias: read_f32(&t("exp_probs_b.bias"))?,
             gate_up,
             down,
             last_route: None,
@@ -209,26 +228,35 @@ impl Moe {
     }
 
     /// One token through the MoE, returning the accumulated expert contribution.
-    pub fn forward(&mut self, x: &[f32]) -> Vec<f32> {
+    pub fn forward(&mut self, file: &GgufFile, x: &[f32]) -> Vec<f32> {
         let route = self.route(x);
         let mut acc = vec![0f32; self.n_embd];
         let mut slab = vec![0f32; self.gate_up.out_dim * self.gate_up.in_dim];
         let mut gate_up = vec![0f32; self.gate_up.out_dim];
+        let mut gate = vec![0f32; self.ff];
+        let mut up = vec![0f32; self.ff];
         let mut act = vec![0f32; self.ff];
         let mut mid = vec![0f32; self.down.out_dim];
         let mut down_slab = vec![0f32; self.down.out_dim * self.down.in_dim];
 
         for (slot, &e) in route.indices.iter().enumerate() {
-            self.gate_up.expert(e, &mut slab);
+            self.gate_up.expert(file, e, &mut slab);
             // gate_up = W13[e] x, [2*ff]
             for (o, out) in gate_up.iter_mut().enumerate() {
                 let row = &slab[o * self.gate_up.in_dim..(o + 1) * self.gate_up.in_dim];
                 *out = row.iter().zip(x).map(|(a, b)| a * b).sum();
             }
-            let (gate, up) = gate_up.split_at(self.ff);
-            swiglu_softcapped(gate, up, self.gate_cap, self.up_cap, &mut act);
+            // The GGUF layout is `[gate rows; up rows]`, because the converter fuses the
+            // checkpoint's two separate tensors with `torch.cat([gate, up], dim=1)`
+            // (`conversion/base.py`, `--fuse-gate-up-exps`). The *source* checkpoint
+            // interleaves its `w13` rows, but that is undone before fusion, so a half
+            // split is right here and an even/odd split would be wrong.
+            let (gate_rows, up_rows) = gate_up.split_at(self.ff);
+            gate.copy_from_slice(gate_rows);
+            up.copy_from_slice(up_rows);
+            swiglu_softcapped(&gate, &up, self.gate_cap, self.up_cap, &mut act);
 
-            self.down.expert(e, &mut down_slab);
+            self.down.expert(file, e, &mut down_slab);
             for (o, out) in mid.iter_mut().enumerate() {
                 let row = &down_slab[o * self.down.in_dim..(o + 1) * self.down.in_dim];
                 *out = row.iter().zip(&act).map(|(a, b)| a * b).sum();
@@ -273,6 +301,21 @@ mod tests {
     }
 
     #[test]
+    fn swiglu_reads_concatenated_gate_then_up_rows() {
+        // `--fuse-gate-up-exps` writes `torch.cat([gate, up], dim=1)`, so the first `ff`
+        // rows are gate and the last `ff` are up. The source checkpoint's interleaved
+        // `w13` order is undone before that fusion.
+        let gate_up = [0.5f32, -0.25, 2.0, 10.0];
+        let ff = 2;
+        let (gate, up) = gate_up.split_at(ff);
+        assert_eq!(gate, &[0.5, -0.25]);
+        assert_eq!(up, &[2.0, 10.0]);
+        // The interleaved reading would pair (0.5, -0.25) and (2.0, 10.0) differently; make
+        // sure the two conventions cannot both pass.
+        assert_ne!(gate, [gate_up[0], gate_up[2]]);
+    }
+
+    #[test]
     fn routing_selects_by_biased_score_but_weights_by_raw_score() {
         // Two of four experts, with a bias large enough to reorder the selection.
         let moe = Moe {
@@ -293,16 +336,26 @@ mod tests {
             ],
             e_score_bias: vec![10.0, 0.0, 0.0, 0.0], // e0 wins on bias alone
             gate_up: ExpertTensor {
-                ggml_type: GgmlType::F32,
-                bytes: Vec::new(),
+                info: TensorInfo {
+                    name: "test".into(),
+                    dims: vec![2, 2, 4],
+                    ggml_type: scoria_gguf::GgmlType::F32,
+                    offset: 0,
+                },
+                slab_bytes: 0,
                 in_dim: 2,
                 out_dim: 2,
                 experts: 4,
                 outer: vec![1.0; 4],
             },
             down: ExpertTensor {
-                ggml_type: GgmlType::F32,
-                bytes: Vec::new(),
+                info: TensorInfo {
+                    name: "test".into(),
+                    dims: vec![1, 2, 4],
+                    ggml_type: scoria_gguf::GgmlType::F32,
+                    offset: 0,
+                },
+                slab_bytes: 0,
                 in_dim: 1,
                 out_dim: 2,
                 experts: 4,

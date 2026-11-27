@@ -968,16 +968,19 @@ extern "C" __global__ void inkling2_conv4_f32(float* __restrict__ x,
                                               unsigned channels) {
     unsigned c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
-    float h0 = cache[c];
-    float h1 = cache[channels + c];
-    float h2 = cache[2u * channels + c];
-    float h3 = x[c];
-    // Newest tap last, matching `short_conv1d_4tap`.
-    x[c] = weight[c] * h0 + weight[channels + c] * h1 + weight[2u * channels + c] * h2
-         + weight[3u * channels + c] * h3;
-    cache[c] = h1;
-    cache[channels + c] = h2;
-    cache[2u * channels + c] = h3;
+    // PyTorch Conv1d cross-correlation: tap 0 multiplies the *oldest* input and tap 3 the
+    // current one. Layout is weight[channel * 4 + tap]. The pre-conv value is added back
+    // as a residual and the sum is divided by sqrt(kernel + 1) = sqrt(5).
+    float current = x[c];
+    float lag1 = cache[c];
+    float lag2 = cache[channels + c];
+    float lag3 = cache[2u * channels + c];
+    const float* w = weight + c * 4u;
+    float acc = w[0] * lag3 + w[1] * lag2 + w[2] * lag1 + w[3] * current;
+    cache[2u * channels + c] = lag2;
+    cache[channels + c] = lag1;
+    cache[c] = current;
+    x[c] = (acc + current) * 0.447213595499958f;  // 1/sqrt(5)
 }
 
 // Per-head `l2_clip(x * scale)` with an optional per-element scale (pass `scale == nullptr`
