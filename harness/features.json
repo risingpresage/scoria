@@ -7,6 +7,15 @@
   ],
   "features": [
     {
+      "id": "phase3-inkling2-attn-core",
+      "phase": 3,
+      "title": "inkling2_loop attention core as a CPU reference: relative bias, L2 clips, log-scale, short convs, sink softmax, output gate",
+      "status": "verified",
+      "verify": "cargo test -p scoria-engine --lib inkling2_attn && ./scripts/check.sh",
+      "observed": "12 unit tests pass, transcribed from transformers' modeling_inkling2_loop.py. Hand-computed: L2 clip (3,4)->(1.2,1.6) at threshold 2; log scale 1.0 below floor 8192 and 1+0.1*ln2 above; relative-bias gather for distances 0..2 with future keys and distance>=extent zeroed; sink softmax 1/3+1/3 neutral and ~0 at sink=+100; 4-tap causal conv t=0,1,2,4 -> 4,11,20,40 with cache chaining; decode_head equals a naive full-row reference for windows none/6/3/1; window 4 selects positions 6..9 (mean 7.5); all-masked row returns zeros, not NaN.",
+      "note": "This is the ordering oracle the future v_wmma kernel must match, per the AGENTS.md rule that device code ships with a CPU reference. Not yet wired to a model: the projections (W_q/W_k/W_v/W_gate/W_rel/W_sink), the MoE FFN and the loop gates are still unimplemented."
+    },
+    {
       "id": "phase3-all-dequant-types",
       "phase": 3,
       "title": "IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S dequant with generated ggml tables; every Inkling tensor type loadable",
