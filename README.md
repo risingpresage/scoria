@@ -1,13 +1,19 @@
-# scoria
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-on-dark.svg">
+    <img src="assets/logo.svg" alt="scoria" width="360">
+  </picture>
+</div>
 
-An LLM inference engine for AMD GPUs. The host and runtime are Rust; all device
-code is standalone HIP kernels cross-compiled for `gfx1201` (RDNA4) and `gfx942`
-(CDMA3). It loads Qwen2 and Qwen3 GGUF checkpoints and runs prefill and decode
-with tiled `v_wmma` GEMMs, split-K GEMV, and a captured `hipGraph` decode loop.
+An inference engine for AMD GPUs, built for speed on real weights. The host and
+runtime are Rust; all device code is standalone HIP kernels cross-compiled for
+`gfx1201` (RDNA4) and `gfx942` (CDMA3). It loads Qwen2 and Qwen3 GGUF checkpoints
+and runs prefill and decode with tiled `v_wmma` GEMMs, split-K GEMV, and a captured
+`hipGraph` decode loop.
 
-It is a measurement harness as much as an engine: every optimisation is a
-Control-Candidate-Control experiment recorded in `harness/ledger.jsonl`, and
-`./scripts/check.sh` gates what lands.
+Speed here is measured, not asserted: every optimisation is a Control-Candidate-
+Control experiment recorded in `harness/ledger.jsonl`, and `./scripts/check.sh`
+gates what lands.
 
 ## Quick start
 
@@ -53,6 +59,26 @@ dominates.
 Against llama.cpp `b11050` (Vulkan, RADV, `-ngl 99`) on the same card, this is
 84-94% of its decode rate and 64-68% of its prefill rate. Prefill is the open
 gap.
+
+## Where this is going
+
+The goal is the fastest path from GGUF weights to tokens on RDNA4, and then the
+architectures a dense llama.cpp path cannot run well:
+
+- **Dense speed first.** Close the prefill gap (64-68% of llama.cpp today) and the
+  decode residue, shape by shape, on Qwen2/Qwen3 from 0.5B to 8B.
+- **Inkling 2 Mini.** 24 layers with layers 6-18 executed three times, and 128 MoE
+  experts with top-8 routing. The schedule already expands in `ExecutionGraph`
+  (48 steps, covered by `expand_inkling2_mini_looped_schedule` in
+  `crates/engine/src/lib.rs`); the expert GEMM and the looped KV policy do not
+  exist yet.
+- **Ternary and paged weights.** A `PTQ1_0` popcount path for the Bonsai ternary
+  models, and `io_uring`/`O_DIRECT` paging so checkpoints larger than 16 GiB
+  stream from NVMe instead of needing to fit.
+
+Dense speed is the current phase; the other two are `pending` in
+`harness/features.json`, which only gains a `verified` status with observed output
+attached.
 
 ## How it works
 
