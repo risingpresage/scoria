@@ -7,6 +7,15 @@
   ],
   "features": [
     {
+      "id": "phase3-inkling2-output-head",
+      "phase": 3,
+      "title": "Output head: final block-residual query, output_norm, unpadded unembed matvec, logit softcap",
+      "status": "verified",
+      "verify": "cargo test -p scoria-engine --lib inkling2_head && ./scripts/check.sh",
+      "observed": "3 tests pass. softcap is bounded by c (asymptote, not a clamp), odd and monotone; block_residual output lies inside the convex hull of the RMS-normalised snapshots and is deterministic; logits over a 2-row synthetic unembedding are opposite in sign for opposite rows, bounded by 30, and repeat exactly. Unembedding streams rows; 200058 real rows of the 201024 padded.",
+      "note": "Not yet connected to a full stack: layers 1-23, the 3x loop over 6-18 with the 13 gate tensors, and the per-layer sliding/full variants are still unwired, so no model logits exist."
+    },
+    {
       "id": "phase3-inkling2-block-residual",
       "phase": 3,
       "title": "Block-boundary residual and mlp_input attention for layer 0",

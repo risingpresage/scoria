@@ -112,6 +112,11 @@
 - Effect on real weights: `|residual|` drops from 48.6 to 7.30 (=`|post|`, confirming no add happened), and the MoE input norm becomes 51.7/50.3/48.9 against `|ffn_norm.weight|` = 50.5.
 - Expert selections shift accordingly (e.g. `[18,45,33,95,11,124,123,114]` for token 785), weights still sum to 8.0, all finite.
 
+## 2026-11-28 — output head (`final_input` -> norm -> unembed -> softcap) implemented
+- `crates/engine/src/inkling2_head.rs`: the final block-residual query (`output_res_query` over block snapshots + hidden, non-causal, 1 query), the `output_norm`, the unembedding matvec, and `tanh(x/30)*30`. The unembedding is 200058 x 2304 rows over the **unpadded** vocabulary (the GGUF pads the tensor to 201024), dequantised one row at a time because f32 would be 1.84 GB.
+- Three tests, and two of them failed first on *my* arithmetic: `tanh(100/30)*30` is 29.92 not 29.99, and a 1-query attention over RMS-normalised snapshots is a convex combination — RMSNorm fixes the RMS, not the norm, so asserting `norm == 1` was wrong. Both now assert structure (bounded by `c`, odd, monotone; output inside the convex hull) plus one comparison against the definition, instead of hand-expanded decimals.
+- 30 engine unit tests green, `./scripts/check.sh` green.
+
 ## Parity gate calibration (cosine > 0.999 is prompt-dependent, not an implementation defect)
 - Measured the control that settles it: **llama.cpp's own Vulkan backend vs llama.cpp's own CPU backend** scores `cos = 0.997985` (`maxdiff 1.152`) on the Qwen3-4B harness chat prompt (`151644,872,198,785,…,77091,198`, `m=13`), where scoria scores `0.997652` (`maxdiff 1.103`). Both pick top1 `785`. No GPU implementation reaches 0.999 on that prompt.
 - Forcing prefill onto the scalar FP32 GEMM (`SCORIA_PREFILL_FP32=1`) changes nothing: 4B `0.997614` vs `0.997652` for FP16 WMMA, 8B `0.996415` vs `0.996404`. So the deficit is **not** FP16 WMMA rounding.
