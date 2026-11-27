@@ -168,7 +168,7 @@ extern "C" __global__ void rmsnorm_f32(const float* __restrict__ x,
         }
     }
     float wsum = scoria_wave_sum(ss);
-    __shared__ float s_sums[8];
+    __shared__ float s_sums[32];
     __shared__ float s_inv;
     if (lane == 0) {
         s_sums[wave_id] = wsum;
@@ -523,10 +523,10 @@ extern "C" __global__ void rope_neox_f32(float* __restrict__ q,
         vec = k + ((size_t)tok * n_kv_heads + kvh) * head_dim;
     }
 
-    float inv_freq = powf(freq_base, -2.0f * (float)i / (float)head_dim);
+    float inv_freq = exp2f((-2.0f / (float)head_dim) * (float)i * log2f(freq_base));
     float theta = (float)(start_pos + tok) * inv_freq;
-    float c = cosf(theta);
-    float s = sinf(theta);
+    float s, c;
+    sincosf(theta, &s, &c);
 
     float x0 = vec[i];
     float x1 = vec[i + half_dim];
@@ -590,12 +590,12 @@ __device__ __forceinline__ void qk_norm_rope_kv_impl(float* __restrict__ q,
 #ifdef SCORIA_RDNA4
     if (head_dim == 128u) {
         unsigned i0 = lane * 2u;
-        float inv_f0 = powf(freq_base, -2.0f * (float)i0 / 128.0f);
-        float inv_f1 = powf(freq_base, -2.0f * (float)(i0 + 1u) / 128.0f);
-        float t0 = (float)pos * inv_f0;
-        float t1 = (float)pos * inv_f1;
-        float c0 = cosf(t0), s0 = sinf(t0);
-        float c1 = cosf(t1), s1 = sinf(t1);
+        float log2_base = log2f(freq_base);
+        float inv_f0 = exp2f((-2.0f / 128.0f) * (float)i0 * log2_base);
+        float inv_f1 = exp2f((-2.0f / 128.0f) * (float)(i0 + 1u) * log2_base);
+        float s0, c0, s1, c1;
+        sincosf((float)pos * inv_f0, &s0, &c0);
+        sincosf((float)pos * inv_f1, &s1, &c1);
 
         if (is_q) {
             float* qv = q + ((size_t)tok * n_heads + h) * 128u;
@@ -669,6 +669,8 @@ __device__ __forceinline__ void qk_norm_rope_kv_impl(float* __restrict__ q,
         inv = rsqrtf(scoria_wave_sum(ss) / (float)head_dim + eps);
     }
 
+    float log2_base = log2f(freq_base);
+    float inv_step = -2.0f / (float)head_dim;
     for (unsigned i = lane; i < half_dim; i += SCORIA_WAVE_SIZE) {
         float x0 = src[i];
         float x1 = src[i + half_dim];
@@ -676,10 +678,10 @@ __device__ __forceinline__ void qk_norm_rope_kv_impl(float* __restrict__ q,
             x0 *= inv * norm_w[i];
             x1 *= inv * norm_w[i + half_dim];
         }
-        float inv_freq = powf(freq_base, -2.0f * (float)i / (float)head_dim);
+        float inv_freq = exp2f(inv_step * (float)i * log2_base);
         float theta = (float)pos * inv_freq;
-        float c = cosf(theta);
-        float s = sinf(theta);
+        float s, c;
+        sincosf(theta, &s, &c);
         float o0 = x0 * c - x1 * s;
         float o1 = x0 * s + x1 * c;
         if (is_q) {
@@ -954,6 +956,85 @@ extern "C" __global__ void qk_norm_rope_kv_f16(float* __restrict__ q,
                                    n_heads, n_kv_heads, head_dim, freq_base, eps);
 }
 
+
+// inkling2_loop decode attention: one wave per query head, online softmax over the KV
+// cache with a hidden-states-conditioned relative bias, a causal sliding-window mask, and
+// a per-head sink logit that absorbs probability mass before normalisation.
+//
+// This mirrors `inkling2_attn::decode_head` exactly; that CPU reference is the oracle.
+// There is no RoPE here: position enters only through `bias`, which the host computes as
+// `gather((W_rel h) proj, q_pos - k_pos)` and zeroes outside the relative extent.
+//
+// `window == 0` hides every position (only the sink has mass), `window == UINT_MAX` is
+// unbounded, and anything between keeps positions with `pos - t < window`.
+extern "C" __global__ void inkling2_attn_decode_f32(const float* __restrict__ q,
+                                                    const float* __restrict__ k_cache,
+                                                    const float* __restrict__ v_cache,
+                                                    const float* __restrict__ bias,
+                                                    const float* __restrict__ sink,
+                                                    float* __restrict__ out,
+                                                    unsigned pos,
+                                                    unsigned n_heads,
+                                                    unsigned n_kv_heads,
+                                                    unsigned head_dim,
+                                                    unsigned window) {
+    unsigned q_head = blockIdx.x;
+    if (q_head >= n_heads) return;
+    unsigned lane = threadIdx.x;
+    if (lane >= SCORIA_WAVE_SIZE) return;
+
+    unsigned kv_group = n_heads / n_kv_heads;
+    unsigned kv_head = q_head / kv_group;
+    float scale = rsqrtf((float)head_dim);
+
+    float q_r[4];
+    float acc[4];
+    #pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        unsigned d = lane + (unsigned)e * SCORIA_WAVE_SIZE;
+        q_r[e] = (d < head_dim) ? q[(size_t)q_head * head_dim + d] : 0.0f;
+        acc[e] = 0.0f;
+    }
+
+    // Treat the sink as a virtual score: starting the online pass at m = sink with l = 1
+    // is exactly `softmax([scores, sink])` with the sink column dropped, and leaves the
+    // output at zero when every position is masked.
+    float sink_v = sink[q_head];
+    float m_i = sink_v;
+    float l_i = 1.0f;
+    const float* bias_row = bias + (size_t)q_head * (pos + 1u);
+
+    for (unsigned t = 0; t <= pos; ++t) {
+        if ((pos - t) >= window) continue;
+        const float* k_ptr = k_cache + ((size_t)t * n_kv_heads + kv_head) * head_dim;
+        float dot = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            unsigned d = lane + (unsigned)e * SCORIA_WAVE_SIZE;
+            if (d < head_dim) dot += q_r[e] * k_ptr[d];
+        }
+        float score = scoria_wave_sum(dot) * scale + bias_row[t];
+        float m_new = fmaxf(m_i, score);
+        float alpha = expf(m_i - m_new);
+        float beta = expf(score - m_new);
+        l_i = l_i * alpha + beta;
+        const float* v_ptr = v_cache + ((size_t)t * n_kv_heads + kv_head) * head_dim;
+        #pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            unsigned d = lane + (unsigned)e * SCORIA_WAVE_SIZE;
+            if (d < head_dim) acc[e] = acc[e] * alpha + beta * v_ptr[d];
+        }
+        m_i = m_new;
+    }
+
+    float inv_l = (l_i > 0.0f) ? 1.0f / l_i : 0.0f;
+    #pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        unsigned d = lane + (unsigned)e * SCORIA_WAVE_SIZE;
+        if (d < head_dim) out[(size_t)q_head * head_dim + d] = acc[e] * inv_l;
+    }
+}
+
 // FP16 KV cache: the decode loop reads K and V once per position, so halving their
 // size halves long-context bandwidth and VRAM. Activations stay FP32; only the cached
 // keys and values are rounded, which is what llama.cpp does by default (`-ctk f16`).
@@ -988,8 +1069,8 @@ extern "C" __global__ void kv_cache_append_f16(const float* __restrict__ k_in,
     v_cache[dst_idx] = (_Float16)v_in[idx];
 }
 
-// Supports head_dim 128 and 64, which covers every checkpoint this engine runs
-// today; the host keeps FP32 KV for anything else rather than taking a slow path.
+// Supports fast Wave32 paths for head_dim 128 and 64 on RDNA4, with a general
+// fallback for arbitrary head_dim <= 256 (and Wave64 CDNA).
 extern "C" __global__ void gqa_attn_f16(const float* __restrict__ q,
                                         const _Float16* __restrict__ k_cache,
                                         const _Float16* __restrict__ v_cache,
@@ -1001,7 +1082,7 @@ extern "C" __global__ void gqa_attn_f16(const float* __restrict__ q,
                                         unsigned head_dim) {
     unsigned q_head = blockIdx.x;
     unsigned tok = blockIdx.y;
-    if (q_head >= n_heads || tok >= m) return;
+    if (q_head >= n_heads || tok >= m || head_dim == 0u || head_dim > 256u) return;
     unsigned start_pos = *pos_ptr;
 
     unsigned tid = threadIdx.x;
@@ -1024,6 +1105,7 @@ extern "C" __global__ void gqa_attn_f16(const float* __restrict__ q,
     float m_i = -1e38f;
     float l_i = 0.0f;
 
+#ifdef SCORIA_RDNA4
     if (head_dim == 128u) {
         unsigned d = lane * 4u;
         float4 qv = *(const float4*)(q_base + d);
@@ -1079,51 +1161,122 @@ extern "C" __global__ void gqa_attn_f16(const float* __restrict__ q,
         return;
     }
 
-    // head_dim == 64
-    unsigned d = lane * 2u;
-    float2 qv = *(const float2*)(q_base + d);
-    float2 av = {0.0f, 0.0f};
+    if (head_dim == 64u) {
+        unsigned d = lane * 2u;
+        float2 qv = *(const float2*)(q_base + d);
+        float2 av = {0.0f, 0.0f};
+        for (unsigned t = wave_id; t < kv_len; t += n_waves) {
+            const _Float16* k_ptr = k_cache + ((size_t)t * n_kv_heads + kv_head) * 64u;
+            const _Float16* v_ptr = v_cache + ((size_t)t * n_kv_heads + kv_head) * 64u;
+            float2 kv = scoria_load_f16x2(k_ptr + d);
+            float p = qv.x * kv.x + qv.y * kv.y;
+            float score = scoria_wave_sum(p) * scale;
+            float m_new = fmaxf(m_i, score);
+            float alpha = (l_i == 0.0f) ? 0.0f : expf(m_i - m_new);
+            float beta = expf(score - m_new);
+            l_i = l_i * alpha + beta;
+            float2 vv = scoria_load_f16x2(v_ptr + d);
+            av.x = av.x * alpha + beta * vv.x;
+            av.y = av.y * alpha + beta * vv.y;
+            m_i = m_new;
+        }
+        if (lane == 0) {
+            s_m[wave_id] = m_i;
+            s_l[wave_id] = l_i;
+        }
+        *(float2*)(&s_o[wave_id][d]) = av;
+        __syncthreads();
+        if (wave_id == 0) {
+            float m_g = -1e38f;
+            for (unsigned w = 0; w < n_waves; ++w) {
+                if (s_l[w] > 0.0f) m_g = fmaxf(m_g, s_m[w]);
+            }
+            float l_g = 0.0f;
+            float2 out_v = {0.0f, 0.0f};
+            for (unsigned w = 0; w < n_waves; ++w) {
+                if (s_l[w] > 0.0f) {
+                    float bw = expf(s_m[w] - m_g);
+                    l_g += s_l[w] * bw;
+                    float2 ov = *(const float2*)(&s_o[w][d]);
+                    out_v.x += ov.x * bw;
+                    out_v.y += ov.y * bw;
+                }
+            }
+            float inv_l = 1.0f / l_g;
+            out_v.x *= inv_l;
+            out_v.y *= inv_l;
+            *(float2*)(out_base + d) = out_v;
+        }
+        return;
+    }
+#endif
+
+    float q_r[8];
+    float a_r[8];
+    #pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        unsigned d = lane + (unsigned)e * SCORIA_WAVE_SIZE;
+        q_r[e] = (d < head_dim) ? q_base[d] : 0.0f;
+        a_r[e] = 0.0f;
+    }
     for (unsigned t = wave_id; t < kv_len; t += n_waves) {
-        const _Float16* k_ptr = k_cache + ((size_t)t * n_kv_heads + kv_head) * 64u;
-        const _Float16* v_ptr = v_cache + ((size_t)t * n_kv_heads + kv_head) * 64u;
-        float2 kv = scoria_load_f16x2(k_ptr + d);
-        float p = qv.x * kv.x + qv.y * kv.y;
+        const _Float16* k_ptr = k_cache + ((size_t)t * n_kv_heads + kv_head) * head_dim;
+        const _Float16* v_ptr = v_cache + ((size_t)t * n_kv_heads + kv_head) * head_dim;
+        float p = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            unsigned d = lane + (unsigned)e * SCORIA_WAVE_SIZE;
+            if (d < head_dim) p += q_r[e] * (float)k_ptr[d];
+        }
         float score = scoria_wave_sum(p) * scale;
         float m_new = fmaxf(m_i, score);
         float alpha = (l_i == 0.0f) ? 0.0f : expf(m_i - m_new);
         float beta = expf(score - m_new);
         l_i = l_i * alpha + beta;
-        float2 vv = scoria_load_f16x2(v_ptr + d);
-        av.x = av.x * alpha + beta * vv.x;
-        av.y = av.y * alpha + beta * vv.y;
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            unsigned d = lane + (unsigned)e * SCORIA_WAVE_SIZE;
+            if (d < head_dim) a_r[e] = a_r[e] * alpha + beta * (float)v_ptr[d];
+        }
         m_i = m_new;
     }
     if (lane == 0) {
         s_m[wave_id] = m_i;
         s_l[wave_id] = l_i;
     }
-    *(float2*)(&s_o[wave_id][d]) = av;
+    #pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        unsigned d = lane + (unsigned)e * SCORIA_WAVE_SIZE;
+        if (d < head_dim) s_o[wave_id][d] = a_r[e];
+    }
     __syncthreads();
+
     if (wave_id == 0) {
         float m_g = -1e38f;
         for (unsigned w = 0; w < n_waves; ++w) {
             if (s_l[w] > 0.0f) m_g = fmaxf(m_g, s_m[w]);
         }
         float l_g = 0.0f;
-        float2 out_v = {0.0f, 0.0f};
+        float acc[8];
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) acc[e] = 0.0f;
         for (unsigned w = 0; w < n_waves; ++w) {
             if (s_l[w] > 0.0f) {
                 float bw = expf(s_m[w] - m_g);
                 l_g += s_l[w] * bw;
-                float2 ov = *(const float2*)(&s_o[w][d]);
-                out_v.x += ov.x * bw;
-                out_v.y += ov.y * bw;
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    unsigned d = lane + (unsigned)e * SCORIA_WAVE_SIZE;
+                    if (d < head_dim) acc[e] += s_o[w][d] * bw;
+                }
             }
         }
         float inv_l = 1.0f / l_g;
-        out_v.x *= inv_l;
-        out_v.y *= inv_l;
-        *(float2*)(out_base + d) = out_v;
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            unsigned d = lane + (unsigned)e * SCORIA_WAVE_SIZE;
+            if (d < head_dim) out_base[d] = acc[e] * inv_l;
+        }
     }
 }
 
@@ -1207,7 +1360,7 @@ extern "C" __global__ void add_rmsnorm_f32(float* __restrict__ x,
         }
     }
     float wsum = scoria_wave_sum(ss);
-    __shared__ float s_sums[8];
+    __shared__ float s_sums[32];
     __shared__ float s_inv;
     if (lane == 0) {
         s_sums[wave_id] = wsum;
@@ -1244,17 +1397,18 @@ extern "C" __global__ void argmax_stage1_f32(const float* __restrict__ vals,
                                              float* __restrict__ out_vals,
                                              unsigned* __restrict__ out_idxs,
                                              unsigned n) {
+    if (n == 0u) return;
     unsigned tid = threadIdx.x;
     unsigned lane = tid & (SCORIA_WAVE_SIZE - 1u);
     unsigned wave_id = tid / SCORIA_WAVE_SIZE;
     unsigned n_waves = blockDim.x / SCORIA_WAVE_SIZE;
     unsigned stride = gridDim.x * blockDim.x;
 
-    float best_v = -1e38f;
-    unsigned best_i = 0u;
+    float best_v = -__builtin_huge_valf();
+    unsigned best_i = 0xFFFFFFFFu;
     for (unsigned i = blockIdx.x * blockDim.x + tid; i < n; i += stride) {
         float v = vals[i];
-        if (v > best_v) {
+        if (v > best_v || (v == best_v && i < best_i)) {
             best_v = v;
             best_i = i;
         }
@@ -1269,8 +1423,8 @@ extern "C" __global__ void argmax_stage1_f32(const float* __restrict__ vals,
         }
     }
 
-    __shared__ float s_v[8];
-    __shared__ unsigned s_i[8];
+    __shared__ float s_v[32];
+    __shared__ unsigned s_i[32];
     if (lane == 0) {
         s_v[wave_id] = best_v;
         s_i[wave_id] = best_i;
@@ -1297,13 +1451,22 @@ extern "C" __global__ void argmax_stage2_f32(const float* __restrict__ in_vals,
                                              const unsigned* __restrict__ in_idxs,
                                              unsigned* __restrict__ out_idx,
                                              unsigned count) {
+    if (count == 0u) return;
     unsigned tid = threadIdx.x;
     unsigned lane = tid & (SCORIA_WAVE_SIZE - 1u);
     unsigned wave_id = tid / SCORIA_WAVE_SIZE;
     unsigned n_waves = blockDim.x / SCORIA_WAVE_SIZE;
 
-    float best_v = (tid < count) ? in_vals[tid] : -1e38f;
-    unsigned best_i = (tid < count) ? in_idxs[tid] : 0u;
+    float best_v = -__builtin_huge_valf();
+    unsigned best_i = 0xFFFFFFFFu;
+    for (unsigned i = tid; i < count; i += blockDim.x) {
+        float v = in_vals[i];
+        unsigned idx = in_idxs[i];
+        if (v > best_v || (v == best_v && idx < best_i)) {
+            best_v = v;
+            best_i = idx;
+        }
+    }
 
     for (int off = SCORIA_WAVE_SIZE >> 1; off > 0; off >>= 1) {
         float ov = __shfl_xor(best_v, off, SCORIA_WAVE_SIZE);
@@ -1314,8 +1477,8 @@ extern "C" __global__ void argmax_stage2_f32(const float* __restrict__ in_vals,
         }
     }
 
-    __shared__ float s_v[8];
-    __shared__ unsigned s_i[8];
+    __shared__ float s_v[32];
+    __shared__ unsigned s_i[32];
     if (lane == 0) {
         s_v[wave_id] = best_v;
         s_i[wave_id] = best_i;
@@ -1726,7 +1889,8 @@ extern "C" __global__ void quantize_q8_1_f32(const float* __restrict__ x,
     if (blk_id * 32u >= k) return;
     unsigned lane = threadIdx.x & 31u;
 
-    float v = x[(size_t)blk_id * 32u + lane];
+    unsigned idx = blk_id * 32u + lane;
+    float v = (idx < k) ? x[idx] : 0.0f;
     float amax = fabsf(v);
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
@@ -1786,21 +1950,17 @@ extern "C" __global__ void gemv_q4_k_q8_1_f32(const unsigned char* __restrict__ 
     size_t row_bytes = (size_t)nb * 144u;
 
     const unsigned char* w0 = weight + (size_t)row0 * row_bytes;
-    const unsigned char* w1 = w0 + row_bytes;
+    const unsigned char* w1 = has_r1 ? (w0 + row_bytes) : w0;
     float acc0 = 0.0f;
     float acc1 = 0.0f;
 
     for (unsigned b = grp; b < nb; b += grp_stride) {
         const unsigned char* blk0 = w0 + (size_t)b * 144u;
+        const unsigned char* blk1 = w1 + (size_t)b * 144u;
         uint4 hdr0 = *(const uint4*)blk0;
         uint4 q0 = *(const uint4*)(blk0 + 16u + (size_t)lane_in_blk * 16u);
-        uint4 hdr1 = {0u, 0u, 0u, 0u};
-        uint4 q1 = {0u, 0u, 0u, 0u};
-        if (has_r1) {
-            const unsigned char* blk1 = w1 + (size_t)b * 144u;
-            hdr1 = *(const uint4*)blk1;
-            q1 = *(const uint4*)(blk1 + 16u + (size_t)lane_in_blk * 16u);
-        }
+        uint4 hdr1 = *(const uint4*)blk1;
+        uint4 q1 = *(const uint4*)(blk1 + 16u + (size_t)lane_in_blk * 16u);
 
         const unsigned char* x_lo_blk = x_q8 + ((size_t)b * 8u + chunk * 2u) * 48u;
         const unsigned char* x_hi_blk = x_lo_blk + 48u;
@@ -1826,23 +1986,21 @@ extern "C" __global__ void gemv_q4_k_q8_1_f32(const unsigned char* __restrict__ 
             acc0 -= (m1_0 * ds_lo.y + m2_0 * ds_hi.y);
         }
 
-        if (has_r1) {
-            float d1_1, m1_1, d2_1, m2_1;
-            scoria_q4k_unpack_scales(hdr1, chunk, &d1_1, &m1_1, &d2_1, &m2_1);
-            int dot_lo1 = 0;
-            dot_lo1 = scoria_dot4_u8_i8(q1.x & 0x0F0F0F0Fu, qx_lo.x, dot_lo1);
-            dot_lo1 = scoria_dot4_u8_i8(q1.y & 0x0F0F0F0Fu, qx_lo.y, dot_lo1);
-            dot_lo1 = scoria_dot4_u8_i8(q1.z & 0x0F0F0F0Fu, qx_lo.z, dot_lo1);
-            dot_lo1 = scoria_dot4_u8_i8(q1.w & 0x0F0F0F0Fu, qx_lo.w, dot_lo1);
-            int dot_hi1 = 0;
-            dot_hi1 = scoria_dot4_u8_i8((q1.x >> 4) & 0x0F0F0F0Fu, qx_hi.x, dot_hi1);
-            dot_hi1 = scoria_dot4_u8_i8((q1.y >> 4) & 0x0F0F0F0Fu, qx_hi.y, dot_hi1);
-            dot_hi1 = scoria_dot4_u8_i8((q1.z >> 4) & 0x0F0F0F0Fu, qx_hi.z, dot_hi1);
-            dot_hi1 = scoria_dot4_u8_i8((q1.w >> 4) & 0x0F0F0F0Fu, qx_hi.w, dot_hi1);
-            acc1 += d1_1 * ds_lo.x * (float)dot_lo1 + d2_1 * ds_hi.x * (float)dot_hi1;
-            if (half_c == 0u) {
-                acc1 -= (m1_1 * ds_lo.y + m2_1 * ds_hi.y);
-            }
+        float d1_1, m1_1, d2_1, m2_1;
+        scoria_q4k_unpack_scales(hdr1, chunk, &d1_1, &m1_1, &d2_1, &m2_1);
+        int dot_lo1 = 0;
+        dot_lo1 = scoria_dot4_u8_i8(q1.x & 0x0F0F0F0Fu, qx_lo.x, dot_lo1);
+        dot_lo1 = scoria_dot4_u8_i8(q1.y & 0x0F0F0F0Fu, qx_lo.y, dot_lo1);
+        dot_lo1 = scoria_dot4_u8_i8(q1.z & 0x0F0F0F0Fu, qx_lo.z, dot_lo1);
+        dot_lo1 = scoria_dot4_u8_i8(q1.w & 0x0F0F0F0Fu, qx_lo.w, dot_lo1);
+        int dot_hi1 = 0;
+        dot_hi1 = scoria_dot4_u8_i8((q1.x >> 4) & 0x0F0F0F0Fu, qx_hi.x, dot_hi1);
+        dot_hi1 = scoria_dot4_u8_i8((q1.y >> 4) & 0x0F0F0F0Fu, qx_hi.y, dot_hi1);
+        dot_hi1 = scoria_dot4_u8_i8((q1.z >> 4) & 0x0F0F0F0Fu, qx_hi.z, dot_hi1);
+        dot_hi1 = scoria_dot4_u8_i8((q1.w >> 4) & 0x0F0F0F0Fu, qx_hi.w, dot_hi1);
+        acc1 += d1_1 * ds_lo.x * (float)dot_lo1 + d2_1 * ds_hi.x * (float)dot_hi1;
+        if (half_c == 0u) {
+            acc1 -= (m1_1 * ds_lo.y + m2_1 * ds_hi.y);
         }
     }
 
@@ -2018,7 +2176,7 @@ extern "C" __global__ void gemv_q6_k_f32(const unsigned char* __restrict__ weigh
 
     float w0s = scoria_wave_sum(acc0);
     float w1s = scoria_wave_sum(acc1);
-    __shared__ float s_red[2][4];
+    __shared__ float s_red[2][32];
     if (lane == 0) {
         s_red[0][wave_id] = w0s;
         s_red[1][wave_id] = w1s;
@@ -2510,7 +2668,7 @@ __device__ __forceinline__ void gemm_wmma_wide_impl(const unsigned char* __restr
                                                      unsigned m,
                                                      unsigned n,
                                                      unsigned k) {
-    if (k == 0u) return;
+    if (m == 0u || n == 0u || k == 0u) return;
     unsigned tid = threadIdx.x;
     unsigned wave_id = tid >> 5;
     unsigned lane = tid & 31u;
@@ -2589,7 +2747,7 @@ __device__ __forceinline__ void gemm_wmma_q4_k_dbuf_impl(const unsigned char* __
                                                          unsigned m,
                                                          unsigned n,
                                                          unsigned k) {
-    if (k == 0u) return;
+    if (m == 0u || n == 0u || k == 0u) return;
     unsigned tid = threadIdx.x;
     unsigned wave_id = tid >> 5;
     unsigned lane = tid & 31u;
@@ -2684,6 +2842,7 @@ __device__ __forceinline__ void gemm_wmma_narrow_impl(const unsigned char* __res
                                                       unsigned m,
                                                       unsigned n,
                                                       unsigned k) {
+    if (m == 0u || n == 0u || k == 0u) return;
     unsigned tid = threadIdx.x;
     unsigned wave_id = tid >> 5;
     unsigned lane = tid & 31u;

@@ -57,6 +57,7 @@ define_infer_kernels! {
         kv_cache_append_f16 => infer_names::KV_CACHE_APPEND_F16,
         qk_norm_rope_kv_f32 => infer_names::QK_NORM_ROPE_KV_F32,
         qk_norm_rope_kv_f16 => infer_names::QK_NORM_ROPE_KV_F16,
+        inkling2_attn_decode_f32 => infer_names::INKLING2_ATTN_DECODE_F32,
         gqa_attn_f32 => infer_names::GQA_ATTN_F32,
         gqa_attn_f16 => infer_names::GQA_ATTN_F16,
         silu_mul_f32 => infer_names::SILU_MUL_F32,

@@ -72,11 +72,36 @@ __device__ __forceinline__ unsigned scoria_lut16(unsigned lut_bits, unsigned nib
 #error "Unsupported AMDGPU target: scoria requires gfx1200/gfx1201 (RDNA4) or gfx90a/gfx942/gfx950 (CDNA)"
 #endif
 
+typedef unsigned scoria_u32x4_t __attribute__((ext_vector_type(4)));
+typedef unsigned scoria_u32x2_t __attribute__((ext_vector_type(2)));
+
+__device__ __forceinline__ uint4 scoria_nt_u4(const void* ptr) {
+    scoria_u32x4_t v = __builtin_nontemporal_load((const scoria_u32x4_t*)ptr);
+    return make_uint4(v[0], v[1], v[2], v[3]);
+}
+
+__device__ __forceinline__ uint2 scoria_nt_u2(const void* ptr) {
+    scoria_u32x2_t v = __builtin_nontemporal_load((const scoria_u32x2_t*)ptr);
+    return make_uint2(v[0], v[1]);
+}
+
+__device__ __forceinline__ unsigned short scoria_nt_u16(const unsigned short* ptr) {
+    return __builtin_nontemporal_load(ptr);
+}
+
 __device__ __forceinline__ int scoria_dot4_u8_i8(unsigned a_u8x4, int b_i8x4, int acc) {
 #ifdef SCORIA_RDNA4
     return __builtin_amdgcn_sudot4(false, (int)a_u8x4, true, b_i8x4, acc, false);
 #else
     return __builtin_amdgcn_sdot4((int)a_u8x4, b_i8x4, acc, false);
+#endif
+}
+
+__device__ __forceinline__ int scoria_dot4_i8_i8(int a_i8x4, int b_i8x4, int acc) {
+#ifdef SCORIA_RDNA4
+    return __builtin_amdgcn_sudot4(true, a_i8x4, true, b_i8x4, acc, false);
+#else
+    return __builtin_amdgcn_sdot4(a_i8x4, b_i8x4, acc, false);
 #endif
 }
 

@@ -7,6 +7,15 @@
   ],
   "features": [
     {
+      "id": "phase3-inkling2-attn-kernel",
+      "phase": 3,
+      "title": "inkling2_attn_decode_f32 HIP kernel verified against the CPU reference on GPU",
+      "status": "verified",
+      "verify": "cargo test -p scoria-engine --test inkling2_attn_gpu && ./scripts/check.sh",
+      "observed": "GPU output matches inkling2_attn::decode_head at pos 0/7/1100 with windows {none,8,3,1,1024,17} within 2e-4 + 2e-3|ref| (pos 1100 exercises distances past the 1024 relative extent). An all-masked row returns exactly zero, not NaN. window==0 now means 'hide everything' and u32::MAX means unbounded; the previous 0==unbounded encoding could not express the masked-out case.",
+      "note": "Still no forward pass: the kernel takes q/k/v/bias/sink as inputs, so the projections, MoE, loop gates and block attention residuals remain before a token can be generated."
+    },
+    {
       "id": "phase3-inkling2-attn-core",
       "phase": 3,
       "title": "inkling2_loop attention core as a CPU reference: relative bias, L2 clips, log-scale, short convs, sink softmax, output gate",

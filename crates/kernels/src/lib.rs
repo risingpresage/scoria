@@ -65,6 +65,7 @@ pub mod infer_names {
     pub const KV_CACHE_APPEND_F16: &str = "kv_cache_append_f16";
     pub const QK_NORM_ROPE_KV_F32: &str = "qk_norm_rope_kv_f32";
     pub const QK_NORM_ROPE_KV_F16: &str = "qk_norm_rope_kv_f16";
+    pub const INKLING2_ATTN_DECODE_F32: &str = "inkling2_attn_decode_f32";
     pub const GQA_ATTN_F32: &str = "gqa_attn_f32";
     pub const GQA_ATTN_F16: &str = "gqa_attn_f16";
     pub const SILU_MUL_F32: &str = "silu_mul_f32";
@@ -219,6 +220,7 @@ mod tests {
             "linear_q6_k",
             "gemv_q4_k_r4_f32",
             "gqa_attn_f32",
+            "gqa_attn_f16",
         ] {
             assert!(asm.contains(sym), "missing symbol `{sym}` in gfx942 asm");
         }
