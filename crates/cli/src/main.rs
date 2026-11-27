@@ -911,10 +911,11 @@ fn cmd_logits(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let per_token = tokens.len() as f64;
     if p.visits > 0 {
         println!(
-            "  last token: attention {:.2}s (gpu {:.2}s) moe {:.2}s over {} visits (moe {:.0}%)",
+            "  last token: attention {:.2}s (gpu {:.2}s) moe {:.2}s (gpu experts {:.2}s) over {} visits (moe {:.0}%)",
             p.attention,
             p.gpu_proj,
             p.moe,
+            p.gpu_experts,
             p.visits,
             100.0 * p.moe / (p.attention + p.moe)
         );
@@ -997,20 +998,14 @@ fn cmd_logits(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     // Determinism is not optional: a second run of the same token sequence must reproduce
     // the logits bit for bit, otherwise nothing downstream can be trusted.
-    let mut again = Model::open_with_router(path, router)?;
-    again.max_visits = max_visits;
-    if threads > 0 {
-        again.set_threads(threads);
-    }
-    if want_gpu {
-        // The determinism check must compare like with like: a host model against a GPU
-        // model differs in the last bits by construction (different reduction order).
-        let _ = again.enable_gpu();
-    }
+    // Replay on the same model: a second GPU model would need another copy of every resident
+    // tensor, and an allocation that silently failed would compare a GPU run against a host
+    // run and report "non-deterministic" for the wrong reason.
+    model.reset();
     for &tok in &tokens[..tokens.len() - 1] {
-        again.forward(tok);
+        model.forward(tok);
     }
-    let repeat = again.forward(tokens[tokens.len() - 1]);
+    let repeat = model.forward(tokens[tokens.len() - 1]);
     let same = repeat == last;
     println!("deterministic (repeat last token): {same}");
     if !same {

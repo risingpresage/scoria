@@ -56,6 +56,7 @@ define_infer_kernels! {
         linear_q8_0 => infer_names::LINEAR_Q8_0,
         linear_q4_k => infer_names::LINEAR_Q4_K,
         linear_q6_k => infer_names::LINEAR_Q6_K,
+        linear_nvfp4 => infer_names::LINEAR_NVFP4,
         rope_neox_f32 => infer_names::ROPE_NEOX_F32,
         kv_cache_append_f32 => infer_names::KV_CACHE_APPEND_F32,
         kv_cache_append_f16 => infer_names::KV_CACHE_APPEND_F16,

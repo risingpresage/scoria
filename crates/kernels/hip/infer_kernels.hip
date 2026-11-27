@@ -389,6 +389,81 @@ extern "C" __global__ void linear_q8_0(const unsigned char* __restrict__ weight,
     }
 }
 
+// NVFP4 (GGML type 40) single-token GEMV: 36 bytes per 64 elements -- four unsigned
+// E4M3 scales (one per 16-element sub-block) followed by 32 bytes of packed E2M1 nibbles.
+// Transcribed from `crates/gguf/src/dequant.rs::dequant_row_nvfp4`, including the halving
+// of the scale (the E2M1 table is doubled) and the low-nibble-first ordering within a
+// sub-block: element `s*16 + j` is `qs[j] & 0xF`, element `s*16 + 8 + j` is `qs[j] >> 4`.
+//
+// One lane takes one 64-element block, reading its 36 contiguous bytes, so the wave reads
+// a row in order and no lane re-reads a scale.
+__device__ __forceinline__ float scoria_e2m1(unsigned code) {
+    // 0..7 -> 0,1,2,3,4,6,8,12; 8..15 -> the same magnitudes negated.
+    unsigned mag = code & 7u;
+    float v;
+    switch (mag) {
+        case 0: v = 0.0f; break;
+        case 1: v = 1.0f; break;
+        case 2: v = 2.0f; break;
+        case 3: v = 3.0f; break;
+        case 4: v = 4.0f; break;
+        case 5: v = 6.0f; break;
+        case 6: v = 8.0f; break;
+        default: v = 12.0f; break;
+    }
+    return (code & 8u) ? -v : v;
+}
+
+__device__ __forceinline__ float scoria_ue4m3(unsigned x) {
+    if (x == 0u || x == 0x7Fu) return 0.0f;
+    unsigned exp = (x >> 3) & 0xFu;
+    float man = (float)(x & 0x7u);
+    float raw = (exp == 0u) ? man * 0.001953125f            // 2^-9
+                            : (1.0f + man * 0.125f) * exp2f((float)((int)exp - 7));
+    return raw * 0.5f;
+}
+
+extern "C" __global__ void linear_nvfp4(const unsigned char* __restrict__ weight,
+                                        const float* __restrict__ x,
+                                        const float* __restrict__ bias,
+                                        float* __restrict__ y,
+                                        unsigned m,
+                                        unsigned n,
+                                        unsigned k) {
+    unsigned wave_id = threadIdx.x / SCORIA_WAVE_SIZE;
+    unsigned lane = threadIdx.x & (SCORIA_WAVE_SIZE - 1u);
+    unsigned waves_per_wg = blockDim.x / SCORIA_WAVE_SIZE;
+    unsigned row = blockIdx.x * waves_per_wg + wave_id;
+    unsigned tok = blockIdx.y;
+    if (row >= n || tok >= m) return;
+
+    unsigned nb = k / 64u;
+    const unsigned char* w_row = weight + (size_t)row * nb * 36u;
+    const float* x_row = x + (size_t)tok * k;
+    float acc = 0.0f;
+    for (unsigned b = lane; b < nb; b += SCORIA_WAVE_SIZE) {
+        const unsigned char* blk = w_row + (size_t)b * 36u;
+        const float* xp = x_row + (size_t)b * 64u;
+        #pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            float d = scoria_ue4m3((unsigned)blk[s]);
+            const unsigned char* qs = blk + 4 + s * 8;
+            float sub = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                unsigned char byte = qs[j];
+                sub += scoria_e2m1((unsigned)(byte & 0x0Fu)) * xp[s * 16 + j];
+                sub += scoria_e2m1((unsigned)(byte >> 4)) * xp[s * 16 + 8 + j];
+            }
+            acc += d * sub;
+        }
+    }
+    float sum = scoria_wave_sum(acc);
+    if (lane == 0) {
+        y[(size_t)tok * n + row] = sum + (bias ? bias[row] : 0.0f);
+    }
+}
+
 extern "C" __global__ void linear_q4_k(const unsigned char* __restrict__ weight,
                                        const float* __restrict__ x,
                                        const float* __restrict__ bias,

@@ -41,7 +41,7 @@
 
 use std::ffi::c_void;
 
-use scoria_gguf::{GgufError, GgufFile, ModelConfig, TensorInfo};
+use scoria_gguf::{GgmlType, GgufError, GgufFile, ModelConfig, TensorInfo};
 use scoria_hip_rt::{DeviceBuf, HipStream};
 
 use crate::EngineContext;
@@ -52,7 +52,7 @@ use crate::inkling2_attn::{
     short_conv1d_4tap_dynamic, unweighted_rmsnorm,
 };
 use crate::inkling2_head::softcap;
-use crate::inkling2_moe::{Moe, RouterScore};
+use crate::inkling2_moe::{Moe, RouterScore, swiglu_softcapped as swiglu_softcapped_public};
 
 fn dequant_tensor(file: &GgufFile, name: &str) -> Result<Vec<f32>, GgufError> {
     let info = file
@@ -467,6 +467,17 @@ impl Head {
 /// Raw device pointers to one layer's projection weights. Copying them out of the `Gpu`
 /// first keeps the borrow checker out of the way: the pointers outlive the `&mut Gpu` call
 /// that consumes them.
+/// Uploads a tensor only when the device can decode its encoding.
+fn upload_if_nvfp4(file: &GgufFile, info: &TensorInfo) -> Option<DeviceBuf> {
+    if info.ggml_type != GgmlType::NVFP4 {
+        return None;
+    }
+    let bytes = file.tensor_bytes(info).ok()?;
+    let mut buf = DeviceBuf::alloc(bytes.len()).ok()?;
+    buf.copy_from_host(bytes).ok()?;
+    Some(buf)
+}
+
 #[derive(Clone, Copy)]
 struct GpuPtrs {
     q: *mut c_void,
@@ -478,6 +489,9 @@ struct GpuPtrs {
     o: *mut c_void,
 }
 
+/// Upper bound on the routed experts batched into one synchronisation.
+const TOP_K_FOR_BATCH: usize = 8;
+
 struct GpuLayer {
     q: DeviceBuf,
     k: DeviceBuf,
@@ -488,10 +502,32 @@ struct GpuLayer {
     sink: DeviceBuf,
 }
 
+/// One layer's expert tensors, when the checkpoint stores them in a format the device can
+/// decode. NVFP4 only, for now: IQ2XS/IQ3XXS/IQ3S/IQ2S/Q3K/IQ4NL have no device
+/// dequantiser yet, so those layers keep running on the host.
+struct GpuExperts {
+    gate_up: Option<DeviceBuf>,
+    down: Option<DeviceBuf>,
+    /// Rows and input width, so the launch does not have to re-read the GGUF header.
+    gate_up_rows: usize,
+    gate_up_k: usize,
+    down_rows: usize,
+    down_k: usize,
+    gate_up_outer: Vec<f32>,
+    down_outer: Vec<f32>,
+}
+
+impl GpuExperts {
+    fn complete(&self) -> bool {
+        self.gate_up.is_some() && self.down.is_some()
+    }
+}
+
 struct Gpu {
     ctx: EngineContext,
     stream: HipStream,
     layers: Vec<GpuLayer>,
+    experts: Vec<Option<GpuExperts>>,
     x: DeviceBuf,
     y: DeviceBuf,
     wave_size: u32,
@@ -532,10 +568,16 @@ impl Gpu {
             });
         }
         Self {
+            experts: Vec::new(),
             // `W_o` reads `n_heads * head_dim` floats, which is wider than the model's
             // hidden size, so the input buffer is sized for the widest operand.
-            x: DeviceBuf::alloc(max_in.max(max_out) * 4).expect("VRAM input buffer"),
-            y: DeviceBuf::alloc(max_out * 4).expect("VRAM output buffer"),
+            // A batch carries `top_k` input vectors, so the input buffer is that much
+            // wider than one projection vector.
+            x: DeviceBuf::alloc(max_in.max(max_out) * 4 * TOP_K_FOR_BATCH)
+                .expect("VRAM input buffer"),
+            // One batch is `top_k` expert outputs, so the output buffer is wider than a
+            // single projection's.
+            y: DeviceBuf::alloc(max_out * 4 * TOP_K_FOR_BATCH).expect("VRAM output buffer"),
             ctx,
             stream,
             layers: out,
@@ -544,8 +586,115 @@ impl Gpu {
         }
     }
 
-    /// `y = W x` for one token, with `W` already resident. Returns `n_out` floats.
+    /// Keep every expert tensor the device can decode resident, one allocation at a time,
+    /// and give up on a tensor (not on the whole run) if VRAM runs out. This is the
+    /// residency half of a tiered store: the hot set is whatever fits, the cold set is the
+    /// GGUF mmap, and residency is decided per tensor because half an expert tensor is
+    /// never useful.
+    fn upload_experts(&mut self, file: &GgufFile, moes: &[Moe]) -> usize {
+        let mut resident = 0;
+        self.experts = Vec::with_capacity(moes.len());
+        for moe in moes {
+            let gu = moe.gate_up_tensor();
+            let dn = moe.down_tensor();
+            let gu_buf = upload_if_nvfp4(file, &gu.info);
+            let dn_buf = upload_if_nvfp4(file, &dn.info);
+            resident += gu_buf.as_ref().map(|b| b.bytes()).unwrap_or(0);
+            resident += dn_buf.as_ref().map(|b| b.bytes()).unwrap_or(0);
+            self.experts.push(Some(GpuExperts {
+                gate_up: gu_buf,
+                down: dn_buf,
+                gate_up_rows: gu.out_dim,
+                gate_up_k: gu.in_dim,
+                down_rows: dn.out_dim,
+                down_k: dn.in_dim,
+                gate_up_outer: gu.outer.clone(),
+                down_outer: dn.outer.clone(),
+            }));
+        }
+        resident
+    }
+
+    /// `y = W x` for one token through `linear_f32`.
     fn run(&mut self, weight: *mut c_void, x: &[f32], n_out: usize) -> Vec<f32> {
+        self.run_kernel(self.ctx.infer.linear_f32, weight, x, n_out)
+    }
+
+    /// Several independent single-token GEMVs — one weight matrix and one input vector per
+    /// slot — as **one** host-to-device copy, one launch per slot, and **one**
+    /// synchronisation. The routed experts are independent, so this is where the launch
+    /// round-trip stops dominating: sixteen synchronisations per visit became two.
+    fn run_batch(
+        &mut self,
+        handle: scoria_hip_rt::KernelHandle,
+        weights: &[*mut c_void],
+        inputs: &[&[f32]],
+        n_out: usize,
+    ) -> Vec<f32> {
+        assert_eq!(weights.len(), inputs.len(), "one weight per input");
+        let k = inputs[0].len();
+        assert!(
+            inputs.iter().all(|i| i.len() == k),
+            "inputs must share a width"
+        );
+        let mut flat = Vec::with_capacity(inputs.len() * k);
+        for input in inputs {
+            flat.extend_from_slice(input);
+        }
+        let bytes =
+            unsafe { std::slice::from_raw_parts(flat.as_ptr() as *const u8, flat.len() * 4) };
+        self.x.copy_from_host(bytes).expect("H2D batch inputs");
+        let mut one = 1u32;
+        let mut n = n_out as u32;
+        let mut kk = k as u32;
+        let waves_per_wg = 256u32 / self.wave_size.max(1);
+        let grid_x = n.div_ceil(waves_per_wg);
+        for (slot, weight) in weights.iter().enumerate() {
+            let mut arg_w = *weight;
+            let mut arg_x =
+                unsafe { (self.x.as_ptr() as *mut u8).add(slot * k * 4) as *mut c_void };
+            let mut arg_bias: *mut c_void = std::ptr::null_mut();
+            let mut arg_y =
+                unsafe { (self.y.as_ptr() as *mut u8).add(slot * n_out * 4) as *mut c_void };
+            let mut args: [*mut c_void; 7] = [
+                &mut arg_w as *mut *mut c_void as *mut c_void,
+                &mut arg_x as *mut *mut c_void as *mut c_void,
+                &mut arg_bias as *mut *mut c_void as *mut c_void,
+                &mut arg_y as *mut *mut c_void as *mut c_void,
+                &mut one as *mut u32 as *mut c_void,
+                &mut n as *mut u32 as *mut c_void,
+                &mut kk as *mut u32 as *mut c_void,
+            ];
+            unsafe {
+                self.ctx
+                    .infer_module
+                    .launch_handle(
+                        handle,
+                        [grid_x, 1, 1],
+                        [256, 1, 1],
+                        0,
+                        &self.stream,
+                        &mut args,
+                    )
+                    .expect("batched GEMV launch");
+            }
+        }
+        self.stream.synchronize().expect("stream sync");
+        let total = weights.len() * n_out;
+        let mut out = vec![0f32; total];
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, total * 4) };
+        self.y.copy_to_host(bytes).expect("D2H batch");
+        out
+    }
+
+    fn run_kernel(
+        &mut self,
+        handle: scoria_hip_rt::KernelHandle,
+        weight: *mut c_void,
+        x: &[f32],
+        n_out: usize,
+    ) -> Vec<f32> {
         let x_bytes = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, x.len() * 4) };
         self.x.copy_from_host(x_bytes).expect("H2D x");
         let mut m = 1u32;
@@ -575,7 +724,7 @@ impl Gpu {
             self.ctx
                 .infer_module
                 .launch_handle(
-                    self.ctx.infer.linear_f32,
+                    handle,
                     [grid_x, 1, 1],
                     [256, 1, 1],
                     0,
@@ -630,6 +779,8 @@ pub struct Profile {
     pub moe: f64,
     /// Of `attention`, the part spent in GPU projections (if any).
     pub gpu_proj: f64,
+    /// Of `moe`, the part spent in GPU expert GEMVs (if any).
+    pub gpu_experts: f64,
     pub visits: usize,
 }
 
@@ -734,8 +885,8 @@ impl Model {
         let ctx = EngineContext::init(0).map_err(|e| format!("HIP init: {e:?}"))?;
         let max_in = self.cfg.n_embd;
         let max_out = (self.cfg.n_heads * self.cfg.head_dim).max(self.cfg.n_embd);
-        let gpu = Gpu::new(ctx, &self.layers, max_in, max_out);
-        let resident = gpu.resident;
+        let mut gpu = Gpu::new(ctx, &self.layers, max_in, max_out);
+        let resident = gpu.resident + gpu.upload_experts(&self.file, &self.moes);
         self.gpu = Some(gpu);
         Ok(resident)
     }
@@ -1207,7 +1358,15 @@ impl Model {
         let mut moe_in = ffn_in;
         rmsnorm(&mut moe_in, &lw.ffn_norm, eps);
         let t_moe = std::time::Instant::now();
-        let mut y = moe.forward(&self.file, &moe_in);
+        let mut y = Self::moe_forward_parts(
+            &mut self.gpu,
+            moe,
+            &self.file,
+            layer,
+            n_embd,
+            &moe_in,
+            &mut self.profile,
+        );
         let moe_time = t_moe.elapsed().as_secs_f64();
         self.profile.moe += moe_time;
         short_conv1d_4tap(&mut y, &lw.ffn_post_conv, &mut cache.ffn_conv, n_embd);
@@ -1217,6 +1376,119 @@ impl Model {
         // convolution/residual adds, which are microseconds).
         self.profile.attention += t_visit.elapsed().as_secs_f64() - moe_time;
         out
+    }
+
+    /// The MoE half of a visit: expert GEMVs on the card when the layer's experts are
+    /// resident and NVFP4, otherwise the verified host loop. The routing, the SwiGLU and
+    /// the weighted accumulation are identical in both, so the host path stays the oracle.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_forward_parts(
+        gpu: &mut Option<Gpu>,
+        moe: &mut Moe,
+        file: &GgufFile,
+        layer: usize,
+        n_embd: usize,
+        x: &[f32],
+        profile: &mut Profile,
+    ) -> Vec<f32> {
+        let route = moe.route(x);
+        let gpu_ready = gpu
+            .as_ref()
+            .and_then(|g| g.experts.get(layer))
+            .and_then(|e| e.as_ref())
+            .map(|e| e.complete())
+            .unwrap_or(false);
+        if !gpu_ready {
+            return moe.forward_route(file, x, &route);
+        }
+
+        let (gate_cap, up_cap) = moe.caps();
+        let ff = moe.ff();
+        let (gu_rows, gu_k) = {
+            let e = gpu.as_ref().unwrap().experts[layer].as_ref().unwrap();
+            (e.gate_up_rows, e.gate_up_k)
+        };
+        let (dn_rows, _dn_k) = {
+            let e = gpu.as_ref().unwrap().experts[layer].as_ref().unwrap();
+            (e.down_rows, e.down_k)
+        };
+        let gu_slab = ((gu_k / 64) * 36) * gu_rows;
+        let dn_slab = {
+            let e = gpu.as_ref().unwrap().experts[layer].as_ref().unwrap();
+            ((e.down_k / 64) * 36) * e.down_rows
+        };
+        let gu_ptr = {
+            let e = gpu.as_ref().unwrap().experts[layer].as_ref().unwrap();
+            e.gate_up.as_ref().unwrap().as_ptr()
+        };
+        let dn_ptr = {
+            let e = gpu.as_ref().unwrap().experts[layer].as_ref().unwrap();
+            e.down.as_ref().unwrap().as_ptr()
+        };
+        let gu_outer = {
+            let e = gpu.as_ref().unwrap().experts[layer].as_ref().unwrap();
+            e.gate_up_outer.clone()
+        };
+        let dn_outer = {
+            let e = gpu.as_ref().unwrap().experts[layer].as_ref().unwrap();
+            e.down_outer.clone()
+        };
+
+        // Phase 1: one batch for every routed expert's gate/up matrix, all with the same
+        // input.
+        let gu_weights: Vec<*mut c_void> = route
+            .indices
+            .iter()
+            .map(|&e| unsafe { (gu_ptr as *mut u8).add(e * gu_slab) as *mut c_void })
+            .collect();
+        let inputs: Vec<&[f32]> = (0..route.indices.len()).map(|_| x).collect();
+        let t_batch = std::time::Instant::now();
+        let handle = gpu.as_ref().unwrap().ctx.infer.linear_nvfp4;
+        let gate_up = gpu
+            .as_mut()
+            .unwrap()
+            .run_batch(handle, &gu_weights, &inputs, gu_rows);
+
+        // SwiGLU per expert, with the outer scale where the CPU path applies it.
+        let mut acts: Vec<Vec<f32>> = Vec::with_capacity(route.indices.len());
+        let (mut g, mut u, mut act) = (vec![0f32; ff], vec![0f32; ff], vec![0f32; ff]);
+        for (slot, &expert) in route.indices.iter().enumerate() {
+            let scale = gu_outer[expert];
+            let row = &gate_up[slot * gu_rows..(slot + 1) * gu_rows];
+            for (dst, src) in g.iter_mut().zip(&row[..ff]) {
+                *dst = src * scale;
+            }
+            for (dst, src) in u.iter_mut().zip(&row[ff..]) {
+                *dst = src * scale;
+            }
+            swiglu_softcapped_public(&g, &u, gate_cap, up_cap, &mut act);
+            acts.push(act.clone());
+        }
+
+        // Phase 2: one batch for every routed expert's down matrix, each with its own
+        // activation as input.
+        let dn_weights: Vec<*mut c_void> = route
+            .indices
+            .iter()
+            .map(|&e| unsafe { (dn_ptr as *mut u8).add(e * dn_slab) as *mut c_void })
+            .collect();
+        let down_inputs: Vec<&[f32]> = acts.iter().map(|a| a.as_slice()).collect();
+        let downs = gpu
+            .as_mut()
+            .unwrap()
+            .run_batch(handle, &dn_weights, &down_inputs, dn_rows);
+        profile.gpu_experts += t_batch.elapsed().as_secs_f64();
+
+        let mut acc = vec![0f32; n_embd];
+        for (slot, &expert) in route.indices.iter().enumerate() {
+            let scale = dn_outer[expert];
+            let w = route.weights[slot];
+            let row = &downs[slot * dn_rows..(slot + 1) * dn_rows];
+            for (a, m) in acc.iter_mut().zip(row) {
+                *a += w * m * scale;
+            }
+        }
+        acc
     }
 
     /// The top-`k` `(token, logit)` pairs, highest first.

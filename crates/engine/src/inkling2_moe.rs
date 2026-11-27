@@ -54,14 +54,14 @@ pub fn swiglu_softcapped(gate: &[f32], up: &[f32], gate_cap: f32, up_cap: f32, o
 
 /// One expert-major 3-D tensor. The bytes stay in the GGUF's mmap: 24 layers of experts
 /// is 12.7 GB on disk, so copying them into the process would be the whole model twice.
-struct ExpertTensor {
-    info: TensorInfo,
-    slab_bytes: usize,
-    in_dim: usize,
-    out_dim: usize,
-    experts: usize,
+pub(crate) struct ExpertTensor {
+    pub(crate) info: TensorInfo,
+    pub(crate) slab_bytes: usize,
+    pub(crate) in_dim: usize,
+    pub(crate) out_dim: usize,
+    pub(crate) experts: usize,
     /// Per-expert outer f32 scale, when the checkpoint carries one.
-    outer: Vec<f32>,
+    pub(crate) outer: Vec<f32>,
 }
 
 impl ExpertTensor {
@@ -186,7 +186,6 @@ pub struct Moe {
     /// One worker per thread; the routed experts are independent, so the top-k split
     /// across threads is the whole parallelism available here.
     threads: usize,
-    scratch: Vec<Scratch>,
     pub last_route: Option<Route>,
 }
 
@@ -241,7 +240,6 @@ impl Moe {
             threads: std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1),
-            scratch: Vec::new(),
             last_route: None,
         })
     }
@@ -295,65 +293,61 @@ impl Moe {
         self.threads
     }
 
-    /// One token through the MoE, returning the accumulated expert contribution.
-    ///
-    /// The routed experts are independent: each dequantises its own two slabs, runs its own
-    /// SwiGLU and matvecs, and returns a weighted partial sum that is added up at the end.
-    /// Nothing is shared, so the top-k split across threads is exact, not approximate.
-    pub fn forward(&mut self, file: &GgufFile, x: &[f32]) -> Vec<f32> {
-        let route = self.route(x);
+    /// The SwiGLU softcaps, the expert width, and the two expert tensors, for a caller that
+    /// wants to run the expert matvecs somewhere else (the GPU path).
+    pub fn caps(&self) -> (f32, f32) {
+        (self.gate_cap, self.up_cap)
+    }
+
+    pub fn ff(&self) -> usize {
+        self.ff
+    }
+
+    pub(crate) fn gate_up_tensor(&self) -> &ExpertTensor {
+        &self.gate_up
+    }
+
+    pub(crate) fn down_tensor(&self) -> &ExpertTensor {
+        &self.down
+    }
+
+    /// One token through the MoE with the routing already decided: the host expert loop,
+    /// threaded across the routed experts exactly like `forward`.
+    pub fn forward_route(&self, file: &GgufFile, x: &[f32], route: &Route) -> Vec<f32> {
         let n_embd = self.n_embd;
         let ff = self.ff;
         let gate_cap = self.gate_cap;
         let up_cap = self.up_cap;
         let top_k = route.indices.len();
         let workers = self.threads.min(top_k).max(1);
-        let gate_up_out = self.gate_up.out_dim;
-        let down_out = self.down.out_dim;
+        let gu_out = self.gate_up.out_dim;
+        let dn_out = self.down.out_dim;
         let widest = self.gate_up.in_dim.max(self.down.in_dim);
-
-        while self.scratch.len() < workers {
-            self.scratch
-                .push(Scratch::new(gate_up_out, down_out, ff, widest));
-        }
-
-        let Moe {
-            gate_up,
-            down,
-            scratch,
-            ..
-        } = self;
+        let per = top_k.div_ceil(workers);
+        let gate_up = &self.gate_up;
+        let down = &self.down;
         let indices = &route.indices;
         let weights = &route.weights;
-        let gate_up_ref: &ExpertTensor = gate_up;
-        let down_ref: &ExpertTensor = down;
-        let per = top_k.div_ceil(workers);
 
-        let partials: Vec<Vec<f32>> = std::thread::scope(|scope| {
+        std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(workers);
-            for (worker, sc) in scratch.iter_mut().take(workers).enumerate() {
+            for worker in 0..workers {
                 let lo = worker * per;
                 let hi = ((worker + 1) * per).min(top_k);
                 if lo >= hi {
                     break;
                 }
                 handles.push(scope.spawn(move || {
+                    let mut sc = Scratch::new(gu_out, dn_out, ff, widest);
                     let mut acc = vec![0f32; n_embd];
                     for slot in lo..hi {
                         let e = indices[slot];
-                        gate_up_ref.row_matvec(file, e, x, &mut sc.gate_up, &mut sc.row);
-                        // The GGUF layout is `[gate rows; up rows]`, because the converter
-                        // fuses the checkpoint's two separate tensors with
-                        // `torch.cat([gate, up], dim=1)` (`conversion/base.py`,
-                        // `--fuse-gate-up-exps`). The *source* checkpoint interleaves its
-                        // `w13` rows, but that is undone before fusion, so a half split is
-                        // right here and an even/odd split would be wrong.
+                        gate_up.row_matvec(file, e, x, &mut sc.gate_up, &mut sc.row);
                         let (gate_rows, up_rows) = sc.gate_up.split_at(ff);
                         sc.gate.copy_from_slice(gate_rows);
                         sc.up.copy_from_slice(up_rows);
                         swiglu_softcapped(&sc.gate, &sc.up, gate_cap, up_cap, &mut sc.act);
-
-                        down_ref.row_matvec(file, e, &sc.act, &mut sc.mid, &mut sc.row);
+                        down.row_matvec(file, e, &sc.act, &mut sc.mid, &mut sc.row);
                         let w = weights[slot];
                         for (a, m) in acc.iter_mut().zip(&sc.mid) {
                             *a += w * m;
@@ -362,19 +356,24 @@ impl Moe {
                     acc
                 }));
             }
-            handles
+            let parts: Vec<Vec<f32>> = handles
                 .into_iter()
                 .map(|h| h.join().expect("expert worker panicked"))
-                .collect()
-        });
-
-        let mut acc = vec![0f32; n_embd];
-        for part in partials {
-            for (a, p) in acc.iter_mut().zip(&part) {
-                *a += p;
+                .collect();
+            let mut acc = vec![0f32; n_embd];
+            for part in parts {
+                for (a, p) in acc.iter_mut().zip(&part) {
+                    *a += p;
+                }
             }
-        }
-        acc
+            acc
+        })
+    }
+
+    /// One token through the MoE, returning the accumulated expert contribution.
+    pub fn forward(&mut self, file: &GgufFile, x: &[f32]) -> Vec<f32> {
+        let route = self.route(x);
+        self.forward_route(file, x, &route)
     }
 }
 
@@ -444,7 +443,6 @@ mod tests {
             ],
             e_score_bias: vec![10.0, 0.0, 0.0, 0.0], // e0 wins on bias alone
             threads: 1,
-            scratch: Vec::new(),
             gate_up: ExpertTensor {
                 info: TensorInfo {
                     name: "test".into(),

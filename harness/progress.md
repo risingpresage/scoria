@@ -179,6 +179,26 @@ Correctness is unchanged, and the host path is the oracle: **max |dlogit| = 2.8e
 
 **Where the time is now:** MoE 0.79 s of 0.97 s (87%). Attention is 0.11 s, of which 0.05 s is GPU. The remaining MoE is *not* a launch away: the experts are IQ2XS / IQ3XXS / NVFP4, and no device dequantiser for those exists yet, so a grouped expert GEMV needs either three new quant codecs in `.hip` or an f16-resident expert cache (Strata's residency policy applied to experts).
 
+## 2026-11-28 — NVFP4 expert GEMV on the card: 0.47-0.51 s/token, 16x from the host baseline
+The MoE is no longer host-only. `linear_nvfp4` decodes and dots the routed experts' rows on `gfx1201`, with 10.24 GiB resident: 2.4 GiB of projection weights plus the NVFP4 expert tensors.
+
+| stage | s/token |
+| --- | --- |
+| start of the threading work, host only | 7.6-8.0 |
+| host, 16 threads | 1.84 |
+| projections on GPU | 0.99 |
+| **NVFP4 experts on GPU** | **0.47-0.51 prefill, 0.47-0.58 decode** |
+
+Correctness holds: perplexity **1.317** over 37 tokens (top-1 34/37), `" Paris."`, repeat run bit-identical, and **GPU-vs-host max |dlogit| = 3.1e-5 with the same argmax**. The host path is still the oracle and still runs (`--no-gpu`).
+
+**The codec.** NVFP4 is 36 bytes per 64 elements: four unsigned-E4M3 scales, one per 16-element sub-block, then 32 bytes of packed E2M1 nibbles, low nibble = element `s*16 + j`, high nibble = `s*16 + 8 + j`, and the scale is *halved* because the E2M1 table is doubled. Transcribed from `dequant_row_nvfp4` and pinned by `tests/inkling2_gpu_nvfp4.rs`, which compares the kernel against the CPU dequantiser **on real checkpoint rows** (`blk.5` gate_up at k=2304, `blk.0` down at k=1152) -- synthetic blocks can be built with one shared scale per 64 elements, which would hide a sub-block ordering bug.
+
+**Batching was the other half.** The first version launched one GEMV per expert and synchronised after each: 0.28 s of GPU time for work that takes 0.04 s batched. `Gpu::run_batch` now uploads every routed input in one copy, launches one kernel per expert, and synchronises **once** per phase -- two synchronisations per visit instead of sixteen.
+
+**What is still on the host, and why.** The checkpoint mixes expert formats: NVFP4 on 12 of 24 `gate_up` and 20 of 24 `down` tensors, with IQ2XS, IQ2S, IQ3XXS, IQ3S, Q3K and IQ4NL making up the rest. Those have no device dequantiser, so those tensors still run the threaded host loop -- which is the 0.30 s MoE that remains. IQ4NL is the easy next one (16-level codebook, 18 bytes per 32 elements); IQ2XS/IQ3XXS need the grid-plus-signs tables.
+
+**Residency, honestly.** This is a fixed residency set, not a policy: `upload_experts` keeps every tensor the device can decode and gives up per tensor if VRAM runs out. There is no LRU, no prefetch, no demotion -- that is still Strata's missing half.
+
 ## Parity gate calibration (cosine > 0.999 is prompt-dependent, not an implementation defect)
 - Measured the control that settles it: **llama.cpp's own Vulkan backend vs llama.cpp's own CPU backend** scores `cos = 0.997985` (`maxdiff 1.152`) on the Qwen3-4B harness chat prompt (`151644,872,198,785,…,77091,198`, `m=13`), where scoria scores `0.997652` (`maxdiff 1.103`). Both pick top1 `785`. No GPU implementation reaches 0.999 on that prompt.
 - Forcing prefill onto the scalar FP32 GEMM (`SCORIA_PREFILL_FP32=1`) changes nothing: 4B `0.997614` vs `0.997652` for FP16 WMMA, 8B `0.996415` vs `0.996404`. So the deficit is **not** FP16 WMMA rounding.

@@ -60,6 +60,7 @@ pub mod infer_names {
     pub const LINEAR_Q8_0: &str = "linear_q8_0";
     pub const LINEAR_Q4_K: &str = "linear_q4_k";
     pub const LINEAR_Q6_K: &str = "linear_q6_k";
+    pub const LINEAR_NVFP4: &str = "linear_nvfp4";
     pub const ROPE_NEOX_F32: &str = "rope_neox_f32";
     pub const KV_CACHE_APPEND_F32: &str = "kv_cache_append_f32";
     pub const KV_CACHE_APPEND_F16: &str = "kv_cache_append_f16";
@@ -89,6 +90,7 @@ pub mod infer_names {
     pub const GEMV_Q4_K_Q8_1_F32: &str = "gemv_q4_k_q8_1_f32";
     pub const GEMV_Q4_K_GATE_UP_SILU_Q8_1_F32: &str = "gemv_q4_k_gate_up_silu_q8_1_f32";
     pub const GEMV_Q6_K_F32: &str = "gemv_q6_k_f32";
+    /// Not a kernel yet: the NVFP4 expert path uses `linear_nvfp4`.
     pub const WMMA_PROBE_F16: &str = "wmma_probe_f16";
     pub const GEMM_WMMA_F16: &str = "gemm_wmma_f16";
     pub const GEMM_WMMA_Q5_0: &str = "gemm_wmma_q5_0";
