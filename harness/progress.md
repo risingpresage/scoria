@@ -101,6 +101,12 @@
 - `|k|` grows 29.8 -> 53.7 across the five steps because the 4-tap causal conv accumulates history, which is the expected behaviour and not a scale bug.
 - Memory: the embedding table is read as raw bytes and one row is dequantised per token (39 MB) instead of dequantising all 201024 rows (1.85 GB); results are bit-identical before and after that change.
 
+## 2026-11-28 — top-8 MoE on real weights, and layer 0 is complete except the block residual
+- `crates/engine/src/inkling2_moe.rs`: router (f32 logits from `ffn_gate_inp`, `scores = sigmoid` by default, **selection on `scores + exp_probs_b.bias` but weights from the raw scores**, renormalised and scaled by 8.0), 128 expert slabs dequantised one at a time (Q3K/IQ2XS/IQ3XXS/IQ2S/IQ3S/NVFP4 all reachable) with the per-expert outer scale applied, softcapped SwiGLU (`tanh(g/4)*4 * sigmoid(g) * tanh(u/25)*25`, saturating to 24.98 not 25), `W2` per expert, weighted f32 accumulation.
+- `scoria layer0 --moe` now runs the FFN half in the reference's order: `post_attention_layernorm` -> MoE -> `post_mlp_conv` -> residual add. Real output for tokens 785/6722/315: 8 distinct experts each, weights summing to 8.0, `|moe_out|` 122.2/97.0/143.5, `|layer_out|` 61.4/64.9/75.6, all finite.
+- Three test failures found and fixed while wiring this, all in *my* expectations rather than the code: `tanh(100/25)*25` is 24.983 (I had assumed 25); a weighted RMSNorm does **not** have an exact `sqrt(n)` norm — only the unweighted one does, so the doc comment now says "within a few percent" instead of claiming an invariant; and the MoE probe initially skipped the pre-MoE normalisation and the post-MLP convolution entirely, which the reference's decoder layer makes explicit.
+- 3 MoE unit tests: softcap saturation, the hand-computed SwiGLU value, and the routing rule that selection uses the biased score while weights use the raw score (a classic MoE bug).
+
 ## Parity gate calibration (cosine > 0.999 is prompt-dependent, not an implementation defect)
 - Measured the control that settles it: **llama.cpp's own Vulkan backend vs llama.cpp's own CPU backend** scores `cos = 0.997985` (`maxdiff 1.152`) on the Qwen3-4B harness chat prompt (`151644,872,198,785,…,77091,198`, `m=13`), where scoria scores `0.997652` (`maxdiff 1.103`). Both pick top1 `785`. No GPU implementation reaches 0.999 on that prompt.
 - Forcing prefill onto the scalar FP32 GEMM (`SCORIA_PREFILL_FP32=1`) changes nothing: 4B `0.997614` vs `0.997652` for FP16 WMMA, 8B `0.996415` vs `0.996404`. So the deficit is **not** FP16 WMMA rounding.

@@ -19,6 +19,7 @@ use crate::inkling2_attn::{
 };
 
 pub struct LayerZero {
+    last_residual: Vec<f32>,
     n_embd: usize,
     n_heads: usize,
     head_dim: usize,
@@ -45,6 +46,8 @@ pub struct LayerZero {
     scale_q: Vec<f32>,
     scale_rel: Vec<f32>,
     proj_rel: Vec<f32>,
+    ffn_norm: Vec<f32>,
+    ffn_post_conv: Vec<f32>,
     conv_k: Vec<f32>,
     conv_v: Vec<f32>,
     post_conv: Vec<f32>,
@@ -56,10 +59,22 @@ pub struct Caches {
     pub k: Vec<f32>,
     pub v: Vec<f32>,
     pub post: Vec<f32>,
+    pub ffn_post: Vec<f32>,
     /// `[kv_len][kv_heads][head_dim]` for K and V.
     pub k_seq: Vec<f32>,
     pub v_seq: Vec<f32>,
     pub len: usize,
+}
+
+pub struct FfnOutput {
+    /// `||ffn_norm.weight||`. The normalised input's norm lands within a few percent of
+    /// it: exactly equal only when `|x|` is uncorrelated with `|w|`, because the norm of
+    /// `x*inv*w` is `sqrt(sum (x_i w_i)^2) / sqrt(mean(x^2))`. The unweighted norm on V is
+    /// the one with an exact invariant (`sqrt(n)`).
+    pub weight_norm: f32,
+    pub input_norm: f32,
+    pub moe_norm: f32,
+    pub layer_norm: f32,
 }
 
 pub struct LayerZeroOutput {
@@ -121,6 +136,7 @@ impl LayerZero {
         let head_dim = cfg.head_dim;
         let kv_heads = cfg.n_kv_heads;
         Ok(Self {
+            last_residual: Vec::new(),
             n_embd: cfg.n_embd,
             n_heads,
             head_dim,
@@ -160,6 +176,8 @@ impl LayerZero {
             scale_q: dequant_tensor(file, "blk.0.attn_q_clip.weight")?,
             scale_rel: dequant_tensor(file, "blk.0.attn_rel_clip.weight")?,
             proj_rel: dequant_tensor(file, "blk.0.attn_rel_bias.weight")?,
+            ffn_norm: dequant_tensor(file, "blk.0.ffn_norm.weight")?,
+            ffn_post_conv: dequant_tensor(file, "blk.0.ffn_post_conv.weight")?,
             conv_k: dequant_tensor(file, "blk.0.attn_k_conv.weight")?,
             conv_v: dequant_tensor(file, "blk.0.attn_v_conv.weight")?,
             post_conv: dequant_tensor(file, "blk.0.attn_post_conv.weight")?,
@@ -167,6 +185,7 @@ impl LayerZero {
                 k: vec![0.0; 3 * kv_heads * head_dim],
                 v: vec![0.0; 3 * kv_heads * head_dim],
                 post: vec![0.0; 3 * cfg.n_embd],
+                ffn_post: vec![0.0; 3 * cfg.n_embd],
                 k_seq: Vec::new(),
                 v_seq: Vec::new(),
                 len: 0,
@@ -174,11 +193,48 @@ impl LayerZero {
         })
     }
 
+    /// The FFN half of the layer: `post_attention_layernorm` -> MoE -> `post_mlp_conv` ->
+    /// residual add, which is the reference's order. (The block attention residual that
+    /// sits between them needs block states, which this probe does not model yet.)
+    pub fn ffn(&mut self, moe: &mut crate::inkling2_moe::Moe) -> FfnOutput {
+        let mut x = self.last_residual.clone();
+        rmsnorm(&mut x, &self.ffn_norm, self.eps);
+        let input_norm = norm(&x);
+
+        let mut y = moe.forward(&x);
+        let moe_norm = norm(&y);
+
+        short_conv1d_4tap(
+            &mut y,
+            &self.ffn_post_conv,
+            &mut self.caches.ffn_post,
+            self.n_embd,
+        );
+        let layer: Vec<f32> = self
+            .last_residual
+            .iter()
+            .zip(&y)
+            .map(|(a, b)| a + b)
+            .collect();
+        FfnOutput {
+            weight_norm: norm(&self.ffn_norm),
+            input_norm,
+            moe_norm,
+            layer_norm: norm(&layer),
+        }
+    }
+
+    /// The residual stream after the attention block, which the FFN consumes.
+    pub fn last_residual(&self) -> &[f32] {
+        &self.last_residual
+    }
+
     pub fn reset(&mut self) {
         self.caches = Caches {
             k: vec![0.0; 3 * self.kv_dim],
             v: vec![0.0; 3 * self.kv_dim],
             post: vec![0.0; 3 * self.n_embd],
+            ffn_post: vec![0.0; 3 * self.n_embd],
             k_seq: Vec::new(),
             v_seq: Vec::new(),
             len: 0,
@@ -309,6 +365,7 @@ impl LayerZero {
         );
         let residual: Vec<f32> = row.iter().zip(&post_out).map(|(a, b)| a + b).collect();
 
+        self.last_residual = residual.clone();
         LayerZeroOutput {
             hidden_norm: norm(&hidden),
             q_norm: norm(&q),

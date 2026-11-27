@@ -14,7 +14,7 @@ use scoria_gguf::{BpeTokenizer, GgufFile, ModelConfig};
 
 fn usage() -> ! {
     eprintln!(
-        "Usage:\n  scoria gate [--quick]\n  scoria inspect <model.gguf>\n  scoria tokenize <model.gguf> <prompt> [--no-bos]\n  scoria run <model.gguf> (--prompt <text> | --tokens <csv>) [--max-tokens <N>] [--max-seq <N>] [--no-bos] [--ignore-eos] [--warmup <N>] [--kv-f16] [--dump-logits <path>] [--tap-layer <L>] [--profile]\n  scoria graph-soak <model.gguf> [--replays <N>] [--tokens <csv>]\n  scoria plan <model.gguf> [--vram-mib <N>] [--ctx <N>]\n  scoria strata <model.gguf> [--top-k <N>] [--tokens <N>] [--qd <N>]\n  scoria arch-check <model.gguf> [--dequant-smoke]\n  scoria layer0 <model.gguf> [--tokens <csv>]"
+        "Usage:\n  scoria gate [--quick]\n  scoria inspect <model.gguf>\n  scoria tokenize <model.gguf> <prompt> [--no-bos]\n  scoria run <model.gguf> (--prompt <text> | --tokens <csv>) [--max-tokens <N>] [--max-seq <N>] [--no-bos] [--ignore-eos] [--warmup <N>] [--kv-f16] [--dump-logits <path>] [--tap-layer <L>] [--profile]\n  scoria graph-soak <model.gguf> [--replays <N>] [--tokens <csv>]\n  scoria plan <model.gguf> [--vram-mib <N>] [--ctx <N>]\n  scoria strata <model.gguf> [--top-k <N>] [--tokens <N>] [--qd <N>]\n  scoria arch-check <model.gguf> [--dequant-smoke]\n  scoria layer0 <model.gguf> [--tokens <csv>] [--moe] [--router-softmax]"
     );
     process::exit(2);
 }
@@ -797,6 +797,17 @@ fn cmd_layer0(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let gguf = GgufFile::open(path)?;
     let cfg = ModelConfig::from_gguf(&gguf)?;
     let mut layer = LayerZero::load(&gguf, &cfg)?;
+    let want_moe = rest.iter().any(|a| a == "--moe");
+    let score = if rest.iter().any(|a| a == "--router-softmax") {
+        scoria_engine::inkling2_moe::RouterScore::Softmax
+    } else {
+        scoria_engine::inkling2_moe::RouterScore::Sigmoid
+    };
+    let mut moe = if want_moe {
+        Some(scoria_engine::inkling2_moe::Moe::load(&gguf, &cfg, score)?)
+    } else {
+        None
+    };
     println!(
         "layer 0: {} | n_embd {} | {} heads x {} | {} kv heads | qk_clip {} | rel {}x{}",
         cfg.architecture,
@@ -824,6 +835,23 @@ fn cmd_layer0(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             out.post_conv_norm,
             out.residual_norm
         );
+        if let Some(moe) = moe.as_mut() {
+            let ffn = layer.ffn(moe);
+            let route = moe.last_route.clone().unwrap();
+            println!(
+                "    ffn: |w|={:.3} |norm_in|={:.3} experts {:?} weights {:?} |moe_out|={:.3} |layer_out|={:.3}",
+                ffn.weight_norm,
+                ffn.input_norm,
+                route.indices,
+                route
+                    .weights
+                    .iter()
+                    .map(|w| (w * 1000.0).round() / 1000.0)
+                    .collect::<Vec<_>>(),
+                ffn.moe_norm,
+                ffn.layer_norm
+            );
+        }
         if step == 0 {
             println!(
                 "    sink[0..4]={:?}\n    bias(at distance 0)[0..4]={:?}",
