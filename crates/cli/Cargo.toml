@@ -1,0 +1,15 @@
+[package]
+name = "scoria-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "scoria"
+path = "src/main.rs"
+
+[dependencies]
+scoria-engine = { path = "../engine" }
+scoria-gguf = { path = "../gguf" }
+scoria-hip-rt = { path = "../hip-rt" }
+scoria-kernels = { path = "../kernels" }

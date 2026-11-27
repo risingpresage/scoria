@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hip-rt",
+    "crates/kernels",
+    "crates/gguf",
+    "crates/engine",
+    "crates/cli",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"

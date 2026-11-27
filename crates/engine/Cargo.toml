@@ -1,0 +1,10 @@
+[package]
+name = "scoria-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+scoria-gguf = { path = "../gguf" }
+scoria-hip-rt = { path = "../hip-rt" }
+scoria-kernels = { path = "../kernels" }

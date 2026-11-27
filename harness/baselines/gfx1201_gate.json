@@ -1,0 +1,42 @@
+{
+  "arch": "gfx1201",
+  "quick": false,
+  "vram_total_bytes": 17095983104,
+  "vram_free_at_start_bytes": 16680747008,
+  "soak": {
+    "cycles": 100,
+    "passes": 100,
+    "sizes_gib": [1, 4, 8],
+    "min_cycle_ms": 3.34,
+    "max_cycle_ms": 243.45,
+    "total_ms": 15307.14
+  },
+  "vram_and_l3": {
+    "stream_default_gbps": 561.66,
+    "stream_th_nt_gbps": 560.09,
+    "l3_baseline_gbps": 2275.64,
+    "l3_after_default_gbps": 433.30,
+    "l3_after_th_nt_gbps": 423.88
+  },
+  "compute": {
+    "wmma_f16_tflops": 207.53,
+    "wmma_fp8_tflops": 383.76,
+    "wmma_iu4_tops": 763.95,
+    "swmmac_f16_tflops": 385.68,
+    "swmmac_fp8_tflops": 734.63,
+    "swmmac_f16_ratio": 1.858,
+    "swmmac_fp8_ratio": 1.914
+  },
+  "lut_and_ternary": {
+    "permlane16_var_giga_lookups_s": 1824.35,
+    "lds_giga_lookups_s": 1709.56,
+    "bitcos_giga_weights_s": 4321.57
+  },
+  "pcie_and_nvme": {
+    "pcie_h2d_gbps": 6.96,
+    "pcie_d2h_gbps": 6.88,
+    "nvme_p31_odirect_gbps": 3.558,
+    "nvme_980_odirect_gbps": 2.544,
+    "nvme_dual_odirect_gbps": 3.494
+  }
+}

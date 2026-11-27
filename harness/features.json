@@ -1,0 +1,76 @@
+{
+  "project": "scoria",
+  "target_arch": "gfx1201",
+  "portable_arches": ["gfx1201", "gfx942"],
+  "features": [
+    {
+      "id": "phase0-harness-lint",
+      "phase": 0,
+      "title": "2026 harness structure, mechanical arch linter, and ISA emission tests (gfx1201 + gfx942)",
+      "status": "verified",
+      "verify": "./scripts/check.sh",
+      "observed": "8/8 workspace tests pass, fmt/clippy -D warnings pass, lint-arch passes"
+    },
+    {
+      "id": "phase0-rocm716-soak",
+      "phase": 0,
+      "title": "ROCm 7.16.0 gfx1201 stability soak (100x 1->4->8 GiB alloc/H2D/launch/free)",
+      "status": "verified",
+      "verify": "./target/release/scoria gate",
+      "observed": "100/100 cycles passed (sizes [1, 4, 8] GiB, 15307.14 ms total, 3.34-243.45 ms/cycle); 5/5 quick runs passed after alloc_guard + dlopen fix"
+    },
+    {
+      "id": "phase0-vram-l3-hints",
+      "phase": 0,
+      "title": "VRAM streaming ceiling and TH_LOAD_NT L3 Infinity Cache preservation",
+      "status": "verified",
+      "verify": "./target/release/scoria gate",
+      "observed": "stream_default=561.66 GB/s, stream_th_nt=560.09 GB/s; l3_baseline=2275.64 GB/s dropped to 433.30 (default) vs 423.88 GB/s (TH_LOAD_NT) after 1 GiB stream (TH_LOAD_NT alone does not prevent L3 eviction on gfx1201)"
+    },
+    {
+      "id": "phase0-wmma-swmmac",
+      "phase": 0,
+      "title": "gfx1201 v_wmma (FP16/FP8/IU4) and v_swmmac (2:4 sparse) peak compute",
+      "status": "verified",
+      "verify": "./target/release/scoria gate",
+      "observed": "WMMA FP16=207.53 TFLOPS, FP8=383.76 TFLOPS, IU4=763.95 TOPS; SWMMAC FP16=385.68 TFLOPS (1.858x), FP8=734.63 TFLOPS (1.914x)"
+    },
+    {
+      "id": "phase0-permlane-bitcos",
+      "phase": 0,
+      "title": "v_permlane16_var_b32 register LUT vs LDS LUT and BITCOS popcount unpack",
+      "status": "verified",
+      "verify": "./target/release/scoria gate",
+      "observed": "permlane16_var=1824.35 G-lookups/s vs LDS=1709.56 G-lookups/s; BITCOS=4321.57 G-weights/s"
+    },
+    {
+      "id": "phase0-pcie-nvme-uring",
+      "phase": 0,
+      "title": "Pinned PCIe DMA and io_uring O_DIRECT NVMe read throughput (P31 + 980)",
+      "status": "verified",
+      "verify": "./target/release/scoria gate",
+      "observed": "PCIe H2D=6.96 GB/s, D2H=6.88 GB/s; incompressible 256 MiB io_uring O_DIRECT: P31=3.558 GB/s, 980=2.544 GB/s, Dual=3.494 GB/s"
+    },
+    {
+      "id": "phase1-gguf-e2e",
+      "phase": 1,
+      "title": "End-to-end GGUF inference baseline with llama.cpp logit parity",
+      "status": "pending",
+      "verify": "cargo test --workspace"
+    },
+    {
+      "id": "phase2-amd-repack-wmma",
+      "phase": 2,
+      "title": "Load-time Wave32 repacking (H4F8/Q4W32), WMMA GEMM, LDS LM head, hipGraph",
+      "status": "pending",
+      "verify": "cargo test --workspace"
+    },
+    {
+      "id": "phase3-looped-ternary-strata",
+      "phase": 3,
+      "title": "Looped Transformer (Inkling 2), Ternary BITCOS (Bonsai), and Strata NVMe paging",
+      "status": "pending",
+      "verify": "cargo test --workspace"
+    }
+  ]
+}
