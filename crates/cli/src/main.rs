@@ -803,6 +803,9 @@ fn cmd_logits(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(0);
     let prompt = arg_val(rest, "--prompt");
     let perp = arg_val(rest, "--perp");
+    let threads = arg_val(rest, "--threads")
+        .map(|v| v.parse::<usize>().unwrap_or(0))
+        .unwrap_or(0);
     let max_visits = arg_val(rest, "--max-visits")
         .map(|v| v.parse::<usize>().unwrap_or(usize::MAX))
         .unwrap_or(usize::MAX);
@@ -828,6 +831,9 @@ fn cmd_logits(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut model = Model::open_with_router(path, router)?;
     model.max_visits = max_visits;
+    if threads > 0 {
+        model.set_threads(threads);
+    }
     let load = started.elapsed();
     println!(
         "model: {} layers, {} visits, vocab {}",
@@ -889,6 +895,18 @@ fn cmd_logits(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         elapsed.as_secs_f64(),
         elapsed.as_secs_f64() / tokens.len() as f64
     );
+    let p = model.profile;
+    let per_token = tokens.len() as f64;
+    if p.visits > 0 {
+        println!(
+            "  last token: attention {:.2}s moe {:.2}s over {} visits (moe {:.0}%)",
+            p.attention,
+            p.moe,
+            p.visits,
+            100.0 * p.moe / (p.attention + p.moe)
+        );
+        let _ = per_token;
+    }
 
     if let Some(text) = perp {
         // Next-token log-likelihood on held-out natural text. A structurally wrong stack
@@ -968,6 +986,9 @@ fn cmd_logits(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // the logits bit for bit, otherwise nothing downstream can be trusted.
     let mut again = Model::open_with_router(path, router)?;
     again.max_visits = max_visits;
+    if threads > 0 {
+        again.set_threads(threads);
+    }
     for &tok in &tokens[..tokens.len() - 1] {
         again.forward(tok);
     }

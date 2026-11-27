@@ -7,6 +7,15 @@
   ],
   "features": [
     {
+      "id": "phase3-inkling2-throughput",
+      "phase": 3,
+      "title": "Inkling 2 Mini host path: 4.1x faster (row-wise expert dequant, threaded MoE/head/projections)",
+      "status": "verified",
+      "verify": "./target/release/scoria logits <gguf> --prompt \"The capital of France is\" --generate 8 && ./scripts/check.sh",
+      "observed": "prefill 1.84 s/token, decode 1.93 s/token at 16 threads (was 7.6-8.0 s/token). Perplexity unchanged at 1.317 over 37 tokens, top-1 34/37; greedy still yields ' Paris.'. Thread scaling measured at 1/4/8/16 threads: 6.47/2.52/2.08/1.84 s/token.",
+      "note": "Host-only path: no GPU kernels, so prefill and decode are the same rate (one position at a time). First token after load is slower (cold page cache over 12.7 GB of weights). Next: grouped expert GEMV on gfx1201, then a batched prefill path."
+    },
+    {
       "id": "phase3-inkling2-full-stack",
       "phase": 3,
       "title": "Full 48-visit Inkling 2 Mini forward: logits from real weights",

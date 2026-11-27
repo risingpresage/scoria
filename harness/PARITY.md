@@ -57,8 +57,11 @@ Ordered by what unblocks the most, not by effort.
    `specs/ATTENTION.md`; this is the long-context workstream and the only one with
    a 2x-class number attached.
 5. **MoE + looped-layer kernels.** The schedule and `MoeSpec` already exist and are
-   tested by `expand_inkling2_mini_looped_schedule`; what is missing is a grouped
-   expert GEMV and a looped KV policy. This is the route to Inkling 2 Mini.
+   tested by `expand_inkling2_mini_looped_schedule`. Inkling 2 Mini now runs the whole
+   48-visit stack on the host at **1.84 s/token prefill and 1.93 s/token decode** (16
+   threads; 7.6-8.0 before the threading work) with perplexity 1.317 on held-out prose,
+   so there is a correctness oracle and a baseline to beat. What is missing is the
+   grouped expert GEMV on `gfx1201` and a looped KV policy.
 6. **MLA checkpoints**, then block-sparse selection (the LSA/DSA/NSA primitive).
 7. **RoPE scaling**, so long-context models can be served past their training length.
 8. **Batching and a server.** Last because it changes the performance model: once

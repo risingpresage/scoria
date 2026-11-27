@@ -139,6 +139,30 @@ Also fixed: the determinism check compared different token positions (it now rep
 
 **Honest state:** correctness is now established behaviourally, not against the reference implementation — that needs the 20.2 GB HF checkpoint plus torch/transformers, neither of which is on this machine. Speed is untouched: 7.6 s/token, single-threaded, no kernels involved. There is still no Strata tiering, no 200k-context run, and no measured decode/prefill number for Inkling.
 
+## 2026-11-28 — Inkling 2 Mini: 4.1x faster, and the first measured decode/prefill number
+The host path went from **7.6-8.0 s/token to 1.84 s/token prefill and 1.93 s/token decode** on `gfx1201`'s CPU side, with perplexity unchanged to the digit (1.317 over 37 tokens, top-1 34/37) and "The capital of France is" still giving `" Paris."`.
+
+| configuration | s/token |
+| --- | --- |
+| one thread, whole-expert f32 slab (start of this work) | 7.6-8.0 |
+| 4 threads, f32 slab | 4.66 |
+| 8 threads, f32 slab | 4.64 |
+| 1 thread, row-wise dequant + threaded head | 6.47 |
+| 8 threads, row-wise dequant + threaded head | 2.08 |
+| 8 threads, + concurrent projections | 1.87 |
+| 16 threads, + concurrent projections | **1.84** |
+
+Four changes, in order of payoff:
+
+1. **The MoE stopped materialising experts as f32.** Each expert was dequantised into a 21 MB (gate/up) + 11 MB (down) f32 buffer before one matvec: 32 MB of write traffic per expert, 12 GB per token across 8 experts and 48 visits, and the single largest cost. `ExpertTensor::row_matvec` now dequantises **one row at a time** into a 9 KB buffer that stays in cache and dots it immediately. Single-threaded this is *slower* (5.00 s vs 2.54 s, the per-row `dequant_row` call overhead), but it is 3.5x faster once parallel (0.78 s vs 2.68 s at 8 threads) because the remaining work is arithmetic, not bandwidth.
+2. **The routed experts run on threads.** They are independent: each dequantises its own rows, runs its own SwiGLU and matvecs, and returns a weighted partial sum. `std::thread::scope` over the top-8 split, per-thread scratch reused across calls.
+3. **The unembedding runs on threads.** 200058 rows x 2304 is 322 MB of quantised weights read per token -- about a second on one core. Rows are independent, so they are split across threads (head time ~1.0 s -> ~0.3 s).
+4. **The six projections of each visit run concurrently**, one spawn round per visit rather than one per matvec, so the spawn overhead is paid 48 times per token instead of 336.
+
+**Then the profile, which is what decided the order:** `scoria logits` now reports attention vs MoE time per token. It went MoE 66% -> 47%, attention 0.99 s, MoE 0.87 s at 16 threads.
+
+**What this is not:** there are no GPU kernels in this path at all, prefill and decode are the same rate because the host runs one position at a time, and the first token after load is slower (it pulls 12.7 GB of weights through the page cache). The measured 1.84 s/token is the honest warm number.
+
 ## Parity gate calibration (cosine > 0.999 is prompt-dependent, not an implementation defect)
 - Measured the control that settles it: **llama.cpp's own Vulkan backend vs llama.cpp's own CPU backend** scores `cos = 0.997985` (`maxdiff 1.152`) on the Qwen3-4B harness chat prompt (`151644,872,198,785,…,77091,198`, `m=13`), where scoria scores `0.997652` (`maxdiff 1.103`). Both pick top1 `785`. No GPU implementation reaches 0.999 on that prompt.
 - Forcing prefill onto the scalar FP32 GEMM (`SCORIA_PREFILL_FP32=1`) changes nothing: 4B `0.997614` vs `0.997652` for FP16 WMMA, 8B `0.996415` vs `0.996404`. So the deficit is **not** FP16 WMMA rounding.

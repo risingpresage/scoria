@@ -406,23 +406,45 @@ impl Head {
     }
 
     /// `logits[v] = softcap(normed . W[v])` for the unpadded vocabulary.
+    ///
+    /// 200058 rows of 2304 values is 322 MB of quantised weights read per token, which cost
+    /// about a second single-threaded. The rows are independent, so they are split across
+    /// threads; each worker dequantises into its own row buffer and writes a disjoint slice
+    /// of the output.
     pub fn logits(&self, file: &GgufFile, hidden: &[f32]) -> Vec<f32> {
         let bytes = file
             .tensor_bytes(&self.info)
             .expect("output tensor is in the mmap");
-        let mut out = Vec::with_capacity(self.vocab);
-        let mut row = vec![0f32; self.n_embd];
-        for v in 0..self.vocab {
-            let start = v * self.row_bytes;
-            scoria_gguf::dequant::dequant_row(
-                self.info.ggml_type,
-                &bytes[start..start + self.row_bytes],
-                &mut row,
-            )
-            .expect("unembedding row dequantises");
-            let dot = row.iter().zip(hidden).map(|(a, b)| a * b).sum::<f32>();
-            out.push(softcap(dot, self.cap));
-        }
+        let n_embd = self.n_embd;
+        let row_bytes = self.row_bytes;
+        let cap = self.cap;
+        let ggml_type = self.info.ggml_type;
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(self.vocab.div_ceil(1))
+            .max(1);
+        let rows_per = self.vocab.div_ceil(threads).max(1);
+        let mut out = vec![0f32; self.vocab];
+        std::thread::scope(|scope| {
+            for (chunk, slot) in out.chunks_mut(rows_per).enumerate() {
+                let base = chunk * rows_per;
+                scope.spawn(move || {
+                    let mut row = vec![0f32; n_embd];
+                    for (i, value) in slot.iter_mut().enumerate() {
+                        let start = (base + i) * row_bytes;
+                        scoria_gguf::dequant::dequant_row(
+                            ggml_type,
+                            &bytes[start..start + row_bytes],
+                            &mut row,
+                        )
+                        .expect("unembedding row dequantises");
+                        let dot = row.iter().zip(hidden).map(|(a, b)| a * b).sum::<f32>();
+                        *value = softcap(dot, cap);
+                    }
+                });
+            }
+        });
         out
     }
 }
@@ -443,6 +465,8 @@ pub struct Model {
     /// Token position of the next forward, i.e. how much history the caches hold.
     pub pos: usize,
     traces: Vec<VisitTrace>,
+    /// Time spent in the MoE half of each visit, and in everything else.
+    pub profile: Profile,
     /// Stop after this many visits and run the head there anyway. Only for depth sweeps:
     /// a truncated model is not a model, but where perplexity stops improving localises a
     /// broken layer.
@@ -452,6 +476,15 @@ pub struct Model {
 
 /// Diagnostics for the last layer visited, so a wrong-looking logit can be traced back to
 /// the layer that produced it.
+/// Where a token's time goes, in seconds. Two buckets are enough to decide what to
+/// optimise next.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Profile {
+    pub attention: f64,
+    pub moe: f64,
+    pub visits: usize,
+}
+
 /// Attention diagnostics for one visit, head 0: the peak softmax weight, how far back it
 /// looks, and the mass that is not the sink. A model that ignores its history shows up
 /// here as a tiny peak and a peak at distance 0.
@@ -532,12 +565,20 @@ impl Model {
             moes,
             pos: 0,
             traces: Vec::new(),
+            profile: Profile::default(),
             max_visits: usize::MAX,
             params,
             cfg,
             file,
             last_report: None,
         })
+    }
+
+    /// Worker count for the MoE expert loop of every layer.
+    pub fn set_threads(&mut self, threads: usize) {
+        for moe in self.moes.iter_mut() {
+            moe.set_threads(threads);
+        }
     }
 
     pub fn reset(&mut self) {
@@ -574,6 +615,7 @@ impl Model {
         let mut h = self.embed(token);
         self.block_states.clear();
         self.traces.clear();
+        self.profile = Profile::default();
         let mut report = StepReport {
             hidden_norm: norm(&h),
             ..Default::default()
@@ -707,6 +749,8 @@ impl Model {
         msg: Option<&[Vec<f32>]>,
         visit: usize,
     ) -> Vec<f32> {
+        let t_visit = std::time::Instant::now();
+        self.profile.visits += 1;
         let cfg = &self.cfg;
         let eps = cfg.rms_eps;
         let n_embd = cfg.n_embd;
@@ -775,7 +819,24 @@ impl Model {
             1.0 + self.params.log_scale_alpha * x.max(1.0).ln()
         };
 
-        let mut q = matvec(&lw.w_q, &qn, n_heads * head_dim, n_embd);
+        // The six projections are independent of each other, so they run concurrently:
+        // one spawn round per visit instead of one per matvec. Each is a serial dot-product
+        // loop over its own rows, which keeps the arithmetic identical to the single-threaded
+        // path (no reduction order changes).
+        let (mut q, mut k, mut v, mut rel, sink) = std::thread::scope(|scope| {
+            let hq = scope.spawn(|| matvec(&lw.w_q, &qn, n_heads * head_dim, n_embd));
+            let hk = scope.spawn(|| matvec(&lw.w_k, &kn, kv_dim, n_embd));
+            let hv = scope.spawn(|| matvec(&lw.w_v, &vn, kv_dim, n_embd));
+            let hr = scope.spawn(|| matvec(&lw.w_rel, &qn, n_heads * lw.d_rel, n_embd));
+            let hs = scope.spawn(|| matvec(&lw.w_sink, &qn, n_heads, n_embd));
+            (
+                hq.join().expect("q projection"),
+                hk.join().expect("k projection"),
+                hv.join().expect("v projection"),
+                hr.join().expect("rel projection"),
+                hs.join().expect("sink projection"),
+            )
+        });
         for hh in 0..n_heads {
             scaled_l2_clip(
                 &mut q[hh * head_dim..(hh + 1) * head_dim],
@@ -784,13 +845,11 @@ impl Model {
             );
         }
         if tau != 1.0 {
-            for v in q.iter_mut() {
-                *v *= tau;
+            for value in q.iter_mut() {
+                *value *= tau;
             }
         }
 
-        let mut k = matvec(&lw.w_k, &kn, kv_dim, n_embd);
-        let mut v = matvec(&lw.w_v, &vn, kv_dim, n_embd);
         match (&lw.conv_k_proj, &lw.conv_v_proj) {
             (Some(pk), Some(pv)) => {
                 let dyn_k = matvec(pk, &kn, lw.kv_heads * 4, n_embd);
@@ -826,7 +885,6 @@ impl Model {
         for g in gate.iter_mut() {
             *g = sigmoid(*g);
         }
-        let mut rel = matvec(&lw.w_rel, &qn, n_heads * lw.d_rel, n_embd);
         for hh in 0..n_heads {
             scaled_l2_clip(
                 &mut rel[hh * lw.d_rel..(hh + 1) * lw.d_rel],
@@ -839,7 +897,6 @@ impl Model {
                 *v *= tau;
             }
         }
-        let sink = matvec(&lw.w_sink, &qn, n_heads, n_embd);
 
         cache.k_seq.extend_from_slice(&k);
         cache.v_seq.extend_from_slice(&v);
@@ -944,10 +1001,17 @@ impl Model {
         }
         let mut moe_in = ffn_in;
         rmsnorm(&mut moe_in, &lw.ffn_norm, eps);
+        let t_moe = std::time::Instant::now();
         let mut y = moe.forward(&self.file, &moe_in);
+        let moe_time = t_moe.elapsed().as_secs_f64();
+        self.profile.moe += moe_time;
         short_conv1d_4tap(&mut y, &lw.ffn_post_conv, &mut cache.ffn_conv, n_embd);
 
-        residual.iter().zip(&y).map(|(a, b)| a + b).collect()
+        let out: Vec<f32> = residual.iter().zip(&y).map(|(a, b)| a + b).collect();
+        // Everything that is not the MoE is the attention half of the visit (plus the two
+        // convolution/residual adds, which are microseconds).
+        self.profile.attention += t_visit.elapsed().as_secs_f64() - moe_time;
+        out
     }
 
     /// The top-`k` `(token, logit)` pairs, highest first.
