@@ -14,7 +14,7 @@ use scoria_gguf::{BpeTokenizer, GgufFile, ModelConfig};
 
 fn usage() -> ! {
     eprintln!(
-        "Usage:\n  scoria gate [--quick]\n  scoria inspect <model.gguf>\n  scoria tokenize <model.gguf> <prompt> [--no-bos]\n  scoria run <model.gguf> (--prompt <text> | --tokens <csv>) [--max-tokens <N>] [--max-seq <N>] [--no-bos] [--ignore-eos] [--warmup <N>] [--kv-f16] [--dump-logits <path>] [--tap-layer <L>] [--profile]\n  scoria graph-soak <model.gguf> [--replays <N>] [--tokens <csv>]\n  scoria plan <model.gguf> [--vram-mib <N>] [--ctx <N>]\n  scoria strata <model.gguf> [--top-k <N>] [--tokens <N>] [--qd <N>]\n  scoria arch-check <model.gguf>"
+        "Usage:\n  scoria gate [--quick]\n  scoria inspect <model.gguf>\n  scoria tokenize <model.gguf> <prompt> [--no-bos]\n  scoria run <model.gguf> (--prompt <text> | --tokens <csv>) [--max-tokens <N>] [--max-seq <N>] [--no-bos] [--ignore-eos] [--warmup <N>] [--kv-f16] [--dump-logits <path>] [--tap-layer <L>] [--profile]\n  scoria graph-soak <model.gguf> [--replays <N>] [--tokens <csv>]\n  scoria plan <model.gguf> [--vram-mib <N>] [--ctx <N>]\n  scoria strata <model.gguf> [--top-k <N>] [--tokens <N>] [--qd <N>]\n  scoria arch-check <model.gguf> [--dequant-smoke]"
     );
     process::exit(2);
 }
@@ -595,6 +595,64 @@ a hot-expert LRU beats raw disk speed",
 /// Validate a checkpoint against the `inkling2_loop` architecture contract: which
 /// tensors exist for every role, which quantisation types the engine cannot dequantise
 /// yet, and the 48-visit execution order with its KV slots.
+/// Dequantises the first blocks of one real tensor per distinct GGML type in the file and
+/// reports the value range. This is the end-to-end check the synthetic block tests cannot
+/// give: mmap -> block slicing -> dequant on weights that actually ship.
+fn dequant_smoke(gguf: &GgufFile) -> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::BTreeMap;
+    let mut first_by_type: BTreeMap<u32, &str> = BTreeMap::new();
+    for t in &gguf.tensors {
+        first_by_type
+            .entry(t.ggml_type.as_u32())
+            .or_insert(t.name.as_str());
+    }
+    println!("\ndequant smoke (8 blocks per type, from the checkpoint):");
+    for (ty, name) in first_by_type {
+        let info = gguf.tensor(name).expect("tensor present");
+        let Some(block_elems) = info.ggml_type.block_elements() else {
+            println!("  {name:38} type {ty:<3} unsupported");
+            continue;
+        };
+        let Some(block_bytes) = info.ggml_type.block_bytes() else {
+            println!("  {name:38} type {ty:<3} unsupported");
+            continue;
+        };
+        let bytes = gguf.tensor_bytes(info)?;
+        let blocks = (bytes.len() / block_bytes).min(8);
+        let mut out = vec![0f32; blocks * block_elems];
+        scoria_gguf::dequant::dequant_row(
+            info.ggml_type,
+            &bytes[..blocks * block_bytes],
+            &mut out,
+        )?;
+        let finite = out.iter().filter(|v| v.is_finite()).count();
+        let lo = out.iter().copied().fold(f32::INFINITY, f32::min);
+        let hi = out.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        // Expert tensors are stored pre-divided by a per-expert f32 outer scale; without
+        // it the raw weights are four orders of magnitude too large, so report both.
+        let scale_name = name
+            .strip_suffix(".weight")
+            .map_or_else(|| format!("{name}.scale"), |stem| format!("{stem}.scale"));
+        let outer = gguf
+            .tensor(&scale_name)
+            .and_then(|si| gguf.tensor_bytes(si).ok())
+            .filter(|b| b.len() >= 4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        let scaled = match outer {
+            Some(k) => format!(" outer={k:.3e} -> [{:.4}, {:.4}]", lo * k, hi * k),
+            None => String::new(),
+        };
+        println!(
+            "  {name:38} type {ty:<3} {:<7} n={:<6} finite={}/{} raw=[{lo:.4}, {hi:.4}]{scaled}",
+            format!("{:?}", info.ggml_type),
+            out.len(),
+            finite,
+            out.len()
+        );
+    }
+    Ok(())
+}
+
 fn cmd_arch_check(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use scoria_engine::inkling2;
     if args.is_empty() {
@@ -711,6 +769,9 @@ fn cmd_arch_check(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     if !missing.is_empty() {
         println!("missing required roles: {}", missing.join(" "));
+    }
+    if args.iter().any(|a| a == "--dequant-smoke") {
+        dequant_smoke(&gguf)?;
     }
     Ok(())
 }

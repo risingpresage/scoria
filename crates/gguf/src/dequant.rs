@@ -1,4 +1,4 @@
-use crate::{GgmlType, GgufError};
+use crate::{GgmlType, GgufError, iq_tables};
 
 #[inline]
 pub fn f16_to_f32(bits: u16) -> f32 {
@@ -365,6 +365,173 @@ pub fn dequant_row_nvfp4(src: &[u8], dst: &mut [f32]) {
     }
 }
 
+fn grid8(grid: u64) -> [u8; 8] {
+    grid.to_le_bytes()
+}
+
+fn grid4(grid: u32) -> [u8; 4] {
+    grid.to_le_bytes()
+}
+
+/// Applies ggml's sign mask: `kmask_iq2xs[j]` selects a bit of the sign byte.
+#[inline]
+fn signed(v: f32, signs: u8, j: usize) -> f32 {
+    if signs & iq_tables::KMASK_IQ2XS[j] != 0 {
+        -v
+    } else {
+        v
+    }
+}
+
+/// IQ2_XS: 74 bytes per 256 elements. `qs` holds 32 sixteen-bit codes (9-bit grid index,
+/// 7-bit sign index); eight packed nibble-pair scales give two sub-block scales each.
+pub fn dequant_row_iq2_xs(src: &[u8], dst: &mut [f32]) {
+    const QK_K: usize = 256;
+    const BLK_BYTES: usize = 74;
+    assert_eq!(dst.len() % QK_K, 0);
+    let nb = dst.len() / QK_K;
+    assert_eq!(src.len(), nb * BLK_BYTES);
+
+    for i in 0..nb {
+        let blk = &src[i * BLK_BYTES..(i + 1) * BLK_BYTES];
+        let d = f16_to_f32(read_u16_le(&blk[0..2]));
+        let scales = &blk[66..74];
+        let y = &mut dst[i * QK_K..(i + 1) * QK_K];
+        for ib32 in 0..8 {
+            let db = [
+                d * (0.5 + f32::from(scales[ib32] & 0x0F)) * 0.25,
+                d * (0.5 + f32::from(scales[ib32] >> 4)) * 0.25,
+            ];
+            for l in 0..4 {
+                let code = read_u16_le(&blk[2 + 2 * (4 * ib32 + l)..]);
+                let grid = grid8(iq_tables::IQ2XS_GRID[(code & 511) as usize]);
+                let signs = iq_tables::KSIGNS_IQ2XS[(code >> 9) as usize];
+                let scale = db[l / 2];
+                for j in 0..8 {
+                    y[ib32 * 32 + l * 8 + j] = scale * f32::from(grid[j]) * signed(1.0, signs, j);
+                }
+            }
+        }
+    }
+}
+
+/// IQ2_S: 82 bytes per 256 elements. Like IQ2_XS but the grid index gains two high bits
+/// from a separate `qh` plane, and the sign bytes sit in the second half of `qs`.
+pub fn dequant_row_iq2_s(src: &[u8], dst: &mut [f32]) {
+    const QK_K: usize = 256;
+    const BLK_BYTES: usize = 82;
+    assert_eq!(dst.len() % QK_K, 0);
+    let nb = dst.len() / QK_K;
+    assert_eq!(src.len(), nb * BLK_BYTES);
+
+    for i in 0..nb {
+        let blk = &src[i * BLK_BYTES..(i + 1) * BLK_BYTES];
+        let d = f16_to_f32(read_u16_le(&blk[0..2]));
+        let qs = &blk[2..66];
+        let qh = &blk[66..74];
+        let scales = &blk[74..82];
+        let y = &mut dst[i * QK_K..(i + 1) * QK_K];
+        for ib32 in 0..8 {
+            let db = [
+                d * (0.5 + f32::from(scales[ib32] & 0x0F)) * 0.25,
+                d * (0.5 + f32::from(scales[ib32] >> 4)) * 0.25,
+            ];
+            for l in 0..4 {
+                let hi = u16::from((qh[ib32] >> (2 * l)) & 0x03) << 8;
+                let index = (u16::from(qs[4 * ib32 + l]) | hi) as usize;
+                let grid = grid8(iq_tables::IQ2S_GRID[index]);
+                let signs = qs[32 + 4 * ib32 + l];
+                let scale = db[l / 2];
+                for j in 0..8 {
+                    y[ib32 * 32 + l * 8 + j] = scale * f32::from(grid[j]) * signed(1.0, signs, j);
+                }
+            }
+        }
+    }
+}
+
+/// IQ3_XXS: 98 bytes per 256 elements. Two four-element grids per eight outputs, with the
+/// scale and four sign indices packed into one u32 per 32-element sub-block.
+pub fn dequant_row_iq3_xxs(src: &[u8], dst: &mut [f32]) {
+    const QK_K: usize = 256;
+    const BLK_BYTES: usize = 98;
+    assert_eq!(dst.len() % QK_K, 0);
+    let nb = dst.len() / QK_K;
+    assert_eq!(src.len(), nb * BLK_BYTES);
+
+    for i in 0..nb {
+        let blk = &src[i * BLK_BYTES..(i + 1) * BLK_BYTES];
+        let d = f16_to_f32(read_u16_le(&blk[0..2]));
+        let qs = &blk[2..98];
+        let y = &mut dst[i * QK_K..(i + 1) * QK_K];
+        for ib32 in 0..8 {
+            let aux = u32::from_le_bytes([
+                qs[64 + 4 * ib32],
+                qs[65 + 4 * ib32],
+                qs[66 + 4 * ib32],
+                qs[67 + 4 * ib32],
+            ]);
+            let db = d * (0.5 + f32::from((aux >> 28) as u8)) * 0.5;
+            for l in 0..4 {
+                let signs = iq_tables::KSIGNS_IQ2XS[((aux >> (7 * l)) & 127) as usize];
+                let g1 = grid4(iq_tables::IQ3XXS_GRID[qs[8 * ib32 + 2 * l] as usize]);
+                let g2 = grid4(iq_tables::IQ3XXS_GRID[qs[8 * ib32 + 2 * l + 1] as usize]);
+                for j in 0..4 {
+                    y[ib32 * 32 + l * 8 + j] = db * f32::from(g1[j]) * signed(1.0, signs, j);
+                    y[ib32 * 32 + l * 8 + 4 + j] =
+                        db * f32::from(g2[j]) * signed(1.0, signs, j + 4);
+                }
+            }
+        }
+    }
+}
+
+/// IQ3_S: 110 bytes per 256 elements. Four scales of 4 bits, a 9th grid-index bit per
+/// output taken from `qh`, and 32 bytes of sign masks.
+pub fn dequant_row_iq3_s(src: &[u8], dst: &mut [f32]) {
+    const QK_K: usize = 256;
+    const BLK_BYTES: usize = 110;
+    assert_eq!(dst.len() % QK_K, 0);
+    let nb = dst.len() / QK_K;
+    assert_eq!(src.len(), nb * BLK_BYTES);
+
+    for i in 0..nb {
+        let blk = &src[i * BLK_BYTES..(i + 1) * BLK_BYTES];
+        let d = f16_to_f32(read_u16_le(&blk[0..2]));
+        let qs = &blk[2..66];
+        let qh = &blk[66..74];
+        let signs = &blk[74..106];
+        let scales = &blk[106..110];
+        let y = &mut dst[i * QK_K..(i + 1) * QK_K];
+
+        for pair in 0..4 {
+            let db = [
+                d * (1.0 + 2.0 * f32::from(scales[pair] & 0x0F)),
+                d * (1.0 + 2.0 * f32::from(scales[pair] >> 4)),
+            ];
+            for half in 0..2 {
+                let qs_base = 16 * pair + 8 * half;
+                let sign_base = 8 * pair + 4 * half;
+                let hi = qh[2 * pair + half];
+                for l in 0..4 {
+                    let bit1 = (hi >> (2 * l)) & 1;
+                    let bit2 = (hi >> (2 * l + 1)) & 1;
+                    let i1 = usize::from(qs[qs_base + 2 * l]) | usize::from(bit1) << 8;
+                    let i2 = usize::from(qs[qs_base + 2 * l + 1]) | usize::from(bit2) << 8;
+                    let g1 = grid4(iq_tables::IQ3S_GRID[i1]);
+                    let g2 = grid4(iq_tables::IQ3S_GRID[i2]);
+                    let sign = signs[sign_base + l];
+                    let base = pair * 64 + half * 32 + l * 8;
+                    for j in 0..4 {
+                        y[base + j] = db[half] * f32::from(g1[j]) * signed(1.0, sign, j);
+                        y[base + 4 + j] = db[half] * f32::from(g2[j]) * signed(1.0, sign, j + 4);
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn dequant_row(ggml_type: GgmlType, src: &[u8], dst: &mut [f32]) -> Result<(), GgufError> {
     match ggml_type {
         GgmlType::F32 => dequant_row_f32(src, dst),
@@ -376,6 +543,10 @@ pub fn dequant_row(ggml_type: GgmlType, src: &[u8], dst: &mut [f32]) -> Result<(
         GgmlType::Q5K => dequant_row_q5_k(src, dst),
         GgmlType::Q6K => dequant_row_q6_k(src, dst),
         GgmlType::BF16 => dequant_row_bf16(src, dst),
+        GgmlType::IQ2XS => dequant_row_iq2_xs(src, dst),
+        GgmlType::IQ2S => dequant_row_iq2_s(src, dst),
+        GgmlType::IQ3XXS => dequant_row_iq3_xxs(src, dst),
+        GgmlType::IQ3S => dequant_row_iq3_s(src, dst),
         GgmlType::IQ4NL => dequant_row_iq4_nl(src, dst),
         GgmlType::NVFP4 => dequant_row_nvfp4(src, dst),
         other => return Err(GgufError::UnsupportedQuant(other.as_u32())),
@@ -386,6 +557,141 @@ pub fn dequant_row(ggml_type: GgmlType, src: &[u8], dst: &mut [f32]) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------- IQ family
+    //
+    // These formats are grid lookups plus a sign mask, so the hand-computable
+    // invariants are: a zero block decodes to zero, the scale and sign plumbing
+    // behaves, and the tables are bit-identical to ggml's.
+
+    const IQ_CASES: [(GgmlType, usize, usize); 4] = [
+        (GgmlType::IQ2XS, 256, 74),
+        (GgmlType::IQ2S, 256, 82),
+        (GgmlType::IQ3XXS, 256, 98),
+        (GgmlType::IQ3S, 256, 110),
+    ];
+
+    #[test]
+    fn iq_tables_are_unchanged_from_ggml() {
+        // FNV-1a over every value, regenerated from ggml-common.h.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut mix = |bytes: [u8; 8]| {
+            for b in bytes {
+                h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        };
+        for v in crate::iq_tables::KMASK_IQ2XS {
+            mix(u64::from(v).to_le_bytes());
+        }
+        for v in crate::iq_tables::KSIGNS_IQ2XS {
+            mix(u64::from(v).to_le_bytes());
+        }
+        for v in crate::iq_tables::IQ2XS_GRID {
+            mix(v.to_le_bytes());
+        }
+        for v in crate::iq_tables::IQ2S_GRID {
+            mix(v.to_le_bytes());
+        }
+        for v in crate::iq_tables::IQ3XXS_GRID {
+            mix(u64::from(v).to_le_bytes());
+        }
+        for v in crate::iq_tables::IQ3S_GRID {
+            mix(u64::from(v).to_le_bytes());
+        }
+        assert_eq!(h, crate::iq_tables::GGML_TABLE_DIGEST);
+    }
+
+    #[test]
+    fn iq_zero_block_decodes_to_zero() {
+        for (ty, elems, bytes) in IQ_CASES {
+            let src = vec![0u8; bytes];
+            let mut dst = vec![0f32; elems];
+            dequant_row(ty, &src, &mut dst).unwrap();
+            assert!(dst.iter().all(|v| *v == 0.0), "{ty:?} zero block");
+        }
+    }
+
+    #[test]
+    fn iq_max_index_block_stays_finite() {
+        // Every grid/sign index at its maximum must still land inside the tables.
+        for (ty, elems, bytes) in IQ_CASES {
+            let mut src = vec![0xFFu8; bytes];
+            // A non-zero, finite scale in the first two bytes.
+            src[0..2].copy_from_slice(&f16_block(1.0));
+            let mut dst = vec![0f32; elems];
+            dequant_row(ty, &src, &mut dst).unwrap();
+            assert!(
+                dst.iter().all(|v| v.is_finite()),
+                "{ty:?} produced non-finite"
+            );
+            assert!(dst.iter().any(|v| *v != 0.0), "{ty:?} produced all zeros");
+        }
+    }
+
+    #[test]
+    fn iq2_xs_scale_and_sign_plumbing() {
+        // d = 1, grid index 0, sign index 0, scale nibble 0 -> db = 0.5*0.25 = 0.125.
+        let mut src = [0u8; 74];
+        src[0..2].copy_from_slice(&f16_block(1.0));
+        let mut dst = [0f32; 256];
+        dequant_row_iq2_xs(&src, &mut dst);
+        let grid = crate::iq_tables::IQ2XS_GRID[0].to_le_bytes();
+        for j in 0..8 {
+            assert_eq!(dst[j], 0.125 * f32::from(grid[j]));
+        }
+        // Scale nibble 1 in the low half doubles the base to 0.5 + 1.
+        src[66] = 0x01;
+        dequant_row_iq2_xs(&src, &mut dst);
+        assert_eq!(dst[0], (0.5 + 1.0) * 0.25 * f32::from(grid[0]));
+        // Sign index 1 must flip the sign bits selected by KMASK for the first code.
+        src[2] = 0x00;
+        src[3] = 0x02; // code >> 9 == 1
+        let signs = crate::iq_tables::KSIGNS_IQ2XS[1];
+        dequant_row_iq2_xs(&src, &mut dst);
+        for j in 0..8 {
+            let want = (0.5 + 1.0) * 0.25 * f32::from(grid[j]);
+            let want = if signs & crate::iq_tables::KMASK_IQ2XS[j] != 0 {
+                -want
+            } else {
+                want
+            };
+            assert_eq!(dst[j], want, "sign bit {j}");
+        }
+    }
+
+    #[test]
+    fn iq3_s_ninth_index_bit_and_signs() {
+        // d = 1, scale nibble 0 -> db = 1; grid index 0 for both halves.
+        let mut src = [0u8; 110];
+        src[0..2].copy_from_slice(&f16_block(1.0));
+        let mut dst = [0f32; 256];
+        dequant_row_iq3_s(&src, &mut dst);
+        let g = crate::iq_tables::IQ3S_GRID[0].to_le_bytes();
+        for j in 0..4 {
+            assert_eq!(dst[j], f32::from(g[j]));
+            assert_eq!(dst[j + 4], f32::from(g[j]));
+        }
+        // Setting bit 0 of qh[0] moves the first grid index to 256.
+        src[66] = 0x01;
+        let g256 = crate::iq_tables::IQ3S_GRID[256].to_le_bytes();
+        dequant_row_iq3_s(&src, &mut dst);
+        assert_eq!(dst[0], f32::from(g256[0]));
+        // Scale nibble 1 -> db = 1 + 2 = 3.
+        src[106] = 0x01;
+        dequant_row_iq3_s(&src, &mut dst);
+        assert_eq!(dst[0], 3.0 * f32::from(g256[0]));
+    }
+
+    #[test]
+    fn iq_types_dispatch_with_their_block_sizes() {
+        for (ty, elems, bytes) in IQ_CASES {
+            assert_eq!(ty.tensor_byte_len(elems).unwrap(), bytes, "{ty:?}");
+            let mut dst = vec![0f32; elems];
+            dequant_row(ty, &vec![0u8; bytes], &mut dst).unwrap();
+            // Wrong length is rejected by the size formula, not by a panic inside.
+            assert!(ty.tensor_byte_len(elems + 1).is_err(), "{ty:?}");
+        }
+    }
 
     fn f16_block(d: f32) -> [u8; 2] {
         // Only exact powers of two are needed by these tests.
@@ -532,7 +838,7 @@ mod tests {
             dequant_row(ty, &src, &mut dst).unwrap();
         }
         // Not-yet-implemented types must report the type id, not panic.
-        let err = dequant_row(GgmlType::IQ2XS, &[0u8; 74], &mut [0f32; 256]).unwrap_err();
+        let err = dequant_row(GgmlType::IQ2XXS, &[0u8; 66], &mut [0f32; 256]).unwrap_err();
         assert!(format!("{err}").contains("unsupported"));
     }
 

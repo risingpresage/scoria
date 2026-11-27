@@ -216,15 +216,19 @@ impl GgmlType {
         match self {
             Self::F32 | Self::F16 | Self::BF16 => Some(1),
             Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_1 => Some(32),
-            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => Some(256),
+            Self::Q2K
+            | Self::Q3K
+            | Self::Q4K
+            | Self::Q5K
+            | Self::Q6K
+            | Self::Q8K
+            | Self::IQ2XS
+            | Self::IQ2S
+            | Self::IQ3XXS
+            | Self::IQ3S => Some(256),
             Self::IQ4NL => Some(32),
             Self::NVFP4 => Some(64),
-            Self::IQ2XXS
-            | Self::IQ2XS
-            | Self::IQ3XXS
-            | Self::IQ3S
-            | Self::IQ2S
-            | Self::Unknown(_) => None,
+            Self::IQ2XXS | Self::Unknown(_) => None,
         }
     }
 
@@ -244,14 +248,13 @@ impl GgmlType {
             Self::Q5K => Some(176),
             Self::Q6K => Some(210),
             Self::Q8K => Some(292),
+            Self::IQ2XS => Some(74),
+            Self::IQ2S => Some(82),
+            Self::IQ3XXS => Some(98),
+            Self::IQ3S => Some(110),
             Self::IQ4NL => Some(18),
             Self::NVFP4 => Some(36),
-            Self::IQ2XXS
-            | Self::IQ2XS
-            | Self::IQ3XXS
-            | Self::IQ3S
-            | Self::IQ2S
-            | Self::Unknown(_) => None,
+            Self::IQ2XXS | Self::Unknown(_) => None,
         }
     }
 

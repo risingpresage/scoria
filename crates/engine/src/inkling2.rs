@@ -285,6 +285,10 @@ pub fn engine_supports(t: GgmlType) -> bool {
             | GgmlType::Q4K
             | GgmlType::Q5K
             | GgmlType::Q6K
+            | GgmlType::IQ2XS
+            | GgmlType::IQ2S
+            | GgmlType::IQ3XXS
+            | GgmlType::IQ3S
             | GgmlType::IQ4NL
             | GgmlType::NVFP4
     )

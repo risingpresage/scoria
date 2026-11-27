@@ -7,6 +7,15 @@
   ],
   "features": [
     {
+      "id": "phase3-all-dequant-types",
+      "phase": 3,
+      "title": "IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S dequant with generated ggml tables; every Inkling tensor type loadable",
+      "status": "verified",
+      "verify": "./scripts/check.sh && ./target/release/scoria arch-check /home/noorm/models/inkling/Inkling-2-Mini-UD-Q3_K_XL.gguf --dequant-smoke",
+      "observed": "arch-check reports no blocking types (all 12 present types are supported). --dequant-smoke dequantises the first 8 blocks of one real tensor per type from the mmap: all finite, and expert tensors land at +/-0.08 once the per-expert outer scale (~4e-05, companion `ffn_*_exps.scale`) is applied, matching the non-expert weights. 20 gguf lib tests pass, including a FNV-1a table-integrity digest over the 2,300 generated ggml constants and hand-computed IQ2_XS/IQ3_S scale and sign cases.",
+      "note": "Grids/sign tables are generated from ggml-common.h by scripts/gen-iq-tables.py rather than transcribed; the digest test fails if a table is hand-edited. The outer-scale multiplication is a loader responsibility, not part of dequant_row."
+    },
+    {
       "id": "phase3-dequant-five-types",
       "phase": 3,
       "title": "Dequantise BF16, Q5_K, Q3_K, IQ4_NL and NVFP4; identify GGML type 40 as NVFP4",

@@ -1,5 +1,6 @@
 pub mod dequant;
 pub mod gguf;
+mod iq_tables;
 pub mod tokenizer;
 
 use std::fmt;
