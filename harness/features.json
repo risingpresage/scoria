@@ -1,8 +1,20 @@
 {
   "project": "scoria",
   "target_arch": "gfx1201",
-  "portable_arches": ["gfx1201", "gfx942"],
+  "portable_arches": [
+    "gfx1201",
+    "gfx942"
+  ],
   "features": [
+    {
+      "id": "phase3-kv-budget-strata",
+      "phase": 3,
+      "title": "Sliding-window-aware KV budget planner and measured Strata paging prototype for Inkling 2 Mini",
+      "status": "verified",
+      "verify": "./scripts/check.sh && ./target/release/scoria plan harness/../models/inkling/Inkling-2-Mini-UD-Q3_K_XL.gguf --ctx 200000 && ./target/release/scoria strata <same gguf>",
+      "observed": "inkling2_loop now parses (per-layer head_count/head_count_kv arrays, sliding_window_pattern bool array, expert_count, loop.count/start/end). `scoria plan` on Inkling-2-Mini-UD-Q3_K_XL (12.70 GiB): 48 KV slots = 8 full-history + 40 windowed (window 1024), 65536 B/token FP32, 32768 FP16, 16384 FP8; 200k context costs 12.52/6.26/3.13 GiB, and with 15.69 GiB free the max context is 43963 (FP32) / 93047 (FP16) / 191214 (FP8) tokens. `scoria strata` measured 11.36 GiB of experts (48 tensors, 1.42-2.85 MiB slabs), 727.1 MiB routed per token at top-8 of 128 (6.2%), 1.57 GB/s buffered after O_DIRECT was rejected on btrfs compress=zstd -> 2 tok/s paged ceiling. 3 KV-budget unit tests added.",
+      "note": "Strata is a fallback, not a substitute for residency: the 11.36 GiB expert set is 6.2% routed per token, so only a hot-expert cache makes paging competitive. Full Inkling inference still needs the inkling2_loop kernels; llama.cpp b11050 cannot load the architecture, so there is no reference logits from it."
+    },
     {
       "id": "phase0-harness-lint",
       "phase": 0,
@@ -73,7 +85,7 @@
       "title": "Measure and retire the Q8_1 integer-dot decode GEMV from the default path",
       "status": "verified",
       "verify": "./scripts/check.sh && python3 scripts/bench_cac.py --tag phase2d_q8_off --trials 3",
-      "observed": "A/B decode tok/s (2 runs each): 8B 99.73 on -> 101.64 off (+1.9%), 7B 113.10 -> 113.68, 4B 157.88 -> 157.25 (wash), 0.5B 427.4 -> 430.5. 3-trial medians with it off: 0.5B 414.90 / pp128 15877.16, 7B 115.20 / 2758.20, 4B 158.41 / 3973.01, 8B 100.07 / 2486.28 — every model at or above the phase2c record. Kept as `SCORIA_Q4K_Q8=1` opt-in.",
+      "observed": "A/B decode tok/s (2 runs each): 8B 99.73 on -> 101.64 off (+1.9%), 7B 113.10 -> 113.68, 4B 157.88 -> 157.25 (wash), 0.5B 427.4 -> 430.5. 3-trial medians with it off: 0.5B 414.90 / pp128 15877.16, 7B 115.20 / 2758.20, 4B 158.41 / 3973.01, 8B 100.07 / 2486.28 \u2014 every model at or above the phase2c record. Kept as `SCORIA_Q4K_Q8=1` opt-in.",
       "note": "Packing x to int8 saves activation traffic but costs a quantise launch per GEMV group, and Q4_K weight traffic dominates decode, so the trade was negative."
     },
     {

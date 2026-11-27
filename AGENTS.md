@@ -33,6 +33,7 @@ This rule exists because it was violated once and had to be fixed twice.
 - Workflows: [kernel-authoring](.agents/skills/kernel-authoring/SKILL.md), [parity-bench](.agents/skills/parity-bench/SKILL.md)
 - Attention family (MLA / DSA / NSA / LSA) and the long-context plan: [ATTENTION.md](specs/ATTENTION.md)
 - Capability parity vs llama.cpp and the order to close it: [PARITY.md](harness/PARITY.md)
+- Strata (weight paging), Inkling 2 Mini budgeting: [STRATA.md](specs/STRATA.md)
 
 ## Mistakes Log
 - 2026-11-26: `hipcc --genco --offload-arch=gfx1201` fails builtins because clang invokes `--cuda-device-only` targeting `gfx906`. Use `clang++ --offload-device-only --no-gpu-bundle-output --offload-arch=gfx1201`.

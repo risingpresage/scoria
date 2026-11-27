@@ -572,6 +572,41 @@ impl GgufFile {
             .ok_or_else(|| GgufError::MissingMetadata(key.to_string()))
     }
 
+    /// Accepts either a scalar or an array, taking the largest value from an array.
+    ///
+    /// Some architectures (e.g. `inkling2_loop`) store per-layer head counts and
+    /// sliding-window masks as arrays with one entry per block, so a scalar-only
+    /// accessor rejects a perfectly valid checkpoint.
+    pub fn meta_u32_any(&self, key: &str) -> Result<u32, GgufError> {
+        let value = self
+            .metadata
+            .get(key)
+            .ok_or_else(|| GgufError::MissingMetadata(key.to_string()))?;
+        if let Some(v) = value.as_u32() {
+            return Ok(v);
+        }
+        value
+            .as_array()
+            .and_then(|a| a.iter().filter_map(|v| v.as_u32()).max())
+            .ok_or_else(|| GgufError::MissingMetadata(key.to_string()))
+    }
+
+    /// Reads an array of integers, or a scalar as a one-element list. Boolean
+    /// arrays are read as 1/0, which is how sliding-window masks are stored.
+    pub fn meta_u32_list(&self, key: &str) -> Option<Vec<u32>> {
+        let value = self.metadata.get(key)?;
+        let one = |v: &GgufValue| -> Option<u32> {
+            v.as_u32().or(match v {
+                GgufValue::Bool(b) => Some(u32::from(*b)),
+                _ => None,
+            })
+        };
+        if let Some(v) = one(value) {
+            return Some(vec![v]);
+        }
+        value.as_array().map(|a| a.iter().filter_map(one).collect())
+    }
+
     pub fn meta_f32(&self, key: &str) -> Result<f32, GgufError> {
         self.metadata
             .get(key)
@@ -623,6 +658,127 @@ pub struct ModelConfig {
     pub rope_freq_base: f32,
     pub rms_eps: f32,
     pub tied_embeddings: bool,
+    /// Per-block KV head counts when the checkpoint stores one value per layer.
+    pub kv_heads_per_layer: Option<Vec<usize>>,
+    /// Sliding-window size, when the architecture has both full and windowed layers.
+    pub sliding_window: Option<usize>,
+    /// One entry per block: non-zero marks a sliding-window layer.
+    pub sliding_window_pattern: Option<Vec<u8>>,
+    pub n_experts: Option<usize>,
+    pub n_experts_used: Option<usize>,
+    /// A block range executed `loop_count` times (looped transformers).
+    pub loop_count: Option<usize>,
+    pub loop_start: Option<usize>,
+    pub loop_end: Option<usize>,
+}
+
+/// KV cache cost for one model, honouring per-layer sliding windows and looped
+/// blocks. Sliding-window layers only ever hold `window` positions, which is the
+/// difference between a 200k context fitting and not fitting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvBudget {
+    /// Logical layers, before loop expansion.
+    pub layers: usize,
+    /// KV slots after loop expansion: each loop pass gets its own cache.
+    pub slots: usize,
+    pub full_slots: usize,
+    pub windowed_slots: usize,
+    pub window: usize,
+    /// Bytes per position for one full-history slot, at 1 byte per element.
+    pub full_bytes_per_token: u64,
+    /// Constant bytes held by all windowed slots, at 1 byte per element.
+    pub windowed_bytes: u64,
+    pub head_dim: usize,
+}
+
+impl KvBudget {
+    /// Total cache bytes at `ctx` positions with `elem_bytes` per element
+    /// (4 = FP32, 2 = FP16, 1 = FP8/INT8).
+    pub fn total_bytes(&self, ctx: usize, elem_bytes: u64) -> u64 {
+        let window = self.window.min(ctx) as u64;
+        (self.full_bytes_per_token * ctx as u64 + self.windowed_bytes * window) * elem_bytes
+    }
+
+    /// Largest context whose cache fits in `budget_bytes`.
+    pub fn max_ctx(&self, budget_bytes: u64, elem_bytes: u64) -> usize {
+        let per_token = self.full_bytes_per_token * elem_bytes;
+        if per_token == 0 {
+            return usize::MAX;
+        }
+        let window = self.window.max(1) as u64;
+        // Beyond the window the cost is per_token * ctx + a constant.
+        let constant = self.windowed_bytes * window * elem_bytes;
+        if budget_bytes > constant {
+            let ctx = (budget_bytes - constant) / per_token;
+            if ctx >= window {
+                return ctx as usize;
+            }
+        }
+        // Below the window, every slot grows with ctx.
+        let denom = per_token + self.windowed_bytes * elem_bytes;
+        (budget_bytes / denom.max(1)) as usize
+    }
+}
+
+impl ModelConfig {
+    /// Summarises the KV cache this checkpoint needs.
+    pub fn kv_budget(&self) -> KvBudget {
+        let loop_extra = match (self.loop_count, self.loop_start, self.loop_end) {
+            (Some(count), Some(start), Some(end)) if end > start && count > 1 => {
+                (end - start) * (count - 1)
+            }
+            _ => 0,
+        };
+        let slots = self.n_layers + loop_extra;
+        let window = self.sliding_window.unwrap_or(self.context_length);
+        let is_windowed = |layer: usize| -> bool {
+            match (&self.sliding_window_pattern, self.sliding_window) {
+                (Some(pattern), Some(_)) => pattern.get(layer).copied().unwrap_or(0) != 0,
+                _ => false,
+            }
+        };
+        let kv_heads_at = |layer: usize| -> usize {
+            self.kv_heads_per_layer
+                .as_ref()
+                .and_then(|v| v.get(layer).copied())
+                .unwrap_or(self.n_kv_heads)
+        };
+
+        let mut full_slots = 0usize;
+        let mut windowed_slots = 0usize;
+        let mut full_bytes_per_token = 0u64;
+        let mut windowed_bytes = 0u64;
+        for layer in 0..self.n_layers {
+            // A looped layer is executed `passes` times; budget one cache per pass.
+            let passes = if loop_extra > 0
+                && self.loop_start.is_some_and(|s| layer >= s)
+                && self.loop_end.is_some_and(|e| layer < e)
+            {
+                self.loop_count.unwrap_or(1)
+            } else {
+                1
+            };
+            let per_slot = (kv_heads_at(layer) * self.head_dim * 2) as u64;
+            if is_windowed(layer) {
+                windowed_slots += passes;
+                windowed_bytes += per_slot * passes as u64;
+            } else {
+                full_slots += passes;
+                full_bytes_per_token += per_slot * passes as u64;
+            }
+        }
+
+        KvBudget {
+            layers: self.n_layers,
+            slots,
+            full_slots,
+            windowed_slots,
+            window,
+            full_bytes_per_token,
+            windowed_bytes,
+            head_dim: self.head_dim,
+        }
+    }
 }
 
 impl ModelConfig {
@@ -634,10 +790,42 @@ impl ModelConfig {
             .unwrap_or(32768) as usize;
         let n_embd = file.meta_u32(&format!("{arch}.embedding_length"))? as usize;
         let n_ff = file.meta_u32(&format!("{arch}.feed_forward_length"))? as usize;
-        let n_heads = file.meta_u32(&format!("{arch}.attention.head_count"))? as usize;
+        let n_heads = file.meta_u32_any(&format!("{arch}.attention.head_count"))? as usize;
         let n_kv_heads = file
-            .meta_u32(&format!("{arch}.attention.head_count_kv"))
+            .meta_u32_any(&format!("{arch}.attention.head_count_kv"))
             .unwrap_or(n_heads as u32) as usize;
+        let kv_heads_per_layer = file
+            .meta_u32_list(&format!("{arch}.attention.head_count_kv"))
+            .filter(|v| v.len() > 1)
+            .map(|v| v.into_iter().map(|x| x as usize).collect::<Vec<_>>());
+        let sliding_window = file
+            .meta_u32(&format!("{arch}.attention.sliding_window"))
+            .ok()
+            .map(|v| v as usize);
+        let sliding_window_pattern = file
+            .meta_u32_list(&format!("{arch}.attention.sliding_window_pattern"))
+            .filter(|v| v.len() > 1)
+            .map(|v| v.into_iter().map(|x| (x != 0) as u8).collect::<Vec<_>>());
+        let n_experts = file
+            .meta_u32(&format!("{arch}.expert_count"))
+            .ok()
+            .map(|v| v as usize);
+        let n_experts_used = file
+            .meta_u32(&format!("{arch}.expert_used_count"))
+            .ok()
+            .map(|v| v as usize);
+        let loop_count = file
+            .meta_u32(&format!("{arch}.loop.count"))
+            .ok()
+            .map(|v| v as usize);
+        let loop_start = file
+            .meta_u32(&format!("{arch}.loop.start"))
+            .ok()
+            .map(|v| v as usize);
+        let loop_end = file
+            .meta_u32(&format!("{arch}.loop.end"))
+            .ok()
+            .map(|v| v as usize);
         let rope_freq_base = file
             .meta_f32(&format!("{arch}.rope.freq_base"))
             .unwrap_or(10000.0);
@@ -668,6 +856,98 @@ impl ModelConfig {
             rope_freq_base,
             rms_eps,
             tied_embeddings,
+            kv_heads_per_layer,
+            sliding_window,
+            sliding_window_pattern,
+            n_experts,
+            n_experts_used,
+            loop_count,
+            loop_start,
+            loop_end,
         })
+    }
+}
+
+#[cfg(test)]
+mod kv_budget_tests {
+    use super::*;
+
+    fn cfg() -> ModelConfig {
+        ModelConfig {
+            architecture: "test".to_string(),
+            n_layers: 24,
+            context_length: 1 << 20,
+            n_embd: 2304,
+            n_ff: 1152,
+            n_heads: 24,
+            n_kv_heads: 8,
+            head_dim: 128,
+            vocab_size: 200058,
+            rope_freq_base: 10000.0,
+            rms_eps: 1e-6,
+            tied_embeddings: false,
+            kv_heads_per_layer: None,
+            sliding_window: None,
+            sliding_window_pattern: None,
+            n_experts: Some(128),
+            n_experts_used: Some(8),
+            loop_count: None,
+            loop_start: None,
+            loop_end: None,
+        }
+    }
+
+    #[test]
+    fn uniform_full_attention_counts_every_layer() {
+        let b = cfg().kv_budget();
+        assert_eq!(b.full_slots, 24);
+        assert_eq!(b.windowed_slots, 0);
+        // 24 layers x 8 kv heads x (128 K + 128 V)
+        assert_eq!(b.full_bytes_per_token, 24 * 8 * 256);
+    }
+
+    #[test]
+    fn inkling_pattern_keeps_only_four_layers_full() {
+        // layer 5, 11, 17, 23 are full-history; 6..18 runs three times.
+        let mut c = cfg();
+        c.sliding_window = Some(1024);
+        c.sliding_window_pattern = Some(
+            (0..24)
+                .map(|l| u8::from(!matches!(l, 5 | 11 | 17 | 23)))
+                .collect(),
+        );
+        c.loop_count = Some(3);
+        c.loop_start = Some(6);
+        c.loop_end = Some(18);
+        let b = c.kv_budget();
+        // 48 slots: 24 layers + 12 looped layers x 2 extra passes.
+        assert_eq!(b.slots, 48);
+        // Layers 11 and 17 are full-history *and* inside the loop, so they get three
+        // caches each; layers 5 and 23 get one. 1 + 3 + 3 + 1 = 8.
+        assert_eq!(b.full_slots, 8);
+        assert_eq!(b.windowed_slots, 40);
+        assert_eq!(b.full_bytes_per_token, 8 * 8 * 256);
+        // Windowed slots stop at 1024 positions, so they are a constant.
+        assert_eq!(b.windowed_bytes, 40 * 8 * 256);
+        assert_eq!(b.total_bytes(1024 * 1024, 1), b.total_bytes(1 << 20, 1));
+        assert_eq!(
+            b.total_bytes(200_000, 1),
+            b.full_bytes_per_token * 200_000 + b.windowed_bytes * 1024
+        );
+    }
+
+    #[test]
+    fn max_ctx_inverts_total_bytes() {
+        let mut c = cfg();
+        c.sliding_window = Some(1024);
+        c.sliding_window_pattern = Some(vec![1; 24]);
+        let b = c.kv_budget();
+        let room = 3 * (1u64 << 30);
+        for elem in [4u64, 2, 1] {
+            let ctx = b.max_ctx(room, elem).min(c.context_length);
+            assert!(b.total_bytes(ctx, elem) <= room);
+            // The next token over budget means the inverse is tight.
+            assert!(b.total_bytes(ctx + 1, elem) > room || ctx == c.context_length);
+        }
     }
 }
