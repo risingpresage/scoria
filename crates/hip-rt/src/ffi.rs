@@ -1,6 +1,6 @@
 #![allow(non_camel_case_types, non_snake_case, dead_code)]
 
-use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
+use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::mem::{size_of, transmute_copy};
 use std::sync::OnceLock;
 
@@ -31,7 +31,7 @@ pub const HIP_DEVICE_PROP_R0600_GCN_ARCH_OFFSET: usize = 1160;
 const RTLD_NOW: c_int = 0x2;
 const RTLD_GLOBAL: c_int = 0x100;
 
-extern "C" {
+unsafe extern "C" {
     fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
     fn dlerror() -> *const c_char;
@@ -128,83 +128,87 @@ unsafe impl Send for HipApi {}
 unsafe impl Sync for HipApi {}
 
 unsafe fn load_sym<T: Copy>(handle: *mut c_void, name: &str) -> Result<T, String> {
-    assert_eq!(size_of::<T>(), size_of::<*mut c_void>());
-    let cname = CString::new(name).map_err(|e| e.to_string())?;
-    let ptr = dlsym(handle, cname.as_ptr());
-    if ptr.is_null() {
-        let err = dlerror();
-        let msg = if err.is_null() {
-            "symbol not found".to_string()
-        } else {
-            CStr::from_ptr(err).to_string_lossy().into_owned()
-        };
-        return Err(format!("dlsym({name}) failed: {msg}"));
+    unsafe {
+        assert_eq!(size_of::<T>(), size_of::<*mut c_void>());
+        let cname = CString::new(name).map_err(|e| e.to_string())?;
+        let ptr = dlsym(handle, cname.as_ptr());
+        if ptr.is_null() {
+            let err = dlerror();
+            let msg = if err.is_null() {
+                "symbol not found".to_string()
+            } else {
+                CStr::from_ptr(err).to_string_lossy().into_owned()
+            };
+            return Err(format!("dlsym({name}) failed: {msg}"));
+        }
+        Ok(transmute_copy::<*mut c_void, T>(&ptr))
     }
-    Ok(transmute_copy::<*mut c_void, T>(&ptr))
 }
 
 unsafe fn load_hip_api() -> Result<HipApi, String> {
-    let mut candidates = Vec::new();
-    if let Ok(rocm_path) = std::env::var("ROCM_PATH") {
-        candidates.push(format!("{rocm_path}/lib/libamdhip64.so"));
-    }
-    candidates.push("/opt/rocm/lib/libamdhip64.so".to_string());
-    candidates.push("libamdhip64.so.7".to_string());
-    candidates.push("libamdhip64.so".to_string());
-
-    let mut handle = std::ptr::null_mut();
-    let mut last_err = String::new();
-    for cand in &candidates {
-        let cname = CString::new(cand.as_str()).map_err(|e| e.to_string())?;
-        handle = dlopen(cname.as_ptr(), RTLD_NOW | RTLD_GLOBAL);
-        if !handle.is_null() {
-            break;
+    unsafe {
+        let mut candidates = Vec::new();
+        if let Ok(rocm_path) = std::env::var("ROCM_PATH") {
+            candidates.push(format!("{rocm_path}/lib/libamdhip64.so"));
         }
-        let err = dlerror();
-        if !err.is_null() {
-            last_err = CStr::from_ptr(err).to_string_lossy().into_owned();
-        }
-    }
-    if handle.is_null() {
-        return Err(format!(
-            "failed to dlopen libamdhip64.so (last error: {last_err})"
-        ));
-    }
+        candidates.push("/opt/rocm/lib/libamdhip64.so".to_string());
+        candidates.push("libamdhip64.so.7".to_string());
+        candidates.push("libamdhip64.so".to_string());
 
-    Ok(HipApi {
-        _handle: handle,
-        hipSetDevice: load_sym(handle, "hipSetDevice")?,
-        hipDeviceSynchronize: load_sym(handle, "hipDeviceSynchronize")?,
-        hipGetErrorString: load_sym(handle, "hipGetErrorString")?,
-        hipMemGetInfo: load_sym(handle, "hipMemGetInfo")?,
-        hipDeviceGetAttribute: load_sym(handle, "hipDeviceGetAttribute")?,
-        hipGetDevicePropertiesR0600: load_sym(handle, "hipGetDevicePropertiesR0600")?,
-        hipMalloc: load_sym(handle, "hipMalloc")?,
-        hipFree: load_sym(handle, "hipFree")?,
-        hipHostMalloc: load_sym(handle, "hipHostMalloc")?,
-        hipHostFree: load_sym(handle, "hipHostFree")?,
-        hipMemcpy: load_sym(handle, "hipMemcpy")?,
-        hipMemcpyAsync: load_sym(handle, "hipMemcpyAsync")?,
-        hipMemsetAsync: load_sym(handle, "hipMemsetAsync")?,
-        hipStreamCreateWithFlags: load_sym(handle, "hipStreamCreateWithFlags")?,
-        hipStreamSynchronize: load_sym(handle, "hipStreamSynchronize")?,
-        hipStreamDestroy: load_sym(handle, "hipStreamDestroy")?,
-        hipEventCreate: load_sym(handle, "hipEventCreate")?,
-        hipEventRecord: load_sym(handle, "hipEventRecord")?,
-        hipEventSynchronize: load_sym(handle, "hipEventSynchronize")?,
-        hipEventElapsedTime: load_sym(handle, "hipEventElapsedTime")?,
-        hipEventDestroy: load_sym(handle, "hipEventDestroy")?,
-        hipModuleLoadData: load_sym(handle, "hipModuleLoadData")?,
-        hipModuleGetFunction: load_sym(handle, "hipModuleGetFunction")?,
-        hipModuleLaunchKernel: load_sym(handle, "hipModuleLaunchKernel")?,
-        hipModuleUnload: load_sym(handle, "hipModuleUnload")?,
-        hipStreamBeginCapture: load_sym(handle, "hipStreamBeginCapture")?,
-        hipStreamEndCapture: load_sym(handle, "hipStreamEndCapture")?,
-        hipGraphInstantiate: load_sym(handle, "hipGraphInstantiate")?,
-        hipGraphLaunch: load_sym(handle, "hipGraphLaunch")?,
-        hipGraphDestroy: load_sym(handle, "hipGraphDestroy")?,
-        hipGraphExecDestroy: load_sym(handle, "hipGraphExecDestroy")?,
-    })
+        let mut handle = std::ptr::null_mut();
+        let mut last_err = String::new();
+        for cand in &candidates {
+            let cname = CString::new(cand.as_str()).map_err(|e| e.to_string())?;
+            handle = dlopen(cname.as_ptr(), RTLD_NOW | RTLD_GLOBAL);
+            if !handle.is_null() {
+                break;
+            }
+            let err = dlerror();
+            if !err.is_null() {
+                last_err = CStr::from_ptr(err).to_string_lossy().into_owned();
+            }
+        }
+        if handle.is_null() {
+            return Err(format!(
+                "failed to dlopen libamdhip64.so (last error: {last_err})"
+            ));
+        }
+
+        Ok(HipApi {
+            _handle: handle,
+            hipSetDevice: load_sym(handle, "hipSetDevice")?,
+            hipDeviceSynchronize: load_sym(handle, "hipDeviceSynchronize")?,
+            hipGetErrorString: load_sym(handle, "hipGetErrorString")?,
+            hipMemGetInfo: load_sym(handle, "hipMemGetInfo")?,
+            hipDeviceGetAttribute: load_sym(handle, "hipDeviceGetAttribute")?,
+            hipGetDevicePropertiesR0600: load_sym(handle, "hipGetDevicePropertiesR0600")?,
+            hipMalloc: load_sym(handle, "hipMalloc")?,
+            hipFree: load_sym(handle, "hipFree")?,
+            hipHostMalloc: load_sym(handle, "hipHostMalloc")?,
+            hipHostFree: load_sym(handle, "hipHostFree")?,
+            hipMemcpy: load_sym(handle, "hipMemcpy")?,
+            hipMemcpyAsync: load_sym(handle, "hipMemcpyAsync")?,
+            hipMemsetAsync: load_sym(handle, "hipMemsetAsync")?,
+            hipStreamCreateWithFlags: load_sym(handle, "hipStreamCreateWithFlags")?,
+            hipStreamSynchronize: load_sym(handle, "hipStreamSynchronize")?,
+            hipStreamDestroy: load_sym(handle, "hipStreamDestroy")?,
+            hipEventCreate: load_sym(handle, "hipEventCreate")?,
+            hipEventRecord: load_sym(handle, "hipEventRecord")?,
+            hipEventSynchronize: load_sym(handle, "hipEventSynchronize")?,
+            hipEventElapsedTime: load_sym(handle, "hipEventElapsedTime")?,
+            hipEventDestroy: load_sym(handle, "hipEventDestroy")?,
+            hipModuleLoadData: load_sym(handle, "hipModuleLoadData")?,
+            hipModuleGetFunction: load_sym(handle, "hipModuleGetFunction")?,
+            hipModuleLaunchKernel: load_sym(handle, "hipModuleLaunchKernel")?,
+            hipModuleUnload: load_sym(handle, "hipModuleUnload")?,
+            hipStreamBeginCapture: load_sym(handle, "hipStreamBeginCapture")?,
+            hipStreamEndCapture: load_sym(handle, "hipStreamEndCapture")?,
+            hipGraphInstantiate: load_sym(handle, "hipGraphInstantiate")?,
+            hipGraphLaunch: load_sym(handle, "hipGraphLaunch")?,
+            hipGraphDestroy: load_sym(handle, "hipGraphDestroy")?,
+            hipGraphExecDestroy: load_sym(handle, "hipGraphExecDestroy")?,
+        })
+    }
 }
 
 static HIP_API: OnceLock<Result<HipApi, String>> = OnceLock::new();

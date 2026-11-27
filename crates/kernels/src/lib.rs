@@ -100,8 +100,8 @@ pub mod infer_names {
 #[cfg(test)]
 mod tests {
     use super::{
-        GATE_KERNELS_GFX1201_HSACO, GATE_KERNELS_GFX942_HSACO, INFER_KERNELS_GFX1201_HSACO,
-        INFER_KERNELS_GFX942_HSACO,
+        GATE_KERNELS_GFX942_HSACO, GATE_KERNELS_GFX1201_HSACO, INFER_KERNELS_GFX942_HSACO,
+        INFER_KERNELS_GFX1201_HSACO,
     };
     use std::fs;
     use std::process::Command;

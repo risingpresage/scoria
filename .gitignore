@@ -3,3 +3,5 @@
 .gate_tmp*
 *.swp
 /harness/gpu-prices.json
+result
+.direnv/

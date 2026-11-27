@@ -8,8 +8,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process;
 
-use scoria_engine::qwen2::{top_k_logits, LayerTap, Qwen2Model};
 use scoria_engine::EngineContext;
+use scoria_engine::qwen2::{LayerTap, Qwen2Model, top_k_logits};
 use scoria_gguf::{BpeTokenizer, GgufFile, ModelConfig};
 
 fn usage() -> ! {

@@ -1,0 +1,6 @@
+[toolchain]
+# Pinned so every checkout compiles kernels and runs clippy with the same compiler.
+# Bump deliberately: `rustup update` moves `stable`, this file does not.
+channel = "1.100.0"
+components = ["clippy", "rustfmt", "rust-src"]
+profile = "minimal"

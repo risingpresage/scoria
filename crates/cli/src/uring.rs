@@ -1,6 +1,6 @@
 #![allow(non_camel_case_types, dead_code)]
 
-use std::ffi::{c_int, c_long, c_void, CString};
+use std::ffi::{CString, c_int, c_long, c_void};
 use std::mem::{size_of, zeroed};
 use std::path::Path;
 use std::ptr;
@@ -99,7 +99,7 @@ const _: () = assert!(size_of::<IoUringParams>() == 120);
 const _: () = assert!(size_of::<IoUringSqe>() == 64);
 const _: () = assert!(size_of::<IoUringCqe>() == 16);
 
-extern "C" {
+unsafe extern "C" {
     fn syscall(num: c_long, ...) -> c_long;
     fn mmap(
         addr: *mut c_void,

@@ -1,7 +1,7 @@
 mod alloc_guard;
 mod ffi;
 
-use std::ffi::{c_void, CStr, CString};
+use std::ffi::{CStr, CString, c_void};
 use std::fmt;
 use std::ptr;
 
@@ -671,24 +671,26 @@ impl HipModule {
         stream: &HipStream,
         params: &mut [*mut c_void],
     ) -> HipResult<()> {
-        let hip = get_api("hipModuleLaunchKernel")?;
-        check(
-            hip,
-            (hip.hipModuleLaunchKernel)(
-                handle.raw,
-                grid[0],
-                grid[1],
-                grid[2],
-                block[0],
-                block[1],
-                block[2],
-                shared_mem_bytes,
-                stream.raw(),
-                params.as_mut_ptr(),
-                ptr::null_mut(),
-            ),
-            "hipModuleLaunchKernel",
-        )
+        unsafe {
+            let hip = get_api("hipModuleLaunchKernel")?;
+            check(
+                hip,
+                (hip.hipModuleLaunchKernel)(
+                    handle.raw,
+                    grid[0],
+                    grid[1],
+                    grid[2],
+                    block[0],
+                    block[1],
+                    block[2],
+                    shared_mem_bytes,
+                    stream.raw(),
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "hipModuleLaunchKernel",
+            )
+        }
     }
 
     pub fn function(&self, name: &str) -> HipResult<HipFunction<'_>> {
@@ -738,24 +740,26 @@ impl<'a> HipFunction<'a> {
         stream: &HipStream,
         params: &mut [*mut c_void],
     ) -> HipResult<()> {
-        let hip = get_api("hipModuleLaunchKernel")?;
-        check(
-            hip,
-            (hip.hipModuleLaunchKernel)(
-                self.raw,
-                grid[0],
-                grid[1],
-                grid[2],
-                block[0],
-                block[1],
-                block[2],
-                shared_mem_bytes,
-                stream.raw(),
-                params.as_mut_ptr(),
-                ptr::null_mut(),
-            ),
-            "hipModuleLaunchKernel",
-        )
+        unsafe {
+            let hip = get_api("hipModuleLaunchKernel")?;
+            check(
+                hip,
+                (hip.hipModuleLaunchKernel)(
+                    self.raw,
+                    grid[0],
+                    grid[1],
+                    grid[2],
+                    block[0],
+                    block[1],
+                    block[2],
+                    shared_mem_bytes,
+                    stream.raw(),
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "hipModuleLaunchKernel",
+            )
+        }
     }
 }
 

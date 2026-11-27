@@ -7,7 +7,7 @@ use std::time::Instant;
 use scoria_engine::EngineContext;
 use scoria_gguf::QuantCodec;
 use scoria_hip_rt::{
-    device_synchronize, mem_info, DeviceBuf, HipEvent, HipResult, HipStream, PinnedBuf,
+    DeviceBuf, HipEvent, HipResult, HipStream, PinnedBuf, device_synchronize, mem_info,
 };
 use scoria_kernels::names;
 
@@ -384,24 +384,23 @@ pub fn run(quick: bool) -> Result<(), Box<dyn std::error::Error>> {
     if nm_dir.is_dir() {
         let s980_path = nm_dir.join(".gate_tmp_980.bin");
         let _s980_guard = TempFileGuard(s980_path.clone());
-        if write_incompressible_file(&s980_path, nvme_bytes).is_ok() {
-            if let Ok(gbps) = uring::bench_seq_read_odirect(&s980_path, nvme_bytes, chunk_bytes, 32)
-            {
-                s980_gbps = Some(gbps);
-                let t0 = Instant::now();
-                let (r1, r2) = std::thread::scope(|s| {
-                    let h1 = s.spawn(|| {
-                        uring::bench_seq_read_odirect(&p31_path, nvme_bytes, chunk_bytes, 32)
-                    });
-                    let h2 = s.spawn(|| {
-                        uring::bench_seq_read_odirect(&s980_path, nvme_bytes, chunk_bytes, 32)
-                    });
-                    (h1.join().unwrap(), h2.join().unwrap())
+        if write_incompressible_file(&s980_path, nvme_bytes).is_ok()
+            && let Ok(gbps) = uring::bench_seq_read_odirect(&s980_path, nvme_bytes, chunk_bytes, 32)
+        {
+            s980_gbps = Some(gbps);
+            let t0 = Instant::now();
+            let (r1, r2) = std::thread::scope(|s| {
+                let h1 = s.spawn(|| {
+                    uring::bench_seq_read_odirect(&p31_path, nvme_bytes, chunk_bytes, 32)
                 });
-                let wall = t0.elapsed().as_secs_f64();
-                if r1.is_ok() && r2.is_ok() {
-                    dual_nvme_gbps = Some((2.0 * nvme_bytes as f64) / wall / 1e9);
-                }
+                let h2 = s.spawn(|| {
+                    uring::bench_seq_read_odirect(&s980_path, nvme_bytes, chunk_bytes, 32)
+                });
+                (h1.join().unwrap(), h2.join().unwrap())
+            });
+            let wall = t0.elapsed().as_secs_f64();
+            if r1.is_ok() && r2.is_ok() {
+                dual_nvme_gbps = Some((2.0 * nvme_bytes as f64) / wall / 1e9);
             }
         }
     }
@@ -468,16 +467,26 @@ pub fn run(quick: bool) -> Result<(), Box<dyn std::error::Error>> {
     fs::write(baseline_path, &json)?;
 
     println!("\n=== scoria Phase 0 gfx1201 Hardware Gate ===");
-    println!("Soak (ROCm 7.16):     {soak_passes}/{soak_cycles} cycles passed (sizes={sizes_gib:?} GiB, {soak_total_ms:.1} ms)");
-    println!("VRAM Stream Default:  {stream_default_gbps:.1} GB/s | L3 probe after: {l3_after_default_gbps:.1} GB/s (baseline {l3_baseline_gbps:.1} GB/s)");
-    println!("VRAM Stream TH_NT:    {stream_nt_gbps:.1} GB/s | L3 probe after: {l3_after_nt_gbps:.1} GB/s");
-    println!("WMMA FP16 / FP8 / IU4:{wmma_f16_tflops:.1} TFLOPS / {wmma_fp8_tflops:.1} TFLOPS / {wmma_iu4_tops:.1} TOPS");
+    println!(
+        "Soak (ROCm 7.16):     {soak_passes}/{soak_cycles} cycles passed (sizes={sizes_gib:?} GiB, {soak_total_ms:.1} ms)"
+    );
+    println!(
+        "VRAM Stream Default:  {stream_default_gbps:.1} GB/s | L3 probe after: {l3_after_default_gbps:.1} GB/s (baseline {l3_baseline_gbps:.1} GB/s)"
+    );
+    println!(
+        "VRAM Stream TH_NT:    {stream_nt_gbps:.1} GB/s | L3 probe after: {l3_after_nt_gbps:.1} GB/s"
+    );
+    println!(
+        "WMMA FP16 / FP8 / IU4:{wmma_f16_tflops:.1} TFLOPS / {wmma_fp8_tflops:.1} TFLOPS / {wmma_iu4_tops:.1} TOPS"
+    );
     println!(
         "SWMMAC FP16 / FP8:    {swmmac_f16_tflops:.1} TFLOPS ({:.2}x) / {swmmac_fp8_tflops:.1} TFLOPS ({:.2}x)",
         swmmac_f16_tflops / wmma_f16_tflops,
         swmmac_fp8_tflops / wmma_fp8_tflops
     );
-    println!("LUT permlane vs LDS:  {lut_permlane_glups:.1} vs {lut_lds_glups:.1} G-lookups/s | BITCOS: {bitcos_glups:.1} G-weights/s");
+    println!(
+        "LUT permlane vs LDS:  {lut_permlane_glups:.1} vs {lut_lds_glups:.1} G-lookups/s | BITCOS: {bitcos_glups:.1} G-weights/s"
+    );
     println!("PCIe Pinned H2D/D2H:  {pcie_h2d_gbps:.2} / {pcie_d2h_gbps:.2} GB/s");
     println!(
         "NVMe io_uring O_DIRECT: P31={p31_gbps:.3} GB/s | 980={} GB/s | Dual={} GB/s",

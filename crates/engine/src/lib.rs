@@ -3,7 +3,7 @@ pub mod qwen2;
 
 use scoria_gguf::QuantCodec;
 use scoria_hip_rt::{
-    detect_arch, set_device, warp_size, HipModule, HipResult, KernelHandle, TargetArch,
+    HipModule, HipResult, KernelHandle, TargetArch, detect_arch, set_device, warp_size,
 };
 use scoria_kernels::{gate_hsaco_for_arch, infer_hsaco_for_arch, infer_names};
 

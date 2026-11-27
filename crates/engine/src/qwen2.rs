@@ -1720,30 +1720,29 @@ fn launch_rmsnorm(
 /// GEMV group, and the Q4_K weights are the whole traffic budget anyway. `SCORIA_Q4K_Q8=1`
 /// opts back in for experiments.
 fn q8_decode_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("SCORIA_Q4K_Q8") {
-        Ok(v) => v != "0",
-        Err(_) => false,
-    })
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("SCORIA_Q4K_Q8").is_ok_and(|v| v != "0"));
+    *ENABLED
 }
 
 /// `SCORIA_PREFILL_FP32=1` forces prefill onto the scalar FP32 GEMM path, bypassing
 /// the FP16 WMMA tile. Used to attribute parity deltas to FP16 prefill rounding.
 fn prefill_fp32_forced() -> bool {
-    static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FORCED.get_or_init(|| std::env::var("SCORIA_PREFILL_FP32").is_ok_and(|v| v != "0"))
+    static FORCED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("SCORIA_PREFILL_FP32").is_ok_and(|v| v != "0"));
+    *FORCED
 }
 
 /// `SCORIA_Q4K_ROWS=2|4|8` forces the Q4_K GEMV rows per workgroup; unset keeps the
 /// adaptive default. Used by the C-A-C sweep in `harness/ledger.jsonl`.
 fn q4k_rows_override() -> Option<u32> {
-    static OVERRIDE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
-    *OVERRIDE.get_or_init(|| {
+    static OVERRIDE: std::sync::LazyLock<Option<u32>> = std::sync::LazyLock::new(|| {
         std::env::var("SCORIA_Q4K_ROWS")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .filter(|r| matches!(r, 2 | 4 | 8))
-    })
+    });
+    *OVERRIDE
 }
 
 #[allow(clippy::too_many_arguments)]

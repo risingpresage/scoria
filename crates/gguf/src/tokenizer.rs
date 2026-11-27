@@ -127,10 +127,11 @@ impl BpeTokenizer {
 
     pub fn encode(&self, text: &str, add_bos: bool) -> Vec<u32> {
         let mut out = Vec::new();
-        if add_bos && self.add_bos_token {
-            if let Some(bos) = self.bos_token_id {
-                out.push(bos);
-            }
+        if add_bos
+            && self.add_bos_token
+            && let Some(bos) = self.bos_token_id
+        {
+            out.push(bos);
         }
 
         let mut pos = 0usize;
@@ -184,11 +185,10 @@ impl BpeTokenizer {
                         if let Some(&rank) = self
                             .merge_ranks
                             .get(&(word[i].clone(), word[i + 1].clone()))
+                            && rank < best_rank
                         {
-                            if rank < best_rank {
-                                best_rank = rank;
-                                best_idx = Some(i);
-                            }
+                            best_rank = rank;
+                            best_idx = Some(i);
                         }
                     }
                     let Some(idx) = best_idx else {
@@ -297,22 +297,23 @@ pub fn qwen2_pretokenize(text: &str) -> Vec<&str> {
             i += end;
             continue;
         }
-        if c0 != '\r' && c0 != '\n' && !c0.is_numeric() {
-            if let Some((_, c1)) = chars.next() {
-                if c1.is_alphabetic() {
-                    let mut end = c0_len + c1.len_utf8();
-                    for (idx, ch) in chars {
-                        if ch.is_alphabetic() {
-                            end = idx + ch.len_utf8();
-                        } else {
-                            break;
-                        }
-                    }
-                    pieces.push(&rest[..end]);
-                    i += end;
-                    continue;
+        if c0 != '\r'
+            && c0 != '\n'
+            && !c0.is_numeric()
+            && let Some((_, c1)) = chars.next()
+            && c1.is_alphabetic()
+        {
+            let mut end = c0_len + c1.len_utf8();
+            for (idx, ch) in chars {
+                if ch.is_alphabetic() {
+                    end = idx + ch.len_utf8();
+                } else {
+                    break;
                 }
             }
+            pieces.push(&rest[..end]);
+            i += end;
+            continue;
         }
 
         // 3. \p{N} (single numeric character)
@@ -347,33 +348,32 @@ pub fn qwen2_pretokenize(text: &str) -> Vec<&str> {
             i += end;
             continue;
         }
-        if c0 == ' ' {
-            if let Some(c1) = rest[c0_len..].chars().next() {
-                if is_sym(c1) {
-                    let mut end = c0_len + c1.len_utf8();
-                    let mut it = rest[end..].char_indices().peekable();
-                    let base = end;
-                    while let Some(&(rel, ch)) = it.peek() {
-                        if is_sym(ch) {
-                            end = base + rel + ch.len_utf8();
-                            it.next();
-                        } else {
-                            break;
-                        }
-                    }
-                    while let Some(&(rel, ch)) = it.peek() {
-                        if ch == '\r' || ch == '\n' {
-                            end = base + rel + ch.len_utf8();
-                            it.next();
-                        } else {
-                            break;
-                        }
-                    }
-                    pieces.push(&rest[..end]);
-                    i += end;
-                    continue;
+        if c0 == ' '
+            && let Some(c1) = rest[c0_len..].chars().next()
+            && is_sym(c1)
+        {
+            let mut end = c0_len + c1.len_utf8();
+            let mut it = rest[end..].char_indices().peekable();
+            let base = end;
+            while let Some(&(rel, ch)) = it.peek() {
+                if is_sym(ch) {
+                    end = base + rel + ch.len_utf8();
+                    it.next();
+                } else {
+                    break;
                 }
             }
+            while let Some(&(rel, ch)) = it.peek() {
+                if ch == '\r' || ch == '\n' {
+                    end = base + rel + ch.len_utf8();
+                    it.next();
+                } else {
+                    break;
+                }
+            }
+            pieces.push(&rest[..end]);
+            i += end;
+            continue;
         }
 
         // 5/6/7. Whitespace runs: \s*[\r\n]+ | \s+(?!\S) | \s+
@@ -433,7 +433,9 @@ mod tests {
     fn qwen2_pretokenize_patterns() {
         assert_eq!(
             qwen2_pretokenize("Hello, world! Don't stop 2026."),
-            vec!["Hello", ",", " world", "!", " Don", "'t", " stop", " ", "2", "0", "2", "6", "."]
+            vec![
+                "Hello", ",", " world", "!", " Don", "'t", " stop", " ", "2", "0", "2", "6", "."
+            ]
         );
         assert_eq!(
             qwen2_pretokenize("a   b\n\nc"),
