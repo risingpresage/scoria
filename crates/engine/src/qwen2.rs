@@ -564,6 +564,7 @@ impl Qwen2Model {
                 let w_k = self.store.get(lw.attn_k);
                 let w_v = self.store.get(lw.attn_v);
                 let use_q8_qkv = m == 1
+                    && q8_decode_enabled()
                     && self.config.n_embd.is_multiple_of(256)
                     && [w_q, w_k, w_v].iter().any(|w| w.ggml_type == GgmlType::Q4K);
                 if use_q8_qkv {
@@ -582,6 +583,7 @@ impl Qwen2Model {
                     (w_v, v_bias, self.scratch.v.as_ptr(), kv_dim),
                 ] {
                     if m == 1
+                        && q8_decode_enabled()
                         && wt.ggml_type == GgmlType::Q4K
                         && self.config.n_embd.is_multiple_of(256)
                     {
@@ -720,7 +722,11 @@ impl Qwen2Model {
                 )?;
 
                 let wo = self.store.get(lw.attn_output);
-                if m == 1 && wo.ggml_type == GgmlType::Q4K && q_dim.is_multiple_of(256) {
+                if m == 1
+                    && q8_decode_enabled()
+                    && wo.ggml_type == GgmlType::Q4K
+                    && q_dim.is_multiple_of(256)
+                {
                     launch_quantize_q8_1(
                         ctx,
                         &self.stream,
@@ -774,6 +780,7 @@ impl Qwen2Model {
                 let w_gate = self.store.get(lw.ffn_gate);
                 let w_up = self.store.get(lw.ffn_up);
                 if m == 1
+                    && q8_decode_enabled()
                     && w_gate.ggml_type == GgmlType::Q4K
                     && w_up.ggml_type == GgmlType::Q4K
                     && self.config.n_embd.is_multiple_of(256)
@@ -828,7 +835,11 @@ impl Qwen2Model {
                     )?;
                 }
                 let wd = self.store.get(lw.ffn_down);
-                if m == 1 && wd.ggml_type == GgmlType::Q4K && self.config.n_ff.is_multiple_of(256) {
+                if m == 1
+                    && q8_decode_enabled()
+                    && wd.ggml_type == GgmlType::Q4K
+                    && self.config.n_ff.is_multiple_of(256)
+                {
                     launch_quantize_q8_1(
                         ctx,
                         &self.stream,
@@ -1195,7 +1206,8 @@ impl Qwen2Model {
             let w_q = self.store.get(lw.attn_q);
             let w_k = self.store.get(lw.attn_k);
             let w_v = self.store.get(lw.attn_v);
-            let use_q8_qkv = self.config.n_embd.is_multiple_of(256)
+            let use_q8_qkv = q8_decode_enabled()
+                && self.config.n_embd.is_multiple_of(256)
                 && [w_q, w_k, w_v].iter().any(|w| w.ggml_type == GgmlType::Q4K);
             if use_q8_qkv {
                 timed!(
@@ -1229,7 +1241,10 @@ impl Qwen2Model {
                             self.config.n_embd,
                         )
                     );
-                } else if wt.ggml_type == GgmlType::Q4K && self.config.n_embd.is_multiple_of(256) {
+                } else if q8_decode_enabled()
+                    && wt.ggml_type == GgmlType::Q4K
+                    && self.config.n_embd.is_multiple_of(256)
+                {
                     timed!(
                         gemv_other_ms,
                         launch_linear_q4_k_q8_1(
@@ -1310,7 +1325,7 @@ impl Qwen2Model {
             );
 
             let wo = self.store.get(lw.attn_output);
-            if wo.ggml_type == GgmlType::Q4K && q_dim.is_multiple_of(256) {
+            if q8_decode_enabled() && wo.ggml_type == GgmlType::Q4K && q_dim.is_multiple_of(256) {
                 timed!(
                     gemv_other_ms,
                     launch_quantize_q8_1(
@@ -1367,7 +1382,8 @@ impl Qwen2Model {
 
             let w_gate = self.store.get(lw.ffn_gate);
             let w_up = self.store.get(lw.ffn_up);
-            if w_gate.ggml_type == GgmlType::Q4K
+            if q8_decode_enabled()
+                && w_gate.ggml_type == GgmlType::Q4K
                 && w_up.ggml_type == GgmlType::Q4K
                 && self.config.n_embd.is_multiple_of(256)
             {
@@ -1442,7 +1458,10 @@ impl Qwen2Model {
                         self.config.n_ff,
                     )
                 );
-            } else if wd.ggml_type == GgmlType::Q4K && self.config.n_ff.is_multiple_of(256) {
+            } else if q8_decode_enabled()
+                && wd.ggml_type == GgmlType::Q4K
+                && self.config.n_ff.is_multiple_of(256)
+            {
                 timed!(
                     gemv_other_ms,
                     launch_quantize_q8_1(
@@ -1652,6 +1671,25 @@ fn launch_rmsnorm(
         n_embd as u32,
         eps
     )
+}
+
+/// Q8_1 integer-dot decode GEMV switch, off by default.
+///
+/// Measured A/B (decode tok/s, 2 runs each, `--ignore-eos`, 65 tokens):
+///   8B (k=4096)  99.73 on  -> 101.64 off   (+1.9%)
+///   7B (k=3584) 113.10 on  -> 113.68 off   (+0.5%)
+///   4B (k=2560) 157.88 on  -> 157.25 off   (wash)
+///   0.5B (k=896) 427.4 on  -> 430.5 off    (+0.7%)
+///
+/// Packing x to int8 saves activation traffic but costs an extra quantise launch per
+/// GEMV group, and the Q4_K weights are the whole traffic budget anyway. `SCORIA_Q4K_Q8=1`
+/// opts back in for experiments.
+fn q8_decode_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("SCORIA_Q4K_Q8") {
+        Ok(v) => v != "0",
+        Err(_) => false,
+    })
 }
 
 /// `SCORIA_PREFILL_FP32=1` forces prefill onto the scalar FP32 GEMM path, bypassing

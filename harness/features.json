@@ -68,6 +68,15 @@
       "observed": "DeepSeek-R1-Distill-Qwen-7B-Q4_K_M: decode=111.94 tok/s (2.83x Phase 1), prefill(20)=673.11 tok/s (1.29x llama.cpp Vulkan 521.05), prefill(128)=2079.89 tok/s (31.27x Phase 1); Qwen2.5-0.5B-Q4_K_M: decode=386.22 tok/s, prefill(26)=4356.28 tok/s, prefill(128)=15534.62 tok/s; parity cos=0.999413 (0.5B, 32/32) and 0.999913 (7B, 21/32, top5 exact)"
     },
     {
+      "id": "phase2d-q8-decode-off",
+      "phase": 2,
+      "title": "Measure and retire the Q8_1 integer-dot decode GEMV from the default path",
+      "status": "verified",
+      "verify": "./scripts/check.sh && python3 scripts/bench_cac.py --tag phase2d_q8_off --trials 3",
+      "observed": "A/B decode tok/s (2 runs each): 8B 99.73 on -> 101.64 off (+1.9%), 7B 113.10 -> 113.68, 4B 157.88 -> 157.25 (wash), 0.5B 427.4 -> 430.5. 3-trial medians with it off: 0.5B 414.90 / pp128 15877.16, 7B 115.20 / 2758.20, 4B 158.41 / 3973.01, 8B 100.07 / 2486.28 — every model at or above the phase2c record. Kept as `SCORIA_Q4K_Q8=1` opt-in.",
+      "note": "Packing x to int8 saves activation traffic but costs a quantise launch per GEMV group, and Q4_K weight traffic dominates decode, so the trade was negative."
+    },
+    {
       "id": "phase2c-fuse-q8-wmma-dbuf",
       "phase": 2,
       "title": "Fused qk-norm+RoPE+KV-append, Q8_1 integer-dot Q4_K GEMV with fused gate/up/SiLU, and double-buffered WMMA prefill",
