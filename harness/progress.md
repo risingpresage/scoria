@@ -292,6 +292,17 @@ One trap worth recording: the first version of the per-tensor path ran the host 
 
 The remaining host work is the `gate_up` half of those 12 layers (2/3 of their expert compute), which needs device codecs for IQ2XS, IQ2S, IQ3XXS, IQ3S and Q3K. IQ3XXS is the biggest single win (5 layers) and needs a 256-entry grid plus the 4-bit sign table.
 
+## 2026-11-28 — IQ3_XXS on the card; the projection batching attempt failed and was reverted
+**Land: IQ3_XXS device codec.** 98 bytes per 256 elements: an f16 scale, 64 bytes of 4-bit grid indices, and 32 `aux` words carrying four 7-bit sign selectors plus a 4-bit sub-block scale. The 256-entry grid and the 128-entry sign masks are **generated from `crates/gguf/src/iq_tables.rs`** rather than retyped, so a transcription slip is not possible; `tests/inkling2_gpu_iq3xxs.rs` then checks the kernel against `dequant_row_iq3_xxs` elementwise on real rows (`blk.12`/`blk.18` `ffn_gate_up_exps`, k=2304) to <=5e-5 relative.
+
+With residency extended to it, the expert set grew from 11 to 16 fully-resident layers (VRAM 10.95 -> 12.16 GiB). Perplexity stays 7.598 and GPU-vs-host stays 3.2e-5. **Decode did not measurably improve**: 0.40-0.84 s/token in the runs available (median 0.45), against 0.39-0.47 before, on a machine whose load average is ~9.5 from an unrelated ComfyUI service. Reporting a gain there would be dishonest.
+
+**Revert: m=chunk projection batching.** I implemented it — `attn_inputs` / `project_position` / `attn_finish` split (landed, behaviour-neutral, verified), a GPU path with three uploads, six launches and one synchronise, and a host `matvec_m`. It produced **wrong logits** (max |dlogit| 37.4 against the single-position path, perplexity 5.9M) and its host variant was pathologically slow (>900 s for 19 tokens). I found one real bug on the way — the two paths disagreed on the order of the six projections, `(q,k,v,rel,gate,sink)` versus `(q,k,v,gate,rel,sink)` — fixed it, and the result was still wrong.
+
+Rather than ship it, I reverted to the verified per-position path. What survives is the split, which is exactly the seam the next attempt needs, and the knowledge that the failure is *inside* the batched launch, not in the layer plumbing: chunk=1 (which uses the unbatched path) and the host-only path both agree with the oracle to 3.2e-5 at this commit.
+
+**Honest state:** decode 0.39-0.47 s/token, prefill ~1.6 s/token at chunk 8, no encode win, no projection batching, largest context run 1100 tokens.
+
 ## Parity gate calibration (cosine > 0.999 is prompt-dependent, not an implementation defect)
 - Measured the control that settles it: **llama.cpp's own Vulkan backend vs llama.cpp's own CPU backend** scores `cos = 0.997985` (`maxdiff 1.152`) on the Qwen3-4B harness chat prompt (`151644,872,198,785,…,77091,198`, `m=13`), where scoria scores `0.997652` (`maxdiff 1.103`). Both pick top1 `785`. No GPU implementation reaches 0.999 on that prompt.
 - Forcing prefill onto the scalar FP32 GEMM (`SCORIA_PREFILL_FP32=1`) changes nothing: 4B `0.997614` vs `0.997652` for FP16 WMMA, 8B `0.996415` vs `0.996404`. So the deficit is **not** FP16 WMMA rounding.

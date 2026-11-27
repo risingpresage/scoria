@@ -567,6 +567,7 @@ fn upload_if_supported(
     let handle = match info.ggml_type {
         GgmlType::NVFP4 => ctx.infer.linear_nvfp4,
         GgmlType::IQ4NL => ctx.infer.linear_iq4nl,
+        GgmlType::IQ3XXS => ctx.infer.linear_iq3_xxs,
         _ => return None,
     };
     let bytes = file.tensor_bytes(info).ok()?;
@@ -607,7 +608,15 @@ fn snapshot(t: &GpuTensor) -> ProjSnapshot {
     }
 }
 
-#[derive(Clone, Copy)]
+/// The per-position inputs to the six projections.
+struct AttnInputs {
+    block_residual: Vec<f32>,
+    qn: Vec<f32>,
+    kn: Vec<f32>,
+    vn: Vec<f32>,
+    tau: f32,
+}
+
 struct GpuPtrs {
     q: *mut c_void,
     k: *mut c_void,
@@ -1395,24 +1404,22 @@ impl Model {
     /// Split out so that a chunk of positions can run the same code per position and then
     /// share one batched MoE. The single-position path calls the two halves back to back,
     /// so batching cannot drift from it.
-    fn attention_half(
-        &mut self,
+    /// The projection inputs for one position: the attention residual, the q/k/v streams after
+    /// the message gates, their input norms, and the log-scale factor.
+    ///
+    /// Split out of `attention_half` so a chunk can compute every position's inputs and then
+    /// run the six projection GEMVs once with `m = chunk`.
+    fn attn_inputs(
+        &self,
         layer: usize,
         h: &[f32],
-        blocks: &mut Vec<Vec<f32>>,
+        blocks: &[Vec<f32>],
         msg: Option<&[Vec<f32>]>,
-        visit: usize,
-    ) -> (Vec<f32>, Vec<f32>) {
+    ) -> AttnInputs {
         let cfg = &self.cfg;
         let eps = cfg.rms_eps;
         let n_embd = cfg.n_embd;
         let lw = &self.layers[layer];
-        let mask_window = self.mask_window();
-        let cache = &mut self.caches[visit];
-        let n_heads = lw.n_heads;
-        let head_dim = lw.head_dim;
-        let kv_dim = lw.kv_dim;
-        let group = n_heads / lw.kv_heads;
 
         let block_residual = h.to_vec();
 
@@ -1470,7 +1477,26 @@ impl Model {
             let x = (self.pos as f32) / self.params.log_scale_floor.max(1) as f32;
             1.0 + self.params.log_scale_alpha * x.max(1.0).ln()
         };
+        AttnInputs {
+            block_residual,
+            qn,
+            kn,
+            vn,
+            tau,
+        }
+    }
 
+    /// The six projections for one position, on the card when the weights are resident.
+    fn project_position(&mut self, layer: usize, ins: &AttnInputs) -> [Vec<f32>; 6] {
+        let qn: &[f32] = &ins.qn;
+        let kn: &[f32] = &ins.kn;
+        let vn: &[f32] = &ins.vn;
+        let cfg = &self.cfg;
+        let n_embd = cfg.n_embd;
+        let lw = &self.layers[layer];
+        let n_heads = lw.n_heads;
+        let head_dim = lw.head_dim;
+        let kv_dim = lw.kv_dim;
         // The projection weights may be resident in VRAM, in which case `linear_f32` runs
         // each one as a single-token GEMV. Otherwise the six host matvecs run concurrently:
         // one spawn round per visit instead of one per matvec.
@@ -1486,26 +1512,26 @@ impl Model {
                 o: gl.o.as_ptr(),
             }
         });
-        let (mut q, mut k, mut v, mut rel, mut gate, sink) = match gpu_ptrs {
+        let (q, k, v, rel, gate, sink) = match gpu_ptrs {
             Some(ptrs) => {
                 let t = std::time::Instant::now();
                 let g = self.gpu.as_mut().expect("gpu active");
-                let q = g.run(ptrs.q, &qn, n_heads * head_dim);
-                let k = g.run(ptrs.k, &kn, kv_dim);
-                let v = g.run(ptrs.v, &vn, kv_dim);
-                let gate = g.run(ptrs.gate, &qn, n_heads * head_dim);
-                let rel = g.run(ptrs.rel, &qn, n_heads * lw.d_rel);
-                let sink = g.run(ptrs.sink, &qn, n_heads);
+                let q = g.run(ptrs.q, qn, n_heads * head_dim);
+                let k = g.run(ptrs.k, kn, kv_dim);
+                let v = g.run(ptrs.v, vn, kv_dim);
+                let gate = g.run(ptrs.gate, qn, n_heads * head_dim);
+                let rel = g.run(ptrs.rel, qn, n_heads * lw.d_rel);
+                let sink = g.run(ptrs.sink, qn, n_heads);
                 self.profile.gpu_proj += t.elapsed().as_secs_f64();
                 (q, k, v, rel, gate, sink)
             }
             None => std::thread::scope(|scope| {
-                let hq = scope.spawn(|| matvec(&lw.w_q, &qn, n_heads * head_dim, n_embd));
-                let hk = scope.spawn(|| matvec(&lw.w_k, &kn, kv_dim, n_embd));
-                let hv = scope.spawn(|| matvec(&lw.w_v, &vn, kv_dim, n_embd));
-                let hg = scope.spawn(|| matvec(&lw.w_gate, &qn, n_heads * head_dim, n_embd));
-                let hr = scope.spawn(|| matvec(&lw.w_rel, &qn, n_heads * lw.d_rel, n_embd));
-                let hs = scope.spawn(|| matvec(&lw.w_sink, &qn, n_heads, n_embd));
+                let hq = scope.spawn(|| matvec(&lw.w_q, qn, n_heads * head_dim, n_embd));
+                let hk = scope.spawn(|| matvec(&lw.w_k, kn, kv_dim, n_embd));
+                let hv = scope.spawn(|| matvec(&lw.w_v, vn, kv_dim, n_embd));
+                let hg = scope.spawn(|| matvec(&lw.w_gate, qn, n_heads * head_dim, n_embd));
+                let hr = scope.spawn(|| matvec(&lw.w_rel, qn, n_heads * lw.d_rel, n_embd));
+                let hs = scope.spawn(|| matvec(&lw.w_sink, qn, n_heads, n_embd));
                 (
                     hq.join().expect("q projection"),
                     hk.join().expect("k projection"),
@@ -1516,6 +1542,50 @@ impl Model {
                 )
             }),
         };
+        [q, k, v, rel, gate, sink]
+    }
+
+    /// Everything after the projections for one position: the per-head clip and convolution,
+    /// the relative bias, attention, the output gate, `W_o`, the post convolution, the block
+    /// boundary, and the normalised MoE input.
+    #[allow(clippy::too_many_arguments)]
+    fn attn_finish(
+        &mut self,
+        layer: usize,
+        h: &[f32],
+        ins: &AttnInputs,
+        proj: [Vec<f32>; 6],
+        blocks: &mut Vec<Vec<f32>>,
+        visit: usize,
+        msg: Option<&[Vec<f32>]>,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let cfg = &self.cfg;
+        let eps = cfg.rms_eps;
+        let n_embd = cfg.n_embd;
+        let lw = &self.layers[layer];
+        let mask_window = self.mask_window();
+        let cache = &mut self.caches[visit];
+        let n_heads = lw.n_heads;
+        let head_dim = lw.head_dim;
+        let kv_dim = lw.kv_dim;
+        let group = n_heads / lw.kv_heads;
+        let block_residual = ins.block_residual.clone();
+        let tau = ins.tau;
+        let kn: &[f32] = &ins.kn;
+        let vn: &[f32] = &ins.vn;
+        let [mut q, mut k, mut v, mut rel, mut gate, sink] = proj;
+        let gpu_ptrs = self.gpu.as_ref().map(|g| {
+            let gl = &g.layers[layer];
+            GpuPtrs {
+                q: gl.q.as_ptr(),
+                k: gl.k.as_ptr(),
+                v: gl.v.as_ptr(),
+                gate: gl.gate.as_ptr(),
+                rel: gl.rel.as_ptr(),
+                sink: gl.sink.as_ptr(),
+                o: gl.o.as_ptr(),
+            }
+        });
         for hh in 0..n_heads {
             scaled_l2_clip(
                 &mut q[hh * head_dim..(hh + 1) * head_dim],
@@ -1531,8 +1601,8 @@ impl Model {
 
         match (&lw.conv_k_proj, &lw.conv_v_proj) {
             (Some(pk), Some(pv)) => {
-                let dyn_k = matvec(pk, &kn, lw.kv_heads * 4, n_embd);
-                let dyn_v = matvec(pv, &vn, lw.kv_heads * 4, n_embd);
+                let dyn_k = matvec(pk, kn, lw.kv_heads * 4, n_embd);
+                let dyn_v = matvec(pv, vn, lw.kv_heads * 4, n_embd);
                 short_conv1d_4tap_dynamic(
                     &mut k,
                     &lw.conv_k,
@@ -1694,6 +1764,20 @@ impl Model {
         let mut moe_in = ffn_in;
         rmsnorm(&mut moe_in, &lw.ffn_norm, eps);
         (residual, moe_in)
+    }
+
+    /// One position through a visit: inputs, projections, then the rest.
+    fn attention_half(
+        &mut self,
+        layer: usize,
+        h: &[f32],
+        blocks: &mut Vec<Vec<f32>>,
+        msg: Option<&[Vec<f32>]>,
+        visit: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let ins = self.attn_inputs(layer, h, blocks, msg);
+        let proj = self.project_position(layer, &ins);
+        self.attn_finish(layer, h, &ins, proj, blocks, visit, msg)
     }
 
     /// The FFN half of a visit: `post_mlp_conv` and the residual add.

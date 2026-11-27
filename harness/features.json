@@ -7,6 +7,15 @@
   ],
   "features": [
     {
+      "id": "phase3-inkling2-iq3xxs",
+      "phase": 3,
+      "title": "IQ3_XXS device codec (generated tables), 16 of 24 layers resident",
+      "status": "verified",
+      "verify": "cargo test -p scoria-engine --test inkling2_gpu_iq3xxs && scoria logits <gguf> --perp <text> && ./scripts/check.sh",
+      "observed": "linear_iq3_xxs matches dequant_row_iq3_xxs elementwise on real rows (blk.12/blk.18 ffn_gate_up_exps, k=2304) to <=5e-5; grid and sign tables generated from iq_tables rather than retyped. Residency 10.95 -> 12.16 GiB, 11 -> 16 fully resident layers. Perplexity 7.598, GPU-vs-host 3.2e-5. Decode 0.40-0.84 s/token (median 0.45), i.e. no measurable gain over 0.39-0.47 on a machine at load ~9.5.",
+      "note": "The m=chunk projection batching was attempted and reverted: it produced max |dlogit| 37.4 and a pathologically slow host variant. The attn_inputs/project_position/attn_finish split it required is landed and behaviour-neutral (verified), so the seam exists for a second attempt."
+    },
+    {
       "id": "phase3-inkling2-iq4nl-per-tensor",
       "phase": 3,
       "title": "IQ4_NL device codec + per-tensor expert residency",
