@@ -44,6 +44,9 @@
           # OCML/OCKL bitcode linked into `-x hip --offload-device-only` output. Optional
           # so a host with /opt/rocm still works without the Nix package.
           rocmLlvm = pkgs.rocmPackages.llvm.clang or null;
+          # The OCML/OCKL bitcode clang links into device code. Nixpkgs ships it in clr,
+          # separately from the compiler, which is why `--rocm-device-lib-path` exists.
+          rocmDeviceLibs = pkgs.rocmPackages.clr or null;
 
           # scoria links nothing at build time: HIP is dlopen'd at runtime and kernels are
           # compiled to .hsaco by build.rs. So the package needs a compiler, not ROCm libs.
@@ -67,6 +70,8 @@
 
             SCORIA_ROCM_CLANG = if rocmLlvm != null then "${rocmLlvm}/bin/clang++" else "clang++";
             SCORIA_ROCM_PATH = if rocmLlvm != null then rocmLlvm else "/opt/rocm";
+            SCORIA_ROCM_DEVICE_LIB =
+              if rocmDeviceLibs != null then "${rocmDeviceLibs}/amdgcn/bitcode" else "";
 
             # The test suite runs the GPU gate and disassembles kernels, so it cannot run
             # in the build sandbox. `nix develop` runs it against the real card instead.
@@ -102,6 +107,8 @@
 
             SCORIA_ROCM_CLANG = if rocmLlvm != null then "${rocmLlvm}/bin/clang++" else "";
             SCORIA_ROCM_PATH = if rocmLlvm != null then rocmLlvm else "/opt/rocm";
+            SCORIA_ROCM_DEVICE_LIB =
+              if rocmDeviceLibs != null then "${rocmDeviceLibs}/amdgcn/bitcode" else "";
 
             shellHook = ''
               echo "scoria: $(rustc --version)"
