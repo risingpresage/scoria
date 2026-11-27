@@ -141,6 +141,51 @@ impl ExpertTensor {
             *slot = row.iter().zip(x).map(|(a, b)| a * b).sum::<f32>() * scale;
         }
     }
+
+    /// `outs[p][o] = outer[e] * (W[e] row o . xs[p])`, dequantising each row **once** and
+    /// dotting it against every input.
+    ///
+    /// This is the whole point of a batched prefill: dequantisation measured at half the
+    /// cost of a single-position expert GEMV, so amortising it across the positions that
+    /// share an expert removes that half for all but the first.
+    fn row_matvec_m(
+        &self,
+        file: &GgufFile,
+        e: usize,
+        xs: &[&[f32]],
+        outs: &mut [Vec<f32>],
+        row: &mut Vec<f32>,
+    ) {
+        assert_eq!(xs.len(), outs.len(), "one output per input");
+        assert!(e < self.experts, "expert {e} out of range");
+        let bytes = file
+            .tensor_bytes(&self.info)
+            .expect("expert tensor is in the mmap");
+        let row_bytes = self
+            .info
+            .ggml_type
+            .tensor_byte_len(self.in_dim)
+            .expect("expert row size");
+        let base = e * self.slab_bytes;
+        let scale = self.outer[e];
+        row.resize(self.in_dim, 0.0);
+        for out in outs.iter_mut() {
+            assert_eq!(out.len(), self.out_dim, "row_matvec_m output");
+        }
+        for o in 0..self.out_dim {
+            let start = base + o * row_bytes;
+            scoria_gguf::dequant::dequant_row(
+                self.info.ggml_type,
+                &bytes[start..start + row_bytes],
+                row,
+            )
+            .expect("expert row dequantises");
+            for (out, x) in outs.iter_mut().zip(xs) {
+                assert_eq!(x.len(), self.in_dim, "row_matvec_m input");
+                out[o] = row.iter().zip(*x).map(|(a, b)| a * b).sum::<f32>() * scale;
+            }
+        }
+    }
 }
 
 /// Per-thread working set: a dequantised-row buffer, the expert output vectors and the
@@ -265,6 +310,13 @@ impl Moe {
 
     /// Selection uses `scores + bias`; the weights come from the raw scores.
     pub fn route(&mut self, x: &[f32]) -> Route {
+        let route = self.route_pure(x);
+        self.last_route = Some(route.clone());
+        route
+    }
+
+    /// The same decision without recording it, for batched callers.
+    pub fn route_pure(&self, x: &[f32]) -> Route {
         let scores = self.router_scores(x);
         let biased: Vec<f32> = scores
             .iter()
@@ -277,9 +329,7 @@ impl Moe {
         let picked: Vec<f32> = indices.iter().map(|&i| scores[i]).collect();
         let sum: f32 = picked.iter().sum::<f32>() + 1e-20;
         let weights = picked.iter().map(|w| w / sum * self.routed_scale).collect();
-        let route = Route { indices, weights };
-        self.last_route = Some(route.clone());
-        route
+        Route { indices, weights }
     }
 
     /// Worker count for the expert loop. One token routes to `top_k` experts and each is
@@ -368,6 +418,110 @@ impl Moe {
             }
             acc
         })
+    }
+
+    /// A chunk of positions through the MoE.
+    ///
+    /// Routing is per position, so the positions that chose an expert are gathered and the
+    /// expert is evaluated once for all of them. Dequantisation — half the cost of a
+    /// single-position expert GEMV — is therefore paid once per expert instead of once per
+    /// (position, expert), which is the entire reason to batch a prefill.
+    pub fn forward_chunk(&self, file: &GgufFile, xs: &[Vec<f32>], outs: &mut [Vec<f32>]) {
+        let n_embd = self.n_embd;
+        let ff = self.ff;
+        assert_eq!(xs.len(), outs.len());
+        for out in outs.iter_mut() {
+            out.resize(n_embd, 0.0);
+            out.fill(0.0);
+        }
+        let routes: Vec<Route> = xs.iter().map(|x| self.route_pure(x)).collect();
+        let mut buckets: Vec<Vec<(usize, f32)>> = vec![Vec::new(); self.n_experts];
+        for (pos, route) in routes.iter().enumerate() {
+            for (slot, &expert) in route.indices.iter().enumerate() {
+                buckets[expert].push((pos, route.weights[slot]));
+            }
+        }
+
+        let experts = self.n_experts;
+        // Only experts that were actually routed to have work: for a chunk of C positions
+        // that is at most `C * top_k`, so spawning a thread per expert range wastes most of
+        // the spawns. This was a third of the chunk path's MoE cost at chunk size 1.
+        let busy = buckets.iter().filter(|b| !b.is_empty()).count();
+        let workers = self.threads.min(experts).min(busy.max(1)).max(1);
+        let per = experts.div_ceil(workers);
+        let gate_up = &self.gate_up;
+        let down = &self.down;
+        let gate_cap = self.gate_cap;
+        let up_cap = self.up_cap;
+        let buckets = &buckets;
+
+        // Each worker owns a contiguous range of experts and its own accumulation buffer,
+        // so positions touched by two experts are summed at the end rather than raced.
+        let partials: Vec<Vec<Vec<f32>>> = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(workers);
+            for worker in 0..workers {
+                let lo = worker * per;
+                let hi = ((worker + 1) * per).min(experts);
+                if lo >= hi {
+                    break;
+                }
+                handles.push(scope.spawn(move || {
+                    let mut acc = vec![vec![0f32; n_embd]; xs.len()];
+                    let mut row = Vec::new();
+                    let mut gate = vec![0f32; ff];
+                    let mut up = vec![0f32; ff];
+                    let mut act = vec![0f32; ff];
+                    let mut gu: Vec<Vec<f32>> = Vec::new();
+                    let mut dn: Vec<Vec<f32>> = Vec::new();
+                    for (expert, hits) in buckets.iter().enumerate().take(hi).skip(lo) {
+                        if hits.is_empty() {
+                            continue;
+                        }
+                        gu.clear();
+                        for _ in 0..hits.len() {
+                            gu.push(vec![0f32; gate_up.out_dim]);
+                        }
+                        let inputs: Vec<&[f32]> =
+                            hits.iter().map(|(pos, _)| xs[*pos].as_slice()).collect();
+                        gate_up.row_matvec_m(file, expert, &inputs, &mut gu, &mut row);
+
+                        let mut acts: Vec<Vec<f32>> = Vec::with_capacity(hits.len());
+                        for g in &gu {
+                            gate.copy_from_slice(&g[..ff]);
+                            up.copy_from_slice(&g[ff..]);
+                            swiglu_softcapped(&gate, &up, gate_cap, up_cap, &mut act);
+                            acts.push(act.clone());
+                        }
+
+                        dn.clear();
+                        for _ in 0..hits.len() {
+                            dn.push(vec![0f32; down.out_dim]);
+                        }
+                        let act_refs: Vec<&[f32]> = acts.iter().map(|a| a.as_slice()).collect();
+                        down.row_matvec_m(file, expert, &act_refs, &mut dn, &mut row);
+
+                        for (which, (pos, weight)) in hits.iter().enumerate() {
+                            for (a, m) in acc[*pos].iter_mut().zip(&dn[which]) {
+                                *a += weight * m;
+                            }
+                        }
+                    }
+                    acc
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("chunk expert worker panicked"))
+                .collect()
+        });
+
+        for part in partials {
+            for (pos, row) in part.iter().enumerate() {
+                for (a, m) in outs[pos].iter_mut().zip(row) {
+                    *a += m;
+                }
+            }
+        }
     }
 
     /// One token through the MoE, returning the accumulated expert contribution.

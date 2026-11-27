@@ -821,6 +821,13 @@ fn cmd_logits(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         (None, tokens.clone())
     };
+    // Routing locality and the dequant/arithmetic split: the two numbers that decide
+    // whether caching dequantised experts is worth building.
+    let route_stats = arg_val(rest, "--route-stats")
+        .map(|v| v.parse::<usize>().unwrap_or(0))
+        .unwrap_or(0);
+    let bench = rest.iter().any(|a| a == "--bench-dequant");
+
     let tokens = match length {
         Some(n) if n > 0 => (0..n).map(|i| 300 + ((i * 37) % 4000) as u32).collect(),
         _ => prompt_tokens,
@@ -840,6 +847,133 @@ fn cmd_logits(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if threads > 0 {
         model.set_threads(threads);
     }
+    let prefill_chunk = arg_val(rest, "--prefill-chunk")
+        .map(|v| v.parse::<usize>().unwrap_or(0))
+        .unwrap_or(0);
+    if prefill_chunk > 0 {
+        let mut model = Model::open_with_router(path, router)?;
+        model.max_visits = max_visits;
+        if threads > 0 {
+            model.set_threads(threads);
+        }
+        if !rest.iter().any(|a| a == "--no-gpu") {
+            match model.enable_gpu() {
+                Ok(resident) => println!(
+                    "projections: GPU (linear_f32), {:.2} GiB resident",
+                    resident as f64 / (1u64 << 30) as f64
+                ),
+                Err(e) => println!("projections: host ({e})"),
+            }
+        }
+        let started = std::time::Instant::now();
+        let all = model.prefill(&tokens, prefill_chunk);
+        let elapsed = started.elapsed().as_secs_f64();
+        let per = elapsed / tokens.len() as f64;
+        println!(
+            "prefill: {} tokens in chunks of {prefill_chunk}: {:.2}s total, {:.3}s/token, {:.2} tok/s",
+            tokens.len(),
+            elapsed,
+            per,
+            1.0 / per
+        );
+        let p = model.profile;
+        let visits = p.visits.max(1) as f64;
+        println!(
+            "  attention {:.3}s, moe {:.3}s (gpu experts {:.3}s) per visit; {} visits",
+            p.attention / visits,
+            p.moe / visits,
+            p.gpu_experts / visits,
+            p.visits
+        );
+        let last = all.last().unwrap();
+        let best = Model::top_k(last, 5);
+        println!("  argmax {} ({:+.4})", best[0].0, best[0].1);
+        if rest.iter().any(|a| a == "--compare-single") {
+            // The single-position path is the oracle: replay the same tokens through it on
+            // the same weights and compare logits position by position.
+            model.reset();
+            let mut single: Vec<Vec<f32>> = Vec::new();
+            for &t in &tokens {
+                single.push(model.forward(t));
+            }
+            let mut worst = 0f32;
+            let mut worst_at = 0usize;
+            let mut argmax_agree = 0usize;
+            for (i, (a, b)) in all.iter().zip(&single).enumerate() {
+                for (x, y) in a.iter().zip(b) {
+                    let d = (x - y).abs();
+                    if d > worst {
+                        worst = d;
+                        worst_at = i;
+                    }
+                }
+                if Model::top_k(a, 1)[0].0 == Model::top_k(b, 1)[0].0 {
+                    argmax_agree += 1;
+                }
+            }
+            println!(
+                "  vs single-position: max |dlogit| {worst:.6} (position {worst_at}), argmax agrees {argmax_agree}/{}",
+                all.len()
+            );
+            let per_position: Vec<String> = all
+                .iter()
+                .zip(&single)
+                .enumerate()
+                .take(14)
+                .map(|(i, (a, b))| {
+                    let d = a.iter().zip(b).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+                    format!("{i}:{d:.5}")
+                })
+                .collect();
+            println!("  per position: {}", per_position.join(" "));
+        }
+        if tokens.len() > 1 {
+            // Perplexity from the same logits, so a batched path can be compared with the
+            // single-position one on the objective's own number.
+            let mut nll = 0f64;
+            let mut hits = 0usize;
+            let mut scored = 0usize;
+            for i in 0..tokens.len() - 1 {
+                let target = tokens[i + 1] as usize;
+                if target >= all[i].len() {
+                    continue;
+                }
+                let max = all[i].iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+                let sum: f64 = all[i].iter().map(|v| ((*v as f64) - max).exp()).sum();
+                nll -= (all[i][target] as f64 - max) - sum.ln();
+                if Model::top_k(&all[i], 1)[0].0 == target {
+                    hits += 1;
+                }
+                scored += 1;
+            }
+            println!(
+                "  perplexity over {scored} tokens: {:.3} (top-1 {hits}/{scored})",
+                (nll / scored as f64).exp()
+            );
+        }
+        return Ok(());
+    }
+
+    if rest.iter().any(|a| a == "--reset-check") {
+        let mut model = Model::open_with_router(path, router)?;
+        let first: Vec<Vec<f32>> = tokens.iter().map(|&t| model.forward(t)).collect();
+        model.reset();
+        let second: Vec<Vec<f32>> = tokens.iter().map(|&t| model.forward(t)).collect();
+        let mut worst = 0f32;
+        for (a, b) in first.iter().zip(&second) {
+            for (x, y) in a.iter().zip(b) {
+                worst = worst.max((x - y).abs());
+            }
+        }
+        println!("reset round trip: max |dlogit| {worst:.6}");
+        return Ok(());
+    }
+
+    if bench {
+        // Pure host measurement: no VRAM, so it cannot collide with anything else.
+        report_dequant(&model);
+        return Ok(());
+    }
     let want_gpu = !rest.iter().any(|a| a == "--no-gpu");
     if want_gpu {
         match model.enable_gpu() {
@@ -851,6 +985,10 @@ fn cmd_logits(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         println!("projections: host (--no-gpu)");
+    }
+    if route_stats > 0 {
+        report_routing(&mut model, route_stats);
+        return Ok(());
     }
     let load = started.elapsed();
     println!(
@@ -939,6 +1077,11 @@ fn cmd_logits(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         if all.len() < 2 {
             return Err("--perp text tokenizes to too few tokens".into());
         }
+        // The per-step loop above already pushed these tokens through the model. Scoring
+        // them again without resetting would let the model attend over its own earlier pass,
+        // which makes any text look predictable: an earlier version of this reported 1.317
+        // for prose whose true perplexity is ~7.6.
+        model.reset();
         let mut hits = 0usize;
         let mut nll = 0f64;
         let mut skipped = 0usize;
@@ -1186,5 +1329,120 @@ fn main() {
     if let Err(e) = res {
         eprintln!("scoria error: {e}");
         process::exit(1);
+    }
+}
+
+/// How concentrated the routing is: distinct experts per layer, the share of accesses taken
+/// by the top 8 experts, and the hit rate an LRU of a given size would have achieved.
+fn report_routing(model: &mut scoria_engine::inkling2_model::Model, tokens: usize) {
+    let layers = model.cfg.n_layers;
+    let mut accesses: Vec<Vec<usize>> = vec![Vec::new(); layers];
+    for step in 0..tokens {
+        let tok = 300 + ((step * 37) % 4000) as u32;
+        model.forward(tok);
+        for (layer, list) in accesses.iter_mut().enumerate() {
+            if let Some(route) = model.route_of(layer) {
+                list.extend_from_slice(&route.indices);
+            }
+        }
+    }
+    let total: usize = accesses.iter().map(|a| a.len()).sum();
+    println!("routing over {tokens} tokens: {total} expert accesses");
+
+    // Concentration: what fraction of accesses go to each layer's 8 most used experts.
+    let mut all_top = 0usize;
+    for (layer, list) in accesses.iter().enumerate() {
+        let mut counts = [0usize; 128];
+        for &e in list {
+            counts[e] += 1;
+        }
+        let mut sorted: Vec<usize> = counts.to_vec();
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+        let top8: usize = sorted.iter().take(8).sum();
+        let distinct = counts.iter().filter(|c| **c > 0).count();
+        all_top += top8;
+        if layer % 6 == 0 || layer == layers - 1 {
+            println!(
+                "  layer {layer:>2}: distinct {distinct:>3}/128, top-8 share {:.1}%",
+                100.0 * top8 as f64 / list.len().max(1) as f64
+            );
+        }
+    }
+    println!(
+        "  all layers: top-8 share {:.1}%",
+        100.0 * all_top as f64 / total.max(1) as f64
+    );
+
+    // Per-layer LRU: the only shape with a realistic memory budget. Each cached expert is
+    // ~32 MB in f32 (21 MB gate/up + 11 MB down), so `cap` slots per layer costs
+    // `24 * cap * 32` MiB.
+    println!("  per-layer LRU (a cached expert is ~32 MiB f32):");
+    for cap in [4usize, 8, 16, 32] {
+        let mut hits = 0usize;
+        let mut counts = 0usize;
+        for list in &accesses {
+            let mut lru: Vec<usize> = Vec::with_capacity(cap);
+            for &e in list {
+                counts += 1;
+                if let Some(pos) = lru.iter().position(|k| *k == e) {
+                    hits += 1;
+                    let k = lru.remove(pos);
+                    lru.push(k);
+                } else {
+                    if lru.len() == cap {
+                        lru.remove(0);
+                    }
+                    lru.push(e);
+                }
+            }
+        }
+        println!(
+            "    {cap:>2}/layer ({} MiB total): hit rate {:.1}%",
+            layers * cap * 32,
+            100.0 * hits as f64 / counts.max(1) as f64
+        );
+    }
+
+    // And a global LRU over (layer, expert), for comparison: it thrashes because 24 layers
+    // compete for one budget.
+    for cap in [64usize, 256, 512] {
+        let mut lru: Vec<(usize, usize)> = Vec::with_capacity(cap);
+        let mut hits = 0usize;
+        for (layer, list) in accesses.iter().enumerate() {
+            for &e in list {
+                let key = (layer, e);
+                if let Some(pos) = lru.iter().position(|k| *k == key) {
+                    hits += 1;
+                    let k = lru.remove(pos);
+                    lru.push(k);
+                } else {
+                    if lru.len() == cap {
+                        lru.remove(0);
+                    }
+                    lru.push(key);
+                }
+            }
+        }
+        println!(
+            "  global LRU {cap:>3} ({} MiB): hit rate {:.1}%",
+            cap * 32,
+            100.0 * hits as f64 / total.max(1) as f64
+        );
+    }
+}
+
+/// Dequantisation versus arithmetic in one expert GEMV. If dequantisation dominates, a
+/// cache of dequantised experts is worth its memory; if not, it is not.
+fn report_dequant(model: &scoria_engine::inkling2_model::Model) {
+    for (layer, down) in [(5usize, false), (5usize, true), (0usize, false)] {
+        let (dequant, dot) = model.bench_dequant(layer, down, 0, 2);
+        let total = dequant + dot;
+        println!(
+            "  layer {layer} {}: dequant {:.3}s, dot {:.3}s -> dequant is {:.0}% of a GEMV",
+            if down { "down" } else { "gate_up" },
+            dequant,
+            dot,
+            100.0 * dequant / total.max(1e-9)
+        );
     }
 }

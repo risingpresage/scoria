@@ -16,4 +16,9 @@ echo "[check] lint-arch"
 echo "[check] cargo test"
 cargo test --workspace
 
+# Tests that push the whole 48-visit stack through the real checkpoint are unaffordable in
+# a debug build; this is where they actually run.
+echo "[check] heavy release tests"
+cargo test --release -p scoria-engine --test inkling2_kv_ring
+
 echo "[check] ALL PASSED"

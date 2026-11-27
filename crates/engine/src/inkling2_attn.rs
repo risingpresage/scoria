@@ -94,6 +94,50 @@ pub fn relative_bias(
     }
 }
 
+/// The same attention as [`decode_head`], but reading one head directly out of an
+/// interleaved `[position][kv_head][head_dim]` cache instead of a per-head copy.
+///
+/// The copy looked harmless and is not: at 4096 positions a full-history visit copies
+/// `24 heads x 4096 x 128 x 2` floats per token (25 M), and there are 8 such visits, so the
+/// copy loop -- not the dot products -- dominates attention at long context. `slots` is the
+/// absolute-to-ring mapping, one entry per visible position, in order.
+///
+/// The arithmetic is identical to `decode_head`: same dot order, same bias, same sink, so
+/// the two agree bit for bit and either can be the oracle for the other.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_head_in_cache(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    slots: &[usize],
+    kv_heads: usize,
+    head: usize,
+    bias: &[f32],
+    sink: f32,
+) -> Vec<f32> {
+    let head_dim = q.len();
+    assert_eq!(bias.len(), slots.len(), "one bias per visible position");
+    let scale = (head_dim as f32).sqrt().recip();
+    let mut logits = Vec::with_capacity(slots.len());
+    for (i, &slot) in slots.iter().enumerate() {
+        let base = slot * kv_heads * head_dim + head * head_dim;
+        let dot: f32 = (0..head_dim).map(|d| q[d] * k_cache[base + d]).sum();
+        logits.push(dot * scale + bias[i]);
+    }
+    sink_softmax(&mut logits, sink);
+    let mut out = vec![0f32; head_dim];
+    for (i, p) in logits.iter().enumerate() {
+        if *p == 0.0 {
+            continue;
+        }
+        let base = slots[i] * kv_heads * head_dim + head * head_dim;
+        for d in 0..head_dim {
+            out[d] += p * v_cache[base + d];
+        }
+    }
+    out
+}
+
 /// Softmax over `logits` with one extra zero-valued sink logit that absorbs probability
 /// mass and is then discarded.
 pub fn sink_softmax(logits: &mut [f32], sink: f32) {
@@ -685,5 +729,35 @@ mod tests {
         short_conv1d_4tap(&mut s, &static_w, &mut c2, 2);
         assert!((s[0] - 5.0 * (5.0f32).sqrt().recip()).abs() < 1e-6);
         assert_ne!(s, x);
+    }
+
+    #[test]
+    fn cached_head_matches_the_per_head_copy_exactly() {
+        // Three visible positions, two kv heads, head_dim 4, one interleaved cache.
+        let (kv_heads, head_dim, positions) = (2usize, 4usize, 3usize);
+        let k: Vec<f32> = (0..positions * kv_heads * head_dim)
+            .map(|i| ((i * 29 % 53) as f32 - 26.0) * 0.01)
+            .collect();
+        let v: Vec<f32> = (0..positions * kv_heads * head_dim)
+            .map(|i| ((i * 17 % 41) as f32 - 20.0) * 0.02)
+            .collect();
+        let q: Vec<f32> = (0..head_dim).map(|i| (i as f32 - 1.5) * 0.1).collect();
+        let bias = vec![0.3f32, -0.2, 0.05];
+        let sink = -0.7f32;
+        // Slot mapping: the ring rotated, so slot order != position order on purpose.
+        let slots = vec![2usize, 0, 1];
+
+        for head in 0..kv_heads {
+            let mut kh = Vec::new();
+            let mut vh = Vec::new();
+            for &slot in &slots {
+                let base = slot * kv_heads * head_dim + head * head_dim;
+                kh.extend_from_slice(&k[base..base + head_dim]);
+                vh.extend_from_slice(&v[base..base + head_dim]);
+            }
+            let want = decode_head(&q, &kh, &vh, &bias, sink, positions - 1, None);
+            let got = decode_head_in_cache(&q, &k, &v, &slots, kv_heads, head, &bias, sink);
+            assert_eq!(got, want, "head {head}");
+        }
     }
 }

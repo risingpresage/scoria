@@ -50,6 +50,15 @@ fn run(ring: bool) -> Vec<f32> {
 
 #[test]
 fn windowed_ring_reproduces_the_unbounded_history_exactly() {
+    // This runs the full 48-visit stack twice over the real checkpoint, which is ~20x
+    // slower in an unoptimised build -- long enough to stall the gate. It is not skipped:
+    // `scripts/check.sh` runs this target again under `--release`, where it takes ~3 min.
+    // The ring's own invariants (sliding, growth, slot mapping) are unit tests in
+    // `inkling2_model` and run in both builds.
+    if cfg!(debug_assertions) {
+        eprintln!("deferring to the release run in scripts/check.sh");
+        return;
+    }
     let ring = run(true);
     let full = run(false);
     assert_eq!(ring.len(), full.len());

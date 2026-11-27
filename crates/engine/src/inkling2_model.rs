@@ -48,7 +48,7 @@ use crate::EngineContext;
 
 use crate::inkling2::{Inkling2Params, Visit, schedule};
 use crate::inkling2_attn::{
-    decode_head, l2_clip, relative_bias, scaled_l2_clip, short_conv1d_4tap,
+    decode_head_in_cache, l2_clip, relative_bias, scaled_l2_clip, short_conv1d_4tap,
     short_conv1d_4tap_dynamic, unweighted_rmsnorm,
 };
 use crate::inkling2_head::softcap;
@@ -578,6 +578,8 @@ struct GpuPtrs {
 
 /// Upper bound on the routed experts batched into one synchronisation.
 const TOP_K_FOR_BATCH: usize = 8;
+/// Upper bound on the positions batched into one prefill chunk.
+const CHUNK_MAX: usize = 8;
 
 struct GpuLayer {
     q: DeviceBuf,
@@ -660,17 +662,84 @@ impl Gpu {
             // hidden size, so the input buffer is sized for the widest operand.
             // A batch carries `top_k` input vectors, so the input buffer is that much
             // wider than one projection vector.
-            x: DeviceBuf::alloc(max_in.max(max_out) * 4 * TOP_K_FOR_BATCH)
+            x: DeviceBuf::alloc(max_in.max(max_out) * 4 * TOP_K_FOR_BATCH * CHUNK_MAX)
                 .expect("VRAM input buffer"),
             // One batch is `top_k` expert outputs, so the output buffer is wider than a
             // single projection's.
-            y: DeviceBuf::alloc(max_out * 4 * TOP_K_FOR_BATCH).expect("VRAM output buffer"),
+            y: DeviceBuf::alloc(max_out * 4 * TOP_K_FOR_BATCH * CHUNK_MAX)
+                .expect("VRAM output buffer"),
             ctx,
             stream,
             layers: out,
             wave_size,
             resident,
         }
+    }
+
+    /// One launch per group, one synchronisation: `groups` is
+    /// `(expert, offset, count)` and `x_flat`/`y_flat` are indexed at
+    /// `offset * k` / `offset * n_out`. This is how a batched prefill runs the experts: the
+    /// positions that chose an expert become `count` rows of one GEMV, so the expert's
+    /// weights are read once instead of once per position.
+    #[allow(clippy::too_many_arguments)]
+    fn run_groups(
+        &mut self,
+        handle: scoria_hip_rt::KernelHandle,
+        base: *mut c_void,
+        slab: usize,
+        groups: &[(usize, usize, usize)],
+        x_flat: &[f32],
+        k: usize,
+        n_out: usize,
+    ) -> Vec<f32> {
+        let bytes =
+            unsafe { std::slice::from_raw_parts(x_flat.as_ptr() as *const u8, x_flat.len() * 4) };
+        self.x.copy_from_host(bytes).expect("H2D chunk inputs");
+        let mut n = n_out as u32;
+        let mut kk = k as u32;
+        let waves_per_wg = 256u32 / self.wave_size.max(1);
+        let grid_x = n.div_ceil(waves_per_wg);
+        for (expert, offset, count) in groups {
+            if *count == 0 {
+                continue;
+            }
+            let mut arg_w = unsafe { (base as *mut u8).add(expert * slab) as *mut c_void };
+            let mut arg_x =
+                unsafe { (self.x.as_ptr() as *mut u8).add(offset * k * 4) as *mut c_void };
+            let mut arg_bias: *mut c_void = std::ptr::null_mut();
+            let mut arg_y =
+                unsafe { (self.y.as_ptr() as *mut u8).add(offset * n_out * 4) as *mut c_void };
+            let mut arg_m = *count as u32;
+            let mut args: [*mut c_void; 7] = [
+                &mut arg_w as *mut *mut c_void as *mut c_void,
+                &mut arg_x as *mut *mut c_void as *mut c_void,
+                &mut arg_bias as *mut *mut c_void as *mut c_void,
+                &mut arg_y as *mut *mut c_void as *mut c_void,
+                &mut arg_m as *mut u32 as *mut c_void,
+                &mut n as *mut u32 as *mut c_void,
+                &mut kk as *mut u32 as *mut c_void,
+            ];
+            unsafe {
+                self.ctx
+                    .infer_module
+                    .launch_handle(
+                        handle,
+                        [grid_x, *count as u32, 1],
+                        [256, 1, 1],
+                        0,
+                        &self.stream,
+                        &mut args,
+                    )
+                    .expect("grouped GEMV launch");
+            }
+        }
+        self.stream.synchronize().expect("stream sync");
+        let total: usize = groups.iter().map(|g| g.2 * n_out).sum();
+        let mut out = vec![0f32; total];
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, total * 4) };
+        self.y.copy_to_host(bytes).expect("D2H groups");
+        out
     }
 
     /// Keep every expert tensor the device can decode resident, one allocation at a time,
@@ -1001,6 +1070,72 @@ impl Model {
         self.reset();
     }
 
+    /// The routing decision of the last forward for `layer`, for locality analysis.
+    pub fn route_of(&self, layer: usize) -> Option<&crate::inkling2_moe::Route> {
+        self.moes[layer].last_route.as_ref()
+    }
+
+    /// Time `dequant_row` against the dot product for one expert matrix, so the question
+    /// "would caching dequantised experts help?" is answered by arithmetic instead of hope.
+    /// Returns `(dequant_seconds, dot_seconds)` for `reps` sweeps of the slab.
+    /// `down = true` benchmarks the `ffn_down_exps` matrix, otherwise gate/up.
+    pub fn bench_dequant(
+        &self,
+        layer: usize,
+        down: bool,
+        expert: usize,
+        reps: usize,
+    ) -> (f64, f64) {
+        let tensor = if down {
+            self.moes[layer].down_tensor()
+        } else {
+            self.moes[layer].gate_up_tensor()
+        };
+        let e = expert;
+        let out_dim = tensor.out_dim;
+        let in_dim = tensor.in_dim;
+        let bytes = self
+            .file
+            .tensor_bytes(&tensor.info)
+            .expect("expert tensor in mmap");
+        let row_bytes = tensor
+            .info
+            .ggml_type
+            .tensor_byte_len(in_dim)
+            .expect("row size");
+        let base = e * tensor.slab_bytes;
+        let mut row = vec![0f32; in_dim];
+        let x: Vec<f32> = (0..in_dim).map(|i| (i % 17) as f32 * 0.01).collect();
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            for o in 0..out_dim {
+                let start = base + o * row_bytes;
+                scoria_gguf::dequant::dequant_row(
+                    tensor.info.ggml_type,
+                    &bytes[start..start + row_bytes],
+                    &mut row,
+                )
+                .expect("row dequantises");
+            }
+        }
+        let dequant = t0.elapsed().as_secs_f64();
+        let t1 = std::time::Instant::now();
+        for _ in 0..reps {
+            for o in 0..out_dim {
+                let start = base + o * row_bytes;
+                scoria_gguf::dequant::dequant_row(
+                    tensor.info.ggml_type,
+                    &bytes[start..start + row_bytes],
+                    &mut row,
+                )
+                .expect("row dequantises");
+                std::hint::black_box(row.iter().zip(&x).map(|(a, b)| a * b).sum::<f32>());
+            }
+        }
+        let both = t1.elapsed().as_secs_f64();
+        (dequant, (both - dequant).max(0.0))
+    }
+
     /// The attention window in force for this model.
     fn mask_window(&self) -> Option<usize> {
         self.kv_window_override.or(self.cfg.sliding_window)
@@ -1201,22 +1336,26 @@ impl Model {
         )
     }
 
-    fn layer_forward(
+    /// The attention half of a visit: everything up to and including the normalised MoE
+    /// input. Returns `(residual, moe_in)`.
+    ///
+    /// Split out so that a chunk of positions can run the same code per position and then
+    /// share one batched MoE. The single-position path calls the two halves back to back,
+    /// so batching cannot drift from it.
+    fn attention_half(
         &mut self,
         layer: usize,
         h: &[f32],
+        blocks: &mut Vec<Vec<f32>>,
         msg: Option<&[Vec<f32>]>,
         visit: usize,
-    ) -> Vec<f32> {
-        let t_visit = std::time::Instant::now();
-        self.profile.visits += 1;
+    ) -> (Vec<f32>, Vec<f32>) {
         let cfg = &self.cfg;
         let eps = cfg.rms_eps;
         let n_embd = cfg.n_embd;
         let lw = &self.layers[layer];
         let mask_window = self.mask_window();
         let cache = &mut self.caches[visit];
-        let moe = &mut self.moes[layer];
         let n_heads = lw.n_heads;
         let head_dim = lw.head_dim;
         let kv_dim = lw.kv_dim;
@@ -1229,7 +1368,7 @@ impl Model {
         let mut streams: Vec<Vec<f32>> = if lw.idx == 0 {
             vec![h.to_vec(); lw.queries]
         } else {
-            block_attention(&lw.attn_res_query, lw.queries, &self.block_states, h, eps)
+            block_attention(&lw.attn_res_query, lw.queries, blocks, h, eps)
         };
         let (mut q_in, mut k_in, mut v_in) = if lw.queries == 3 {
             (streams.remove(0), streams.remove(0), streams.remove(0))
@@ -1416,29 +1555,22 @@ impl Model {
             &mut bias,
         );
 
+        // Read each head straight out of the interleaved cache. The per-head copy this
+        // replaces was 25 M floats per full-history visit at 4096 positions, i.e. the copy
+        // loop rather than the dots dominated attention at long context.
+        let slots: Vec<usize> = (first_visible..=kv_pos).map(|t| cache.kv.slot(t)).collect();
         let mut attn = vec![0f32; n_heads * head_dim];
         for hh in 0..n_heads {
             let kvh = hh / group;
-            let mut kh = Vec::with_capacity(visible * head_dim);
-            let mut vh = Vec::with_capacity(visible * head_dim);
-            for t in first_visible..=kv_pos {
-                let slot = cache.kv.slot(t);
-                let base = slot * lw.kv_dim;
-                kh.extend_from_slice(
-                    &cache.kv.k[base + kvh * head_dim..base + (kvh + 1) * head_dim],
-                );
-                vh.extend_from_slice(
-                    &cache.kv.v[base + kvh * head_dim..base + (kvh + 1) * head_dim],
-                );
-            }
-            let out = decode_head(
+            let out = decode_head_in_cache(
                 &q[hh * head_dim..(hh + 1) * head_dim],
-                &kh,
-                &vh,
+                &cache.kv.k,
+                &cache.kv.v,
+                &slots,
+                lw.kv_heads,
+                kvh,
                 &bias[hh * visible..(hh + 1) * visible],
                 sink[hh],
-                visible - 1,
-                None,
             );
             attn[hh * head_dim..(hh + 1) * head_dim].copy_from_slice(&out);
         }
@@ -1496,23 +1628,57 @@ impl Model {
         short_conv1d_4tap(&mut out, &lw.post_conv, &mut cache.post_conv, n_embd);
 
         let residual = if lw.boundary {
-            self.block_states.push(block_residual);
+            blocks.push(block_residual);
             out
         } else {
             h.iter().zip(&out).map(|(a, b)| a + b).collect()
         };
 
-        let mut ffn_in =
-            block_attention(&lw.ffn_res_query, 1, &self.block_states, &residual, eps).remove(0);
+        let mut ffn_in = block_attention(&lw.ffn_res_query, 1, blocks, &residual, eps).remove(0);
         if let (Some(msg), Some(gates)) = (msg, lw.gates.as_ref()) {
             ffn_in = gates[3].apply(&ffn_in, &msg[3], n_embd, eps);
         }
         let mut moe_in = ffn_in;
         rmsnorm(&mut moe_in, &lw.ffn_norm, eps);
+        (residual, moe_in)
+    }
+
+    /// The FFN half of a visit: `post_mlp_conv` and the residual add.
+    fn ffn_half(
+        &mut self,
+        layer: usize,
+        residual: &[f32],
+        moe_out: &[f32],
+        visit: usize,
+    ) -> Vec<f32> {
+        let n_embd = self.cfg.n_embd;
+        let mut y = moe_out.to_vec();
+        {
+            let lw = &self.layers[layer];
+            let cache = &mut self.caches[visit];
+            short_conv1d_4tap(&mut y, &lw.ffn_post_conv, &mut cache.ffn_conv, n_embd);
+        }
+        residual.iter().zip(&y).map(|(a, b)| a + b).collect()
+    }
+
+    /// One position through a visit: the two halves with the MoE between them.
+    fn layer_forward(
+        &mut self,
+        layer: usize,
+        h: &[f32],
+        msg: Option<&[Vec<f32>]>,
+        visit: usize,
+    ) -> Vec<f32> {
+        let t_visit = std::time::Instant::now();
+        self.profile.visits += 1;
+        let n_embd = self.cfg.n_embd;
+        let mut blocks = std::mem::take(&mut self.block_states);
+        let (residual, moe_in) = self.attention_half(layer, h, &mut blocks, msg, visit);
+        self.block_states = blocks;
         let t_moe = std::time::Instant::now();
-        let mut y = Self::moe_forward_parts(
+        let moe_out = Self::moe_forward_parts(
             &mut self.gpu,
-            moe,
+            &mut self.moes[layer],
             &self.file,
             layer,
             n_embd,
@@ -1521,11 +1687,7 @@ impl Model {
         );
         let moe_time = t_moe.elapsed().as_secs_f64();
         self.profile.moe += moe_time;
-        short_conv1d_4tap(&mut y, &lw.ffn_post_conv, &mut cache.ffn_conv, n_embd);
-
-        let out: Vec<f32> = residual.iter().zip(&y).map(|(a, b)| a + b).collect();
-        // Everything that is not the MoE is the attention half of the visit (plus the two
-        // convolution/residual adds, which are microseconds).
+        let out = self.ffn_half(layer, &residual, &moe_out, visit);
         self.profile.attention += t_visit.elapsed().as_secs_f64() - moe_time;
         out
     }
@@ -1641,6 +1803,320 @@ impl Model {
             }
         }
         acc
+    }
+
+    /// Prefill a token sequence in chunks of `chunk` positions, returning the logits of the
+    /// last position.
+    ///
+    /// The 48 visits, the block snapshots and the message context are all per position, so
+    /// a chunk is carried as one vector per position throughout; only the expert GEMVs and
+    /// (on the card) the projections are shared, which is where the amortisation lives.
+    pub fn prefill(&mut self, tokens: &[u32], chunk: usize) -> Vec<Vec<f32>> {
+        let chunk = chunk.clamp(1, CHUNK_MAX);
+        let mut logits = Vec::with_capacity(tokens.len());
+        let mut at = 0;
+        while at < tokens.len() {
+            let end = (at + chunk).min(tokens.len());
+            logits.extend(self.forward_chunk(&tokens[at..end]));
+            at = end;
+        }
+        logits
+    }
+
+    /// One chunk of positions through the whole stack, returning the logits of every
+    /// position in it (the head is cheap next to a visit, and per-position logits are what
+    /// perplexity needs).
+    fn forward_chunk(&mut self, tokens: &[u32]) -> Vec<Vec<f32>> {
+        let n = tokens.len();
+        let base_pos = self.pos;
+        let eps = self.cfg.rms_eps;
+        let mut h: Vec<Vec<f32>> = tokens.iter().map(|&t| self.embed(t)).collect();
+        let mut blocks: Vec<Vec<Vec<f32>>> = vec![Vec::new(); n];
+
+        let looped = matches!(
+            (self.cfg.loop_count, self.cfg.loop_start, self.cfg.loop_end),
+            (Some(p), Some(s), Some(e)) if p > 1 && e > s
+        );
+        let (passes, start, end) = if looped {
+            (
+                self.cfg.loop_count.unwrap(),
+                self.cfg.loop_start.unwrap(),
+                self.cfg.loop_end.unwrap(),
+            )
+        } else {
+            (1, 0, self.cfg.n_layers)
+        };
+        let visit_of = |layer: usize, pass: usize| -> usize {
+            if layer < start {
+                layer
+            } else if layer < end {
+                start + pass * (end - start) + (layer - start)
+            } else {
+                start + passes * (end - start) + (layer - end)
+            }
+        };
+
+        for layer in 0..start {
+            self.chunk_visit(
+                layer,
+                &mut h,
+                &mut blocks,
+                None,
+                visit_of(layer, 0),
+                base_pos,
+            );
+        }
+        let pre_h = h.clone();
+        let pre_blocks = blocks.clone();
+        let num_pre = blocks.first().map(|b| b.len()).unwrap_or(0);
+
+        // Pass 0 is a plain run over the looped block, with no messages.
+        for layer in start..end {
+            self.chunk_visit(
+                layer,
+                &mut h,
+                &mut blocks,
+                None,
+                visit_of(layer, 0),
+                base_pos,
+            );
+        }
+
+        for pass in 1..passes {
+            let prev_h = h.clone();
+            let prev_blocks: Vec<Vec<Vec<f32>>> = blocks
+                .iter()
+                .map(|b| b.iter().skip((num_pre + 1).min(b.len())).cloned().collect())
+                .collect();
+            h = pre_h.clone();
+            blocks = pre_blocks.clone();
+            for layer in start..end {
+                self.chunk_visit(
+                    layer,
+                    &mut h,
+                    &mut blocks,
+                    Some((&prev_blocks, &prev_h)),
+                    visit_of(layer, pass),
+                    base_pos,
+                );
+            }
+        }
+
+        for layer in end..self.cfg.n_layers {
+            self.chunk_visit(
+                layer,
+                &mut h,
+                &mut blocks,
+                None,
+                visit_of(layer, 0),
+                base_pos,
+            );
+        }
+        self.pos = base_pos + n;
+
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let final_hidden =
+                block_attention(&self.head.query, 1, &blocks[i], &h[i], eps).remove(0);
+            let mut normed = final_hidden;
+            rmsnorm(&mut normed, &self.head.norm, self.head.eps);
+            out.push(self.head.logits(&self.file, &normed));
+        }
+        out
+    }
+
+    /// One visit over a chunk: attention half per position, one batched MoE, FFN half per
+    /// position.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn chunk_visit(
+        &mut self,
+        layer: usize,
+        h: &mut [Vec<f32>],
+        blocks: &mut [Vec<Vec<f32>>],
+        prev: Option<(&Vec<Vec<Vec<f32>>>, &Vec<Vec<f32>>)>,
+        visit: usize,
+        base_pos: usize,
+    ) {
+        let n = h.len();
+        let t_visit = std::time::Instant::now();
+        self.profile.visits += n;
+        let mut residuals: Vec<Vec<f32>> = Vec::with_capacity(n);
+        let mut moe_ins: Vec<Vec<f32>> = Vec::with_capacity(n);
+        for i in 0..n {
+            // The log-scale uses the token's absolute position.
+            self.pos = base_pos + i + 1;
+            let msg = prev.map(|(pb, ph)| self.messages(layer, &pb[i], &ph[i], i));
+            let mut blk = std::mem::take(&mut blocks[i]);
+            let (residual, moe_in) =
+                self.attention_half(layer, &h[i], &mut blk, msg.as_deref(), visit);
+            blocks[i] = blk;
+            residuals.push(residual);
+            moe_ins.push(moe_in);
+        }
+
+        let n_embd = self.cfg.n_embd;
+        let t_moe = std::time::Instant::now();
+        let moe_outs = Self::moe_chunk_parts(
+            &mut self.gpu,
+            &self.moes[layer],
+            &self.file,
+            layer,
+            n_embd,
+            &moe_ins,
+            &mut self.profile,
+        );
+        self.profile.moe += t_moe.elapsed().as_secs_f64();
+        for i in 0..n {
+            h[i] = self.ffn_half(layer, &residuals[i], &moe_outs[i], visit);
+        }
+        self.profile.attention += t_visit.elapsed().as_secs_f64() - t_moe.elapsed().as_secs_f64();
+    }
+
+    /// A chunk of positions through the MoE of one layer.
+    ///
+    /// Positions that routed to the same expert are gathered, so either path pays the
+    /// expert's dequantisation/weight read once per expert instead of once per position.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_chunk_parts(
+        gpu: &mut Option<Gpu>,
+        moe: &Moe,
+        file: &GgufFile,
+        layer: usize,
+        n_embd: usize,
+        xs: &[Vec<f32>],
+        profile: &mut Profile,
+    ) -> Vec<Vec<f32>> {
+        let mut outs = vec![vec![0f32; n_embd]; xs.len()];
+        let gpu_ready = gpu
+            .as_ref()
+            .and_then(|g| g.experts.get(layer))
+            .and_then(|e| e.as_ref())
+            .map(|e| e.complete())
+            .unwrap_or(false);
+        if !gpu_ready {
+            if std::env::var_os("SCORIA_TRACE_CHUNK").is_some() {
+                eprintln!(
+                    "  chunk moe layer {layer}: HOST (resident={})",
+                    gpu.as_ref().map(|g| g.experts.len()).unwrap_or(0)
+                );
+            }
+            moe.forward_chunk(file, xs, &mut outs);
+            return outs;
+        }
+
+        let t_batch = std::time::Instant::now();
+        let (gate_cap, up_cap) = moe.caps();
+        let ff = moe.ff();
+        let e = gpu.as_ref().unwrap().experts[layer].as_ref().unwrap();
+        let (gu_rows, gu_k) = (e.gate_up_rows, e.gate_up_k);
+        let (dn_rows, dn_k) = (e.down_rows, e.down_k);
+        let gu_slab = ((gu_k / 64) * 36) * gu_rows;
+        let dn_slab = ((dn_k / 64) * 36) * dn_rows;
+        let gu_ptr = e.gate_up.as_ref().unwrap().as_ptr();
+        let dn_ptr = e.down.as_ref().unwrap().as_ptr();
+        let gu_outer = e.gate_up_outer.clone();
+        let dn_outer = e.down_outer.clone();
+        let handle = gpu.as_ref().unwrap().ctx.infer.linear_nvfp4;
+
+        // Routing for every position, then a gather per expert.
+        let routes: Vec<crate::inkling2_moe::Route> =
+            xs.iter().map(|x| moe.route_pure(x)).collect();
+        let mut buckets: Vec<Vec<(usize, f32)>> = vec![Vec::new(); gu_outer.len()];
+        for (pos, route) in routes.iter().enumerate() {
+            for (slot, &expert) in route.indices.iter().enumerate() {
+                buckets[expert].push((pos, route.weights[slot]));
+            }
+        }
+        let mut groups: Vec<(usize, usize, usize)> = Vec::new();
+        let mut flat: Vec<f32> = Vec::new();
+        let mut offset = 0usize;
+        for (expert, hits) in buckets.iter().enumerate() {
+            if hits.is_empty() {
+                continue;
+            }
+            groups.push((expert, offset, hits.len()));
+            for (pos, _) in hits {
+                flat.extend_from_slice(&xs[*pos]);
+            }
+            offset += hits.len();
+        }
+        let gate_up = gpu
+            .as_mut()
+            .unwrap()
+            .run_groups(handle, gu_ptr, gu_slab, &groups, &flat, gu_k, gu_rows);
+
+        // SwiGLU per (position, expert), with the outer scale applied where the CPU does.
+        let mut per_position: Vec<Vec<(usize, Vec<f32>)>> = vec![Vec::new(); xs.len()];
+        let (mut g, mut u, mut act) = (vec![0f32; ff], vec![0f32; ff], vec![0f32; ff]);
+        let mut base = 0usize;
+        for (expert, hits) in buckets.iter().enumerate() {
+            if hits.is_empty() {
+                continue;
+            }
+            let scale = gu_outer[expert];
+            for (which, (pos, weight)) in hits.iter().enumerate() {
+                let row = &gate_up[(base + which) * gu_rows..(base + which + 1) * gu_rows];
+                for (dst, src) in g.iter_mut().zip(&row[..ff]) {
+                    *dst = src * scale;
+                }
+                for (dst, src) in u.iter_mut().zip(&row[ff..]) {
+                    *dst = src * scale;
+                }
+                swiglu_softcapped_public(&g, &u, gate_cap, up_cap, &mut act);
+                per_position[*pos].push((expert, {
+                    let mut a = act.clone();
+                    a.push(*weight);
+                    a
+                }));
+            }
+            base += hits.len();
+        }
+
+        // Down phase: gather the activations the same way.
+        // Group the gathered activations in expert order.
+        let mut by_expert: Vec<Vec<(usize, &[f32], f32)>> = vec![Vec::new(); gu_outer.len()];
+        for (pos, entries) in per_position.iter().enumerate() {
+            for (expert, payload) in entries {
+                let weight = payload[ff];
+                by_expert[*expert].push((pos, &payload[..ff], weight));
+            }
+        }
+        let mut flat_acts: Vec<f32> = Vec::new();
+        let mut offsets: Vec<(usize, usize, usize)> = Vec::new();
+        // The second gather starts at zero again: `offset` is an index into the batch
+        // buffers, and carrying it over from the gate/up gather writes the down outputs past
+        // the region that is downloaded, so the caller reads back stale gate/up values.
+        offset = 0;
+        for (expert, hits) in by_expert.iter().enumerate() {
+            if hits.is_empty() {
+                continue;
+            }
+            offsets.push((expert, offset, hits.len()));
+            for (_, act_slice, _) in hits {
+                flat_acts.extend_from_slice(act_slice);
+            }
+            offset += hits.len();
+        }
+        let downs = gpu
+            .as_mut()
+            .unwrap()
+            .run_groups(handle, dn_ptr, dn_slab, &offsets, &flat_acts, dn_k, dn_rows);
+        let mut base = 0usize;
+        for (expert, hits) in by_expert.iter().enumerate() {
+            if hits.is_empty() {
+                continue;
+            }
+            let scale = dn_outer[expert];
+            for (which, (pos, _, weight)) in hits.iter().enumerate() {
+                let row = &downs[(base + which) * dn_rows..(base + which + 1) * dn_rows];
+                for (a, m) in outs[*pos].iter_mut().zip(row) {
+                    *a += weight * m * scale;
+                }
+            }
+            base += hits.len();
+        }
+        profile.gpu_experts += t_batch.elapsed().as_secs_f64();
+        outs
     }
 
     /// The top-`k` `(token, logit)` pairs, highest first.

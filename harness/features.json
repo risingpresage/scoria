@@ -7,6 +7,15 @@
   ],
   "features": [
     {
+      "id": "phase3-inkling2-batched-prefill",
+      "phase": 3,
+      "title": "Chunked batched prefill (expert-gathered) + perplexity correction",
+      "status": "verified",
+      "verify": "scoria logits <gguf> --perp <text> --prefill-chunk 8 --compare-single && ./scripts/check.sh",
+      "observed": "Prefill is a separate measured path: chunk 8 -> 0.70-0.83 s/token (1.20-1.43 tok/s), chunk 1 -> 1.4-2.3 s/token, perplexity 7.598 at every chunk size. Verified on both the GPU and host paths: chunk 1/2/4/8 vs the single-position path agree to max |dlogit| 3.3e-5 with argmax matching at every position. Gate green (heavy model test now runs in a release step).",
+      "note": "Prefill is SLOWER than decode (0.47 s/token). Expert batching cannot help much: 8 positions x 8 experts = 64 draws over 128 experts, so ~50 distinct experts and 1.28 positions per expert. The outstanding win is batched projection GEMVs (m = chunk), which have perfect weight reuse. Two bugs fixed: chunked loop pass 0 was skipped; the GPU down-phase gather did not reset its batch offset and read back stale gate/up values."
+    },
+    {
       "id": "phase3-inkling2-kv-ring-long-context",
       "phase": 3,
       "title": "Windowed KV ring with exact eviction, and a measured 1100-token run",

@@ -217,6 +217,46 @@ The 48 visits used to append to 48 unbounded `Vec`s: 393 KB of KV per token, 78 
 
 **What this does and does not do for Strata.** The windowed ring *is* an eviction policy, and the expert residency set *is* a residency policy; both are now real. What is still absent is a **tiered** store with LRU, prefetch and demotion. For full-history KV that is not an oversight: those 8 visits read every earlier position on every token, so paging them would mean 13.1 GB of reads per token -- a policy cannot fix that, only a different attention algorithm (sparse or chunked) could.
 
+## 2026-11-28 — batched prefill, and a correction: the perplexity I reported was double-fed
+**Correction first.** `scoria logits --perp` forwarded the tokens once to print per-step output and then scored them *again without resetting the KV cache*, so the model was attending over its own earlier pass. That is why it reported **1.317** for prose whose true perplexity is **7.598** (2.028 nats, top-1 16/37). The fix is one line (`model.reset()` before scoring) and the number is now 7.598 on the same text. This affects three earlier entries' perplexity figures; it does **not** affect the model itself — the `" Paris."` generation and the GPU-vs-host `max |dlogit| 3.1e-5` parity both stand, because the parity check replays a prefix once.
+
+The independent confirmation is the new prefill path: written separately, it produced **7.598** as well.
+
+**Batched prefill.** `Model::prefill(tokens, chunk)` carries one vector per position through all 48 visits, with per-position block snapshots and message context, causal attention per position, and the expert GEMVs **gathered by expert** so an expert is dequantised once for every position that routed to it.
+
+| chunk | vs single-position path |
+| 1 | max |dlogit| 5.3e-5, argmax agrees 38/38 |
+| 2 | 4.4e-5, 8/8 |
+| 4 | 4.4e-5, 8/8 |
+| 8 | 4.4e-5, 8/8 |
+
+Perplexity is identical for chunk 1 and chunk 8 (7.598), which is the property that matters: batching changes nothing but the order of a few additions.
+
+**Bug found while verifying:** the chunked path skipped loop **pass 0** — the same bug I had already fixed in the single-position path and reintroduced here. Caught only because the chunked and single paths disagreed at loop layer 6; per-visit hidden norms matched exactly up to that point.
+
+**Measured, honestly:** the host batched MoE is **single-threaded** (`Moe::forward_chunk` has no thread pool yet), so the host prefill path is 5.2 s/token — slower than the threaded single-position path. The batched *GPU* path is what this change exists for, and it is measured separately below. The 4096-token run was killed at the 90-minute timeout while sharing the machine with these measurements, so the largest context that has actually completed remains **1100 tokens**.
+
+## 2026-11-28 — prefill measured as its own path; it is slower than decode, and here is why
+`scoria logits --prefill-chunk N` runs a batched prefill and reports prefill tok/s separately from decode.
+
+| chunk | prefill s/token | prefill tok/s | perplexity |
+| 1 | 1.4-2.3 | 0.43-0.73 | 7.598 |
+| 4 | 1.3-1.7 | 0.58-0.75 | 7.598 |
+| 8 | **0.70-0.83** | **1.20-1.43** | 7.598 |
+
+Decode is 0.47 s/token (2.1 tok/s), so **prefill is currently slower than decode** — the honest result, and the reason is not mysterious:
+
+* **The expert batching barely helps, and arithmetic says it cannot.** A chunk of 8 positions makes 64 expert draws over 128 experts, so the expected number of *distinct* experts is ~50 and the average positions-per-expert is 1.28. Dequantising once per expert instead of once per position therefore saves ~20%, not 8x. The gather overhead costs more than that.
+* **The projections are where batching should pay, and they are still per-position.** Each visit still issues six single-row GEMVs with their own launch and synchronise per position. That is measurable: per visit the chunk path spends 0.003 s on the attention half against decode's 0.0021 s, and 0.012 s on the MoE against 0.0058 s.
+
+So the next increment is not more MoE batching — it is the projections with `m = chunk`, which have *perfect* reuse (the same weights for every position in the chunk).
+
+**Two bugs found and fixed while building this:**
+1. The chunked path skipped loop **pass 0** (the same bug as the single-position path had, reintroduced).
+2. The GPU down-phase gather did not reset its batch `offset`, so the down outputs were written past the downloaded region and the caller read back **stale gate/up values**. This is why the GPU chunk path produced perplexity 20008 while the host chunk path gave 15.9 on the same text: the chunk path had only ever been verified with `--no-gpu`.
+
+**Verified now, on both paths:** chunk 1/2/4/8 vs the single-position path agree to **max |dlogit| 3.3e-5 with the argmax matching at every position**, and perplexity is 7.598 at every chunk size on the GPU path and 15.903/15.904 on the short text. `./scripts/check.sh` green, with the heavy model-level test moved to a release step (it was stalling the debug suite for over an hour).
+
 ## Parity gate calibration (cosine > 0.999 is prompt-dependent, not an implementation defect)
 - Measured the control that settles it: **llama.cpp's own Vulkan backend vs llama.cpp's own CPU backend** scores `cos = 0.997985` (`maxdiff 1.152`) on the Qwen3-4B harness chat prompt (`151644,872,198,785,…,77091,198`, `m=13`), where scoria scores `0.997652` (`maxdiff 1.103`). Both pick top1 `785`. No GPU implementation reaches 0.999 on that prompt.
 - Forcing prefill onto the scalar FP32 GEMM (`SCORIA_PREFILL_FP32=1`) changes nothing: 4B `0.997614` vs `0.997652` for FP16 WMMA, 8B `0.996415` vs `0.996404`. So the deficit is **not** FP16 WMMA rounding.
