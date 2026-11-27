@@ -4,7 +4,7 @@ use std::ptr;
 use std::time::Instant;
 
 use scoria_gguf::{GgmlType, GgufError, GgufFile, ModelConfig, QuantCodec, TensorInfo};
-use scoria_hip_rt::{DeviceBuf, HipError, HipEvent, HipResult, HipStream};
+use scoria_hip_rt::{DeviceBuf, HipError, HipEvent, HipGraphExec, HipResult, HipStream};
 
 use crate::{
     EngineContext, ExecutionGraph, KvSlotKey, LayerSpec, LinearKernel, MixerKind, Stage,
@@ -40,14 +40,14 @@ impl KernelArg for f32 {
 
 macro_rules! hip_launch {
     ($ctx:expr, $stream:expr, $handle:expr, $grid:expr, $block:expr; $($val:expr),+ $(,)?) => {{
-        hip_launch!(@step $ctx, $stream, $handle, $grid, $block; []; $($val),+)
+        hip_launch!(@step $ctx, $stream, $handle, $grid, $block, 0u32; []; $($val),+)
     }};
-    (@step $ctx:expr, $stream:expr, $handle:expr, $grid:expr, $block:expr; [$($ptr:ident),*]; $head:expr, $($tail:expr),+) => {{
+    (@step $ctx:expr, $stream:expr, $handle:expr, $grid:expr, $block:expr, $smem:expr; [$($ptr:ident),*]; $head:expr, $($tail:expr),+) => {{
         let mut arg = $head;
         let ptr = KernelArg::as_arg_ptr(&mut arg);
-        hip_launch!(@step $ctx, $stream, $handle, $grid, $block; [$($ptr,)* ptr]; $($tail),+)
+        hip_launch!(@step $ctx, $stream, $handle, $grid, $block, $smem; [$($ptr,)* ptr]; $($tail),+)
     }};
-    (@step $ctx:expr, $stream:expr, $handle:expr, $grid:expr, $block:expr; [$($ptr:ident),*]; $last:expr) => {{
+    (@step $ctx:expr, $stream:expr, $handle:expr, $grid:expr, $block:expr, $smem:expr; [$($ptr:ident),*]; $last:expr) => {{
         let mut arg = $last;
         let ptr = KernelArg::as_arg_ptr(&mut arg);
         let mut args = [$($ptr,)* ptr];
@@ -56,11 +56,18 @@ macro_rules! hip_launch {
                 $handle,
                 $grid,
                 $block,
-                0,
+                $smem,
                 $stream,
                 &mut args,
             )
         }
+    }};
+}
+
+/// Like [`hip_launch!`] but with an explicit dynamic shared-memory size.
+macro_rules! hip_launch_smem {
+    ($ctx:expr, $stream:expr, $handle:expr, $grid:expr, $block:expr, $smem:expr; $($val:expr),+ $(,)?) => {{
+        hip_launch!(@step $ctx, $stream, $handle, $grid, $block, $smem; []; $($val),+)
     }};
 }
 
@@ -220,6 +227,8 @@ struct LayerWeights {
     attn_k_bias: Option<usize>,
     attn_v: usize,
     attn_v_bias: Option<usize>,
+    attn_q_norm: Option<usize>,
+    attn_k_norm: Option<usize>,
     attn_output: usize,
     ffn_norm: usize,
     ffn_gate: usize,
@@ -230,6 +239,7 @@ struct LayerWeights {
 struct ScratchBuffers {
     max_batch: usize,
     token_ids: DeviceBuf,
+    pos: DeviceBuf,
     hidden: DeviceBuf,
     normed: DeviceBuf,
     q: DeviceBuf,
@@ -254,6 +264,7 @@ impl ScratchBuffers {
         Ok(Self {
             max_batch,
             token_ids: DeviceBuf::alloc(max_batch * std::mem::size_of::<u32>())?,
+            pos: DeviceBuf::alloc(std::mem::size_of::<u32>())?,
             hidden: DeviceBuf::alloc(max_batch * cfg.n_embd * f32_sz)?,
             normed: DeviceBuf::alloc(max_batch * cfg.n_embd * f32_sz)?,
             q: DeviceBuf::alloc(max_batch * q_dim * f32_sz)?,
@@ -317,12 +328,13 @@ impl Qwen2Model {
         max_seq: usize,
     ) -> Result<Self, ModelLoadError> {
         let config = ModelConfig::from_gguf(gguf)?;
-        if config.architecture != "qwen2" {
+        if config.architecture != "qwen2" && config.architecture != "qwen3" {
             return Err(ModelLoadError::Unsupported(format!(
-                "expected architecture `qwen2`, got `{}`",
+                "expected architecture `qwen2` or `qwen3`, got `{}`",
                 config.architecture
             )));
         }
+        let is_qwen3 = config.architecture == "qwen3";
 
         let linear_kernel = ReferenceLinearKernel;
         let mut store = VramTensorStore::new();
@@ -345,6 +357,16 @@ impl Qwen2Model {
                 attn_k_bias: upload_optional(gguf, &mut store, &format!("blk.{l}.attn_k.bias"))?,
                 attn_v: upload_required(gguf, &mut store, &format!("blk.{l}.attn_v.weight"))?,
                 attn_v_bias: upload_optional(gguf, &mut store, &format!("blk.{l}.attn_v.bias"))?,
+                attn_q_norm: upload_optional(
+                    gguf,
+                    &mut store,
+                    &format!("blk.{l}.attn_q_norm.weight"),
+                )?,
+                attn_k_norm: upload_optional(
+                    gguf,
+                    &mut store,
+                    &format!("blk.{l}.attn_k_norm.weight"),
+                )?,
                 attn_output: upload_required(
                     gguf,
                     &mut store,
@@ -355,6 +377,11 @@ impl Qwen2Model {
                 ffn_up: upload_required(gguf, &mut store, &format!("blk.{l}.ffn_up.weight"))?,
                 ffn_down: upload_required(gguf, &mut store, &format!("blk.{l}.ffn_down.weight"))?,
             };
+            if is_qwen3 && (lw.attn_q_norm.is_none() || lw.attn_k_norm.is_none()) {
+                return Err(ModelLoadError::Unsupported(format!(
+                    "qwen3 layer {l} is missing attn_q_norm/attn_k_norm"
+                )));
+            }
             for &idx in &[
                 lw.attn_q,
                 lw.attn_k,
@@ -440,14 +467,8 @@ impl Qwen2Model {
         );
 
         let total_chunks = tokens.len().div_ceil(self.scratch.max_batch);
-        let steps = self.graph.expand_steps();
-        let q_dim = self.config.n_heads * self.config.head_dim;
-        let kv_dim = self.config.n_kv_heads * self.config.head_dim;
-
         for (chunk_idx, chunk) in tokens.chunks(self.scratch.max_batch).enumerate() {
             let m = chunk.len();
-            let start_pos = self.pos;
-
             let tok_bytes = unsafe {
                 std::slice::from_raw_parts(
                     chunk.as_ptr() as *const u8,
@@ -455,7 +476,36 @@ impl Qwen2Model {
                 )
             };
             self.scratch.token_ids.copy_from_host_at(0, tok_bytes)?;
+            self.write_device_pos()?;
+            let is_last_chunk = chunk_idx + 1 == total_chunks;
+            self.run_layers(ctx, m, is_last_chunk, &mut tap)?;
+            self.pos += m;
+        }
+        Ok(())
+    }
 
+    /// Publishes the host-side sequence position into the device slot read by the
+    /// RoPE / KV-append / attention kernels, so those launches can be replayed from a
+    /// captured graph with no host round trip.
+    fn write_device_pos(&mut self) -> HipResult<()> {
+        let bytes = (self.pos as u32).to_le_bytes();
+        self.scratch.pos.copy_from_host_at(0, &bytes)
+    }
+
+    /// One forward pass over `m` tokens already staged in `scratch.token_ids` and
+    /// `scratch.pos`. Free of host synchronisation, so it is capture-safe.
+    fn run_layers(
+        &mut self,
+        ctx: &EngineContext,
+        m: usize,
+        is_last_chunk: bool,
+        tap: &mut Option<LayerTap<'_>>,
+    ) -> HipResult<()> {
+        let steps = self.graph.expand_steps();
+        let q_dim = self.config.n_heads * self.config.head_dim;
+        let kv_dim = self.config.n_kv_heads * self.config.head_dim;
+
+        {
             let embd = self.store.get(self.token_embd);
             launch_embed(
                 ctx,
@@ -485,7 +535,7 @@ impl Qwen2Model {
                     )?;
                 }
                 maybe_tap(
-                    &mut tap,
+                    tap,
                     &self.stream,
                     &format!("attn_norm-{l}"),
                     &self.scratch.normed,
@@ -539,34 +589,50 @@ impl Qwen2Model {
                     self.config.n_embd,
                 )?;
 
+                if let (Some(qn), Some(kn)) = (lw.attn_q_norm, lw.attn_k_norm) {
+                    launch_qk_rmsnorm(
+                        ctx,
+                        &self.stream,
+                        self.scratch.q.as_ptr(),
+                        self.scratch.k.as_ptr(),
+                        self.store.get(qn).buf.as_ptr(),
+                        self.store.get(kn).buf.as_ptr(),
+                        m,
+                        self.config.n_heads,
+                        self.config.n_kv_heads,
+                        self.config.head_dim,
+                        self.config.rms_eps,
+                    )?;
+                }
+
                 launch_rope_neox(
                     ctx,
                     &self.stream,
                     self.scratch.q.as_ptr(),
                     self.scratch.k.as_ptr(),
+                    self.scratch.pos.as_ptr(),
                     m,
-                    start_pos,
                     self.config.n_heads,
                     self.config.n_kv_heads,
                     self.config.head_dim,
                     self.config.rope_freq_base,
                 )?;
                 maybe_tap(
-                    &mut tap,
+                    tap,
                     &self.stream,
                     &format!("Qcur-{l}"),
                     &self.scratch.q,
                     m * q_dim,
                 )?;
                 maybe_tap(
-                    &mut tap,
+                    tap,
                     &self.stream,
                     &format!("Kcur-{l}"),
                     &self.scratch.k,
                     m * kv_dim,
                 )?;
                 maybe_tap(
-                    &mut tap,
+                    tap,
                     &self.stream,
                     &format!("Vcur-{l}"),
                     &self.scratch.v,
@@ -584,8 +650,8 @@ impl Qwen2Model {
                     self.scratch.v.as_ptr(),
                     k_cache.as_ptr(),
                     v_cache.as_ptr(),
+                    self.scratch.pos.as_ptr(),
                     m,
-                    start_pos,
                     kv_dim,
                 )?;
 
@@ -596,8 +662,8 @@ impl Qwen2Model {
                     k_cache.as_ptr(),
                     v_cache.as_ptr(),
                     self.scratch.attn_out.as_ptr(),
+                    self.scratch.pos.as_ptr(),
                     m,
-                    start_pos,
                     self.config.n_heads,
                     self.config.n_kv_heads,
                     self.config.head_dim,
@@ -627,7 +693,7 @@ impl Qwen2Model {
                     self.config.rms_eps,
                 )?;
                 maybe_tap(
-                    &mut tap,
+                    tap,
                     &self.stream,
                     &format!("ffn_inp-{l}"),
                     &self.scratch.hidden,
@@ -690,13 +756,13 @@ impl Qwen2Model {
                         self.config.rms_eps,
                     )?;
                     maybe_tap(
-                        &mut tap,
+                        tap,
                         &self.stream,
                         &format!("l_out-{l}"),
                         &self.scratch.hidden,
                         m * self.config.n_embd,
                     )?;
-                } else if chunk_idx + 1 == total_chunks && m == 1 {
+                } else if is_last_chunk && m == 1 {
                     launch_add_rmsnorm(
                         ctx,
                         &self.stream,
@@ -709,7 +775,7 @@ impl Qwen2Model {
                         self.config.rms_eps,
                     )?;
                     maybe_tap(
-                        &mut tap,
+                        tap,
                         &self.stream,
                         &format!("l_out-{l}"),
                         &self.scratch.hidden,
@@ -724,7 +790,7 @@ impl Qwen2Model {
                         m * self.config.n_embd,
                     )?;
                     maybe_tap(
-                        &mut tap,
+                        tap,
                         &self.stream,
                         &format!("l_out-{l}"),
                         &self.scratch.hidden,
@@ -733,9 +799,7 @@ impl Qwen2Model {
                 }
             }
 
-            self.pos += m;
-
-            if chunk_idx + 1 == total_chunks {
+            if is_last_chunk {
                 if m > 1 {
                     let last_byte_off = (m - 1) * self.config.n_embd * std::mem::size_of::<f32>();
                     let last_hidden_ptr =
@@ -754,7 +818,7 @@ impl Qwen2Model {
                     )?;
                 }
                 maybe_tap(
-                    &mut tap,
+                    tap,
                     &self.stream,
                     "result_norm",
                     &self.scratch.normed,
@@ -778,7 +842,9 @@ impl Qwen2Model {
         Ok(())
     }
 
-    fn argmax_device_logits(&self, ctx: &EngineContext) -> HipResult<u32> {
+    /// Two-stage device argmax over `scratch.logits` into `scratch.argmax_out`.
+    /// Capture-safe: no host synchronisation.
+    fn launch_argmax(&self, ctx: &EngineContext) -> HipResult<()> {
         hip_launch!(
             ctx,
             &self.stream,
@@ -800,12 +866,70 @@ impl Qwen2Model {
             self.scratch.argmax_idxs.as_ptr(),
             self.scratch.argmax_out.as_ptr(),
             64u32
-        )?;
+        )
+    }
 
+    /// Closes the decode loop on-device: sample -> `token_ids`, `pos += 1`.
+    fn launch_decode_advance(&self, ctx: &EngineContext) -> HipResult<()> {
+        hip_launch!(
+            ctx,
+            &self.stream,
+            ctx.infer.decode_advance_u32,
+            [1, 1, 1],
+            [1, 1, 1];
+            self.scratch.argmax_out.as_ptr(),
+            self.scratch.token_ids.as_ptr(),
+            self.scratch.pos.as_ptr()
+        )
+    }
+
+    fn argmax_device_logits(&self, ctx: &EngineContext) -> HipResult<u32> {
+        self.launch_argmax(ctx)?;
         self.stream.synchronize()?;
         let mut tok_bytes = [0u8; 4];
         self.scratch.argmax_out.copy_to_host(&mut tok_bytes)?;
         Ok(u32::from_le_bytes(tok_bytes))
+    }
+
+    /// Captures one single-token decode step (layers + argmax + advance) as a HIP
+    /// graph. Requires `scratch.token_ids` and the device position to already hold
+    /// the first decode input; `decode_graph_next` then feeds it back each replay.
+    pub fn capture_decode_graph(&mut self, ctx: &EngineContext) -> HipResult<HipGraphExec> {
+        self.write_device_pos()?;
+        self.stream.synchronize()?;
+        self.stream.begin_capture()?;
+        let mut no_tap: Option<LayerTap<'_>> = None;
+        let captured = self
+            .run_layers(ctx, 1, true, &mut no_tap)
+            .and_then(|()| self.launch_argmax(ctx))
+            .and_then(|()| self.launch_decode_advance(ctx));
+        let graph = self.stream.end_capture()?;
+        captured?;
+        graph.instantiate()
+    }
+
+    /// Seeds the on-device decode input slot (token) so the first graph replay reads it.
+    pub fn seed_decode_token(&mut self, _ctx: &EngineContext, token: u32) -> HipResult<()> {
+        self.scratch
+            .token_ids
+            .copy_from_host_at(0, &token.to_le_bytes())
+    }
+
+    /// Replays the captured decode graph and returns the sampled token.
+    pub fn decode_graph_next(
+        &mut self,
+        graph: &HipGraphExec,
+        max_seq: usize,
+    ) -> HipResult<Option<u32>> {
+        if self.pos + 1 > max_seq {
+            return Ok(None);
+        }
+        graph.launch(&self.stream)?;
+        self.stream.synchronize()?;
+        let mut tok_bytes = [0u8; 4];
+        self.scratch.argmax_out.copy_to_host(&mut tok_bytes)?;
+        self.pos += 1;
+        Ok(Some(u32::from_le_bytes(tok_bytes)))
     }
 
     pub fn generate_greedy(
@@ -836,13 +960,23 @@ impl Qwen2Model {
         generated.push(next_tok);
 
         let t_decode0 = Instant::now();
-        for _ in 1..max_new_tokens {
-            if !ignore_eos && eos_token_id == Some(next_tok) {
-                break;
+        if max_new_tokens > 1 {
+            // Seed the on-device input slot with the prefill sample, then replay one
+            // captured decode step per token.
+            self.scratch
+                .token_ids
+                .copy_from_host_at(0, &next_tok.to_le_bytes())?;
+            let graph = self.capture_decode_graph(ctx)?;
+            while generated.len() < max_new_tokens {
+                if !ignore_eos && eos_token_id == Some(next_tok) {
+                    break;
+                }
+                let Some(tok) = self.decode_graph_next(&graph, self.kv_cache.max_seq)? else {
+                    break;
+                };
+                next_tok = tok;
+                generated.push(next_tok);
             }
-            self.forward_tokens_to_device(ctx, &[next_tok], None)?;
-            next_tok = self.argmax_device_logits(ctx)?;
-            generated.push(next_tok);
         }
         let decode_ms = t_decode0.elapsed().as_secs_f64() * 1000.0;
 
@@ -861,7 +995,6 @@ impl Qwen2Model {
     ) -> HipResult<DecodeProfile> {
         let mut prof = DecodeProfile::default();
         let t_wall0 = Instant::now();
-        let start_pos = self.pos;
         let q_dim = self.config.n_heads * self.config.head_dim;
         let kv_dim = self.config.n_kv_heads * self.config.head_dim;
 
@@ -879,6 +1012,7 @@ impl Qwen2Model {
 
         let tok_bytes = token.to_le_bytes();
         self.scratch.token_ids.copy_from_host_at(0, &tok_bytes)?;
+        self.write_device_pos()?;
         let embd = self.store.get(self.token_embd);
         timed!(
             other_ms,
@@ -968,6 +1102,25 @@ impl Qwen2Model {
                 }
             }
 
+            if let (Some(qn), Some(kn)) = (lw.attn_q_norm, lw.attn_k_norm) {
+                timed!(
+                    other_ms,
+                    launch_qk_rmsnorm(
+                        ctx,
+                        &self.stream,
+                        self.scratch.q.as_ptr(),
+                        self.scratch.k.as_ptr(),
+                        self.store.get(qn).buf.as_ptr(),
+                        self.store.get(kn).buf.as_ptr(),
+                        1,
+                        self.config.n_heads,
+                        self.config.n_kv_heads,
+                        self.config.head_dim,
+                        self.config.rms_eps,
+                    )
+                );
+            }
+
             timed!(
                 other_ms,
                 launch_rope_neox(
@@ -975,8 +1128,8 @@ impl Qwen2Model {
                     &self.stream,
                     self.scratch.q.as_ptr(),
                     self.scratch.k.as_ptr(),
+                    self.scratch.pos.as_ptr(),
                     1,
-                    start_pos,
                     self.config.n_heads,
                     self.config.n_kv_heads,
                     self.config.head_dim,
@@ -994,8 +1147,8 @@ impl Qwen2Model {
                     self.scratch.v.as_ptr(),
                     k_cache.as_ptr(),
                     v_cache.as_ptr(),
+                    self.scratch.pos.as_ptr(),
                     1,
-                    start_pos,
                     kv_dim,
                 )
             );
@@ -1009,8 +1162,8 @@ impl Qwen2Model {
                     k_cache.as_ptr(),
                     v_cache.as_ptr(),
                     self.scratch.attn_out.as_ptr(),
+                    self.scratch.pos.as_ptr(),
                     1,
-                    start_pos,
                     self.config.n_heads,
                     self.config.n_kv_heads,
                     self.config.head_dim,
@@ -1239,6 +1392,7 @@ fn launch_embed(
         GgmlType::F16 => ctx.infer.embed_f16,
         GgmlType::Q8_0 => ctx.infer.embed_q8_0,
         GgmlType::Q4K => ctx.infer.embed_q4_k,
+        GgmlType::Q6K => ctx.infer.embed_q6_k,
         other => panic!("unsupported embedding type {:?}", other),
     };
     hip_launch!(
@@ -1281,6 +1435,18 @@ fn launch_rmsnorm(
     )
 }
 
+/// `SCORIA_Q4K_ROWS=2|4|8` forces the Q4_K GEMV rows per workgroup; unset keeps the
+/// adaptive default. Used by the C-A-C sweep in `harness/ledger.jsonl`.
+fn q4k_rows_override() -> Option<u32> {
+    static OVERRIDE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        std::env::var("SCORIA_Q4K_ROWS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|r| matches!(r, 2 | 4 | 8))
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn launch_linear(
     ctx: &EngineContext,
@@ -1294,22 +1460,52 @@ fn launch_linear(
     k: usize,
 ) -> HipResult<()> {
     if m == 1 {
+        // Q4_K blocks are 16 superblock-groups wide; grow the rows per workgroup when
+        // `k` is short so every group stays busy (see `gemv_q4_k_rows_impl`).
+        let q4k_rows: u32 = match q4k_rows_override() {
+            Some(r) => r,
+            None if k < 2048 => 8,
+            None => 4,
+        };
         let rows_per_wg = 128u32 / ctx.wave_size;
         let gemv_cfg = match weight.ggml_type {
-            GgmlType::F16 => Some((ctx.infer.gemv_f16_f32, n as u32)),
-            GgmlType::Q5_0 => Some((ctx.infer.gemv_q5_0_f32, (n as u32).div_ceil(rows_per_wg))),
-            GgmlType::Q8_0 => Some((ctx.infer.gemv_q8_0_f32, (n as u32).div_ceil(rows_per_wg))),
-            GgmlType::Q4K => Some((ctx.infer.gemv_q4_k_f32, (n as u32).div_ceil(2))),
-            GgmlType::Q6K => Some((ctx.infer.gemv_q6_k_f32, (n as u32).div_ceil(2))),
+            GgmlType::F16 => Some((ctx.infer.gemv_f16_f32, n as u32, 1u32, 0usize)),
+            GgmlType::Q5_0 => Some((
+                ctx.infer.gemv_q5_0_f32,
+                (n as u32).div_ceil(rows_per_wg),
+                1u32,
+                0usize,
+            )),
+            GgmlType::Q8_0 => Some((
+                ctx.infer.gemv_q8_0_f32,
+                (n as u32).div_ceil(rows_per_wg),
+                1u32,
+                0usize,
+            )),
+            GgmlType::Q4K => {
+                let handle = match q4k_rows {
+                    2 => ctx.infer.gemv_q4_k_f32,
+                    4 => ctx.infer.gemv_q4_k_r4_f32,
+                    _ => ctx.infer.gemv_q4_k_r8_f32,
+                };
+                Some((handle, (n as u32).div_ceil(q4k_rows), q4k_rows, 0usize))
+            }
+            GgmlType::Q6K => Some((
+                ctx.infer.gemv_q6_k_f32,
+                (n as u32).div_ceil(2),
+                1u32,
+                0usize,
+            )),
             _ => None,
         };
-        if let Some((handle, grid_x)) = gemv_cfg {
-            return hip_launch!(
+        if let Some((handle, grid_x, _rows, shared_bytes)) = gemv_cfg {
+            return hip_launch_smem!(
                 ctx,
                 stream,
                 handle,
                 [grid_x, 1, 1],
-                [128, 1, 1];
+                [128, 1, 1],
+                shared_bytes as u32;
                 weight.buf.as_ptr(),
                 x_ptr,
                 bias_ptr,
@@ -1320,21 +1516,40 @@ fn launch_linear(
         }
     }
 
+    // NB: the m < 8 scalar path is kept deliberately. WMMA rounds activations and
+    // weights to FP16, which costs ~1.5e-3 cosine on 2-7 token prompts (0.9999 ->
+    // 0.9984 on the 7B) even though greedy tokens still match; the parity gate wins.
     if m >= 8 && k.is_multiple_of(32) && ctx.arch.is_rdna4() {
-        let wmma_handle = match weight.ggml_type {
-            GgmlType::F16 => ctx.infer.gemm_wmma_f16,
-            GgmlType::Q5_0 => ctx.infer.gemm_wmma_q5_0,
-            GgmlType::Q8_0 => ctx.infer.gemm_wmma_q8_0,
-            GgmlType::Q4K => ctx.infer.gemm_wmma_q4_k,
-            GgmlType::Q6K => ctx.infer.gemm_wmma_q6_k,
-            _ => None,
+        // Wide 64x128 tile has ~2x the arithmetic intensity, but needs >=128 blocks to
+        // fill the 64 CUs; smaller matrices keep the 32x64 tile instead.
+        let wide_blocks = (n as u32).div_ceil(128) as u64 * (m as u32).div_ceil(64) as u64;
+        let (wmma_handle, tile_n, tile_m) = if wide_blocks >= 128 {
+            let h = match weight.ggml_type {
+                GgmlType::F16 => ctx.infer.gemm_wmma_f16,
+                GgmlType::Q5_0 => ctx.infer.gemm_wmma_q5_0,
+                GgmlType::Q8_0 => ctx.infer.gemm_wmma_q8_0,
+                GgmlType::Q4K => ctx.infer.gemm_wmma_q4_k,
+                GgmlType::Q6K => ctx.infer.gemm_wmma_q6_k,
+                _ => None,
+            };
+            (h, 128u32, 64u32)
+        } else {
+            let h = match weight.ggml_type {
+                GgmlType::F16 => ctx.infer.gemm_wmma_narrow_f16,
+                GgmlType::Q5_0 => ctx.infer.gemm_wmma_narrow_q5_0,
+                GgmlType::Q8_0 => ctx.infer.gemm_wmma_narrow_q8_0,
+                GgmlType::Q4K => ctx.infer.gemm_wmma_narrow_q4_k,
+                GgmlType::Q6K => ctx.infer.gemm_wmma_narrow_q6_k,
+                _ => None,
+            };
+            (h, 64u32, 32u32)
         };
         if let Some(handle) = wmma_handle {
             return hip_launch!(
                 ctx,
                 stream,
                 handle,
-                [(n as u32).div_ceil(64), (m as u32).div_ceil(32), 1],
+                [(n as u32).div_ceil(tile_n), (m as u32).div_ceil(tile_m), 1],
                 [256, 1, 1];
                 weight.buf.as_ptr(),
                 x_ptr,
@@ -1375,13 +1590,45 @@ fn launch_linear(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn launch_qk_rmsnorm(
+    ctx: &EngineContext,
+    stream: &HipStream,
+    q_ptr: *mut c_void,
+    k_ptr: *mut c_void,
+    q_w_ptr: *mut c_void,
+    k_w_ptr: *mut c_void,
+    n_tokens: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    eps: f32,
+) -> HipResult<()> {
+    hip_launch!(
+        ctx,
+        stream,
+        ctx.infer.qk_rmsnorm_f32,
+        [n_tokens as u32, (n_heads + n_kv_heads) as u32, 1],
+        [ctx.wave_size, 1, 1];
+        q_ptr,
+        k_ptr,
+        q_w_ptr,
+        k_w_ptr,
+        n_tokens as u32,
+        n_heads as u32,
+        n_kv_heads as u32,
+        head_dim as u32,
+        eps
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn launch_rope_neox(
     ctx: &EngineContext,
     stream: &HipStream,
     q_ptr: *mut c_void,
     k_ptr: *mut c_void,
+    pos_ptr: *mut c_void,
     m: usize,
-    start_pos: usize,
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
@@ -1396,8 +1643,8 @@ fn launch_rope_neox(
         [block_x, 1, 1];
         q_ptr,
         k_ptr,
+        pos_ptr,
         m as u32,
-        start_pos as u32,
         n_heads as u32,
         n_kv_heads as u32,
         head_dim as u32,
@@ -1413,8 +1660,8 @@ fn launch_kv_append(
     v_in: *mut c_void,
     k_cache: *mut c_void,
     v_cache: *mut c_void,
+    pos_ptr: *mut c_void,
     m: usize,
-    start_pos: usize,
     kv_dim: usize,
 ) -> HipResult<()> {
     let total = (m * kv_dim) as u32;
@@ -1428,8 +1675,8 @@ fn launch_kv_append(
         v_in,
         k_cache,
         v_cache,
+        pos_ptr,
         m as u32,
-        start_pos as u32,
         kv_dim as u32
     )
 }
@@ -1442,8 +1689,8 @@ fn launch_gqa_attn(
     k_cache: *mut c_void,
     v_cache: *mut c_void,
     out_ptr: *mut c_void,
+    pos_ptr: *mut c_void,
     m: usize,
-    start_pos: usize,
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
@@ -1458,8 +1705,8 @@ fn launch_gqa_attn(
         k_cache,
         v_cache,
         out_ptr,
+        pos_ptr,
         m as u32,
-        start_pos as u32,
         n_heads as u32,
         n_kv_heads as u32,
         head_dim as u32

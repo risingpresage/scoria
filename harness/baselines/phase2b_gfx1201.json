@@ -1,0 +1,70 @@
+{
+  "phase": "2b",
+  "arch": "gfx1201",
+  "gpu": "AMD Radeon RX 9070 XT (16 GiB GDDR6, 64 CUs, Wave32)",
+  "ledger": "harness/ledger.jsonl",
+  "benchmark_script": "scripts/bench_cac.py --trials 3 (in-process --warmup 1, matching llama-bench)",
+  "decode_tokens": 64,
+  "trials": 3,
+  "changes": [
+    "qwen3 architecture: per-head q/k RMSNorm (qk_rmsnorm_f32) before RoPE, key_length head_dim, Q6_K embedding lookup for tied Qwen3-4B token_embd",
+    "Q4_K decode GEMV row scaling (gemv_q4_k_r4/r8_f32): rows per workgroup grow as k/256 shrinks so all 16 superblock groups stay busy (Qwen3-4B nb=10 was 62.5% idle)",
+    "hipGraph decode capture: device-resident pos slot (rope/kv_append/gqa_attn read *pos), decode_advance_u32 epilogue (token <- argmax, pos += 1), one graph replay per token",
+    "prefill WMMA 64x128 macro-tile with 4 accumulators/wave (gemm_wmma_*), dispatched when >=128 blocks are available; 32x64 tile kept for small matrices",
+    "scoria graph-soak: 1000-replay hipMemGetInfo leak guard for the decode graph"
+  ],
+  "targets_vs_llamacpp_b11050_vulkan_radv_ngl99": {
+    "qwen3-4b-instruct-2507-q4_k_m": {"pp128": 5826.04, "tg64": 189.32},
+    "qwen3-8b-q4_k_m": {"pp128": 3902.77, "tg64": 111.73},
+    "deepseek-r1-distill-qwen-7b-q4_k_m": {"pp128": 4151.29, "tg64": 121.97}
+  },
+  "phase2b": {
+    "tag": "phase2b_final",
+    "qwen2.5-0.5b-q4_k_m": {
+      "short_prompt_tokens": 26,
+      "short_prefill_tok_s_median": 4265.60,
+      "prefill_128_tok_s_median": 14853.13,
+      "short_decode_tok_s_median": 401.56
+    },
+    "deepseek-r1-distill-qwen-7b-q4_k_m": {
+      "short_prompt_tokens": 20,
+      "short_prefill_tok_s_median": 647.49,
+      "prefill_128_tok_s_median": 2141.72,
+      "short_decode_tok_s_median": 112.52
+    },
+    "qwen3-4b-instruct-2507-q4_k_m": {
+      "short_prompt_tokens": 13,
+      "short_prefill_tok_s_median": 645.86,
+      "prefill_128_tok_s_median": 3615.97,
+      "short_decode_tok_s_median": 154.35
+    },
+    "qwen3-8b-q4_k_m": {
+      "short_prompt_tokens": 13,
+      "short_prefill_tok_s_median": 470.58,
+      "prefill_128_tok_s_median": 2230.71,
+      "short_decode_tok_s_median": 99.90
+    }
+  },
+  "phase2a_comparison": {
+    "qwen2.5-0.5b-q4_k_m": {"decode": 386.22, "pp128": 15534.62},
+    "deepseek-r1-distill-qwen-7b-q4_k_m": {"decode": 111.94, "pp128": 2079.89},
+    "qwen3-4b-instruct-2507-q4_k_m": {"decode": null, "pp128": 3214.11},
+    "qwen3-8b-q4_k_m": {"decode": 95.05, "pp128": 1919.66}
+  },
+  "parity": {
+    "method": "scripts/parity_oracle.py vs libllama.so b11050, llama.cpp CPU reference",
+    "qwen3-4b-instruct-2507-q4_k_m": {"cosine_sim": 0.999656832, "top1_match": true, "greedy": "24/24"},
+    "qwen3-8b-q4_k_m": {"cosine_sim": 0.999335304, "top1_match": true, "greedy": "24/24"},
+    "deepseek-r1-distill-qwen-7b-q4_k_m": {"cosine_sim": 0.999913239, "top1_match": true, "greedy": "24/24 on chat prompt"},
+    "qwen2.5-0.5b-q4_k_m": {"cosine_sim": 0.999345427, "top1_match": true, "greedy": "24/24"},
+    "note": "5-token prompts (m<8, FP32 scalar GEMM path) sit at cos ~0.9983 on the 7B because llama.cpp quantises activations to Q8_K for Q4_K matmul while scoria keeps FP32; greedy tokens still match exactly."
+  },
+  "graph_soak": {
+    "qwen3-8b-q4_k_m": {"replays": 1000, "free_before_mib": 9610.0, "free_after_mib": 9616.0, "drift_mib": -6.0},
+    "qwen3-4b-instruct-2507-q4_k_m": {"replays": 100, "drift_mib": 0.0, "replays_1000_drift_mib": 2.0, "replays_2000_drift_mib": 14.0, "note": "hipMemGetInfo is process-global; drift tracks VRAM held by other GPU clients and stays far under the 64 MiB guard"}
+  },
+  "remaining_gap": {
+    "decode": "Weights are streamed ~492 GB/s on the 8B (5.02 GB/step) vs a 561.66 GB/s measured stream ceiling; lm_head alone reaches ~600 GB/s on the same kernel, so the loss is per-layer launch/fill work rather than raw GEMV.",
+    "prefill": "pp128 has a ~25 ms per-forward constant: Q4_K GEMV fill re-reads the 16 B superblock header once per BK=32 step (8x per 256-weight block) and each weight is read twice at BM=64 with m=128. Marginal rate beyond that constant is ~4165 tok/s on the 8B."
+  }
+}

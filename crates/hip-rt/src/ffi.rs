@@ -9,6 +9,9 @@ pub type hipStream_t = *mut c_void;
 pub type hipEvent_t = *mut c_void;
 pub type hipModule_t = *mut c_void;
 pub type hipFunction_t = *mut c_void;
+pub type hipGraph_t = *mut c_void;
+pub type hipGraphExec_t = *mut c_void;
+pub type hipGraphNode_t = *mut c_void;
 
 pub const HIP_SUCCESS: hipError_t = 0;
 
@@ -19,6 +22,8 @@ pub const HIP_MEMCPY_DEVICE_TO_DEVICE: c_int = 3;
 
 pub const HIP_HOST_MALLOC_DEFAULT: c_uint = 0x0;
 pub const HIP_STREAM_NON_BLOCKING: c_uint = 0x01;
+/// `hipStreamCaptureModeGlobal`.
+pub const HIP_STREAM_CAPTURE_MODE_GLOBAL: c_int = 0;
 pub const HIP_DEVICE_ATTRIBUTE_WARP_SIZE: c_int = 87;
 pub const HIP_DEVICE_PROP_R0600_SIZE: usize = 1472;
 pub const HIP_DEVICE_PROP_R0600_GCN_ARCH_OFFSET: usize = 1160;
@@ -102,6 +107,21 @@ pub struct HipApi {
         extra: *mut *mut c_void,
     ) -> hipError_t,
     pub hipModuleUnload: unsafe extern "C" fn(module: hipModule_t) -> hipError_t,
+
+    pub hipStreamBeginCapture: unsafe extern "C" fn(stream: hipStream_t, mode: c_int) -> hipError_t,
+    pub hipStreamEndCapture:
+        unsafe extern "C" fn(stream: hipStream_t, graph: *mut hipGraph_t) -> hipError_t,
+    pub hipGraphInstantiate: unsafe extern "C" fn(
+        exec: *mut hipGraphExec_t,
+        graph: hipGraph_t,
+        errorNode: *mut hipGraphNode_t,
+        logBuffer: *mut c_char,
+        bufferSize: usize,
+    ) -> hipError_t,
+    pub hipGraphLaunch:
+        unsafe extern "C" fn(exec: hipGraphExec_t, stream: hipStream_t) -> hipError_t,
+    pub hipGraphDestroy: unsafe extern "C" fn(graph: hipGraph_t) -> hipError_t,
+    pub hipGraphExecDestroy: unsafe extern "C" fn(exec: hipGraphExec_t) -> hipError_t,
 }
 
 unsafe impl Send for HipApi {}
@@ -178,6 +198,12 @@ unsafe fn load_hip_api() -> Result<HipApi, String> {
         hipModuleGetFunction: load_sym(handle, "hipModuleGetFunction")?,
         hipModuleLaunchKernel: load_sym(handle, "hipModuleLaunchKernel")?,
         hipModuleUnload: load_sym(handle, "hipModuleUnload")?,
+        hipStreamBeginCapture: load_sym(handle, "hipStreamBeginCapture")?,
+        hipStreamEndCapture: load_sym(handle, "hipStreamEndCapture")?,
+        hipGraphInstantiate: load_sym(handle, "hipGraphInstantiate")?,
+        hipGraphLaunch: load_sym(handle, "hipGraphLaunch")?,
+        hipGraphDestroy: load_sym(handle, "hipGraphDestroy")?,
+        hipGraphExecDestroy: load_sym(handle, "hipGraphExecDestroy")?,
     })
 }
 

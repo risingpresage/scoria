@@ -68,6 +68,15 @@
       "observed": "DeepSeek-R1-Distill-Qwen-7B-Q4_K_M: decode=111.94 tok/s (2.83x Phase 1), prefill(20)=673.11 tok/s (1.29x llama.cpp Vulkan 521.05), prefill(128)=2079.89 tok/s (31.27x Phase 1); Qwen2.5-0.5B-Q4_K_M: decode=386.22 tok/s, prefill(26)=4356.28 tok/s, prefill(128)=15534.62 tok/s; parity cos=0.999413 (0.5B, 32/32) and 0.999913 (7B, 21/32, top5 exact)"
     },
     {
+      "id": "phase2b-qwen3-baselines",
+      "phase": 2,
+      "title": "Qwen3 architecture support, hipGraph decode capture, adaptive Q4_K GEMV rows, and 64x128 prefill WMMA",
+      "status": "verified",
+      "verify": "./scripts/check.sh && python3 scripts/bench_cac.py --tag phase2b_final --trials 3 && ./target/release/scoria graph-soak /home/noorm/models/spec-lab/Qwen3-8B-Q4_K_M.gguf --replays 1000",
+      "observed": "qwen3 loads via key_length head_dim + attn_{q,k}_norm (qk_rmsnorm_f32) + Q6_K embeddings; parity vs libllama b11050 CPU: 4B cos=0.999657, 8B cos=0.999335, 7B cos=0.999913, 0.5B cos=0.999345, all top1_match and 24/24 greedy. 3-trial medians: 4B decode 154.35 / pp128 3615.97, 8B decode 99.90 / pp128 2230.71, 7B decode 112.52 / pp128 2141.72, 0.5B decode 401.56 / pp128 14853.13. graph-soak 1000 replays drift -6 MiB.",
+      "note": "4B/8B targets (>189.32 / >111.73 decode, >5826.04 / >3902.77 pp128) not yet met; see harness/baselines/phase2b_gfx1201.json `remaining_gap`."
+    },
+    {
       "id": "phase2-amd-repack-wmma",
       "phase": 2,
       "title": "Load-time Wave32 repacking (H4F8/Q4W32), Q8_1 dot4 GEMV, and hipGraph capture",

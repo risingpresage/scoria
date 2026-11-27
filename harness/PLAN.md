@@ -18,6 +18,13 @@ Methodology: ceilings-first + interleaved Control-Candidate-Control (`C-A-C`) vi
   - 0.5B: decode `280.57` tok/s; 7B: decode `86.51` tok/s (flagged `attn` regression `1.654 -> 2.844 ms`).
 - **Exp 4 (`step3d_attn_q4k_b128`)**: 4-wave split-T `gqa_attn_f32` (`float4` coalesced KV loads) + 2-row/WG `uint4` `global_load_b128` Split-K `gemv_q4_k_f32` + `float4` RMSNorm/SiLU + declarative Rust `define_infer_kernels!` / `hip_launch!`.
   - 0.5B: decode `386.69` tok/s; 7B: decode `107.75` tok/s (`attn` dropped `2.844 -> 0.605 ms`).
+- **Exp 6 (`phase2b_qwen3`)**: `qwen3` arch (per-head `qk_rmsnorm_f32`, `key_length` head_dim, `embed_lookup_q6_k`), Q4_K GEMV row scaling, `hipGraph` decode capture, 64x128 prefill tile.
+  - 4B: decode **`154.35` tok/s**, prefill(13) **`645.86`**, prefill(128) **`3615.97`**.
+  - 8B: decode **`99.90` tok/s**, prefill(13) **`470.58`**, prefill(128) **`2230.71`**.
+  - 7B: decode **`112.52` tok/s**, prefill(20) **`647.49`**, prefill(128) **`2141.72`**.
+  - 0.5B: decode **`401.56` tok/s**, prefill(26) **`4265.60`**, prefill(128) **`14853.13`**.
+  - Note: `bench_cac.py` now runs one in-process `--warmup` pass so lazy HSACO binding (~25-80 ms) is not folded into the prefill timer, matching `llama-bench`.
+  - Remaining: 4B/8B decode and pp128 are still below the `llama.cpp` Vulkan targets. Decode is at ~88% of the measured stream ceiling; prefill has a ~25 ms forward constant from Q4_K superblock-header re-reads (`BK=32` re-reads the 16 B header 8x per 256 weights) plus a second weight pass at `BM=64`/`m=128`.
 - **Exp 5 (`step4_wmma_prefill` / `phase2a_final`)**: Silicon-probed `v_wmma_f32_16x16x16_f16` tiled prefill GEMM (`BM=32, BN=64, BK=32`) across `F16`, `Q5_0`, `Q8_0`, `Q4_K`, `Q6_K`.
   - 0.5B: decode **`386.22` tok/s**, prefill(26) **`4356.28` tok/s**, prefill(128) **`15534.62` tok/s**.
   - 7B: decode **`111.94` tok/s** (`gpu_sum=10.854 ms`), prefill(20) **`673.11` tok/s** (`1.29x` `llama.cpp` Vulkan), prefill(128) **`2079.89` tok/s** (`31.27x` Phase 1).

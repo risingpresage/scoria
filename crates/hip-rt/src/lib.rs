@@ -443,6 +443,104 @@ impl HipStream {
             "hipStreamSynchronize",
         )
     }
+
+    /// Begins stream capture. Everything submitted to this stream until
+    /// [`HipStream::end_capture`] becomes a replayable [`HipGraph`].
+    pub fn begin_capture(&self) -> HipResult<()> {
+        let hip = get_api("hipStreamBeginCapture")?;
+        check(
+            hip,
+            unsafe { (hip.hipStreamBeginCapture)(self.raw, HIP_STREAM_CAPTURE_MODE_GLOBAL) },
+            "hipStreamBeginCapture",
+        )
+    }
+
+    pub fn end_capture(&self) -> HipResult<HipGraph> {
+        let hip = get_api("hipStreamEndCapture")?;
+        let mut raw = ptr::null_mut();
+        check(
+            hip,
+            unsafe { (hip.hipStreamEndCapture)(self.raw, &mut raw) },
+            "hipStreamEndCapture",
+        )?;
+        Ok(HipGraph { raw })
+    }
+}
+
+/// A captured, not-yet-instantiated HIP graph.
+pub struct HipGraph {
+    raw: hipGraph_t,
+}
+
+unsafe impl Send for HipGraph {}
+unsafe impl Sync for HipGraph {}
+
+impl HipGraph {
+    pub fn instantiate(&self) -> HipResult<HipGraphExec> {
+        let hip = get_api("hipGraphInstantiate")?;
+        let mut exec = ptr::null_mut();
+        let mut log = vec![0u8; 2048];
+        let mut err_node: hipGraphNode_t = ptr::null_mut();
+        check(
+            hip,
+            unsafe {
+                (hip.hipGraphInstantiate)(
+                    &mut exec,
+                    self.raw,
+                    &mut err_node,
+                    log.as_mut_ptr() as *mut std::ffi::c_char,
+                    log.len(),
+                )
+            },
+            "hipGraphInstantiate",
+        )?;
+        Ok(HipGraphExec { raw: exec })
+    }
+}
+
+impl Drop for HipGraph {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            if let Ok(hip) = get_api("hipGraphDestroy") {
+                unsafe {
+                    let _ = (hip.hipGraphDestroy)(self.raw);
+                }
+            }
+            self.raw = ptr::null_mut();
+        }
+    }
+}
+
+/// An instantiated graph, ready to be replayed on any stream.
+pub struct HipGraphExec {
+    raw: hipGraphExec_t,
+}
+
+unsafe impl Send for HipGraphExec {}
+unsafe impl Sync for HipGraphExec {}
+
+impl HipGraphExec {
+    pub fn launch(&self, stream: &HipStream) -> HipResult<()> {
+        let hip = get_api("hipGraphLaunch")?;
+        check(
+            hip,
+            unsafe { (hip.hipGraphLaunch)(self.raw, stream.raw()) },
+            "hipGraphLaunch",
+        )
+    }
+}
+
+impl Drop for HipGraphExec {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            if let Ok(hip) = get_api("hipGraphExecDestroy") {
+                unsafe {
+                    let _ = (hip.hipGraphExecDestroy)(self.raw);
+                }
+            }
+            self.raw = ptr::null_mut();
+        }
+    }
 }
 
 impl Drop for HipStream {

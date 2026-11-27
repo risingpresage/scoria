@@ -51,7 +51,9 @@ pub mod infer_names {
     pub const EMBED_LOOKUP_F16: &str = "embed_lookup_f16";
     pub const EMBED_LOOKUP_Q8_0: &str = "embed_lookup_q8_0";
     pub const EMBED_LOOKUP_Q4_K: &str = "embed_lookup_q4_k";
+    pub const EMBED_LOOKUP_Q6_K: &str = "embed_lookup_q6_k";
     pub const RMSNORM_F32: &str = "rmsnorm_f32";
+    pub const QK_RMSNORM_F32: &str = "qk_rmsnorm_f32";
     pub const LINEAR_F32: &str = "linear_f32";
     pub const LINEAR_F16: &str = "linear_f16";
     pub const LINEAR_Q5_0: &str = "linear_q5_0";
@@ -64,12 +66,15 @@ pub mod infer_names {
     pub const SILU_MUL_F32: &str = "silu_mul_f32";
     pub const ADD_INPLACE_F32: &str = "add_inplace_f32";
     pub const ADD_RMSNORM_F32: &str = "add_rmsnorm_f32";
+    pub const DECODE_ADVANCE_U32: &str = "decode_advance_u32";
     pub const ARGMAX_STAGE1_F32: &str = "argmax_stage1_f32";
     pub const ARGMAX_STAGE2_F32: &str = "argmax_stage2_f32";
     pub const GEMV_F16_F32: &str = "gemv_f16_f32";
     pub const GEMV_Q5_0_F32: &str = "gemv_q5_0_f32";
     pub const GEMV_Q8_0_F32: &str = "gemv_q8_0_f32";
     pub const GEMV_Q4_K_F32: &str = "gemv_q4_k_f32";
+    pub const GEMV_Q4_K_R4_F32: &str = "gemv_q4_k_r4_f32";
+    pub const GEMV_Q4_K_R8_F32: &str = "gemv_q4_k_r8_f32";
     pub const GEMV_Q6_K_F32: &str = "gemv_q6_k_f32";
     pub const WMMA_PROBE_F16: &str = "wmma_probe_f16";
     pub const GEMM_WMMA_F16: &str = "gemm_wmma_f16";
@@ -77,6 +82,11 @@ pub mod infer_names {
     pub const GEMM_WMMA_Q8_0: &str = "gemm_wmma_q8_0";
     pub const GEMM_WMMA_Q4_K: &str = "gemm_wmma_q4_k";
     pub const GEMM_WMMA_Q6_K: &str = "gemm_wmma_q6_k";
+    pub const GEMM_WMMA_NARROW_F16: &str = "gemm_wmma_narrow_f16";
+    pub const GEMM_WMMA_NARROW_Q5_0: &str = "gemm_wmma_narrow_q5_0";
+    pub const GEMM_WMMA_NARROW_Q8_0: &str = "gemm_wmma_narrow_q8_0";
+    pub const GEMM_WMMA_NARROW_Q4_K: &str = "gemm_wmma_narrow_q4_k";
+    pub const GEMM_WMMA_NARROW_Q6_K: &str = "gemm_wmma_narrow_q6_k";
 }
 
 #[cfg(test)]
@@ -157,11 +167,17 @@ mod tests {
         let asm = disasm(INFER_KERNELS_GFX1201_HSACO, "gfx1201", "infer_rdna4");
         for sym in [
             "rmsnorm_f32",
+            "qk_rmsnorm_f32",
+            "embed_lookup_q6_k",
+            "decode_advance_u32",
             "linear_q5_0",
             "linear_q4_k",
             "linear_q6_k",
+            "gemv_q4_k_r4_f32",
+            "gemv_q4_k_r8_f32",
             "gqa_attn_f32",
             "gemm_wmma_q4_k",
+            "gemm_wmma_narrow_q4_k",
             "v_wmma_f32_16x16x16_f16",
         ] {
             assert!(asm.contains(sym), "missing symbol `{sym}` in gfx1201 asm");
@@ -184,9 +200,13 @@ mod tests {
         let asm = disasm(INFER_KERNELS_GFX942_HSACO, "gfx942", "infer_cdna3");
         for sym in [
             "rmsnorm_f32",
+            "qk_rmsnorm_f32",
+            "embed_lookup_q6_k",
+            "decode_advance_u32",
             "linear_q5_0",
             "linear_q4_k",
             "linear_q6_k",
+            "gemv_q4_k_r4_f32",
             "gqa_attn_f32",
         ] {
             assert!(asm.contains(sym), "missing symbol `{sym}` in gfx942 asm");

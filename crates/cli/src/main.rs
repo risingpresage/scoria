@@ -14,7 +14,7 @@ use scoria_gguf::{BpeTokenizer, GgufFile, ModelConfig};
 
 fn usage() -> ! {
     eprintln!(
-        "Usage:\n  scoria gate [--quick]\n  scoria inspect <model.gguf>\n  scoria tokenize <model.gguf> <prompt> [--no-bos]\n  scoria run <model.gguf> (--prompt <text> | --tokens <csv>) [--max-tokens <N>] [--max-seq <N>] [--no-bos] [--ignore-eos] [--dump-logits <path>] [--tap-layer <L>]"
+        "Usage:\n  scoria gate [--quick]\n  scoria inspect <model.gguf>\n  scoria tokenize <model.gguf> <prompt> [--no-bos]\n  scoria run <model.gguf> (--prompt <text> | --tokens <csv>) [--max-tokens <N>] [--max-seq <N>] [--no-bos] [--ignore-eos] [--warmup <N>] [--dump-logits <path>] [--tap-layer <L>] [--profile]\n  scoria graph-soak <model.gguf> [--replays <N>] [--tokens <csv>]"
     );
     process::exit(2);
 }
@@ -91,6 +91,10 @@ fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let no_bos = rest.iter().any(|a| a == "--no-bos");
     let ignore_eos = rest.iter().any(|a| a == "--ignore-eos");
     let profile = rest.iter().any(|a| a == "--profile");
+    let warmup: usize = arg_val(rest, "--warmup")
+        .map(|s| s.parse())
+        .transpose()?
+        .unwrap_or(0);
     let dump_logits = arg_val(rest, "--dump-logits").map(PathBuf::from);
     let tap_layer: Option<usize> = arg_val(rest, "--tap-layer")
         .map(|s| s.parse())
@@ -123,6 +127,13 @@ fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     };
+
+    // Untimed warm-up passes: the first forward in a fresh process pays lazy HSACO
+    // binding and clock ramp, which otherwise lands entirely in the prefill timing.
+    for _ in 0..warmup {
+        model.forward_tokens(&ctx, &prompt_ids, None)?;
+        model.reset();
+    }
 
     let tap_opt: Option<LayerTap<'_>> = if tap_layer.is_some() {
         Some(&mut tap_cb)
@@ -190,6 +201,66 @@ fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Replays the captured decode graph many times and asserts VRAM does not drift.
+/// ROCm graph instantiate/launch paths have historically leaked; this is the guard
+/// the Phase 2B plan requires before `hipGraph` decode can be trusted.
+fn cmd_graph_soak(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if args.is_empty() {
+        usage();
+    }
+    let path = &args[0];
+    let rest = &args[1..];
+    let replays: usize = arg_val(rest, "--replays")
+        .map(|s| s.parse())
+        .transpose()?
+        .unwrap_or(1000);
+    let tokens: Vec<u32> = arg_val(rest, "--tokens")
+        .unwrap_or("785,6722,315,9625,374")
+        .split(',')
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().parse::<u32>())
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let gguf = GgufFile::open(path)?;
+    let ctx = EngineContext::init(0)?;
+    let mut model = Qwen2Model::load(&ctx, &gguf, 4096)?;
+
+    // Prefill so the KV cache is populated and the decode step is representative.
+    let logits = model.forward_tokens(&ctx, &tokens, None)?;
+    let first = scoria_engine::qwen2::argmax_f32(&logits);
+    model
+        .seed_decode_token(&ctx, first)
+        .expect("seed decode token");
+    let (free0, total) = scoria_hip_rt::mem_info()?;
+    let graph = model.capture_decode_graph(&ctx)?;
+
+    let mut tokens_out = std::collections::BTreeSet::new();
+    for _ in 0..replays {
+        match model.decode_graph_next(&graph, 4096)? {
+            Some(tok) => {
+                tokens_out.insert(tok);
+            }
+            None => break,
+        }
+    }
+    drop(graph);
+    let (free1, _) = scoria_hip_rt::mem_info()?;
+
+    let drift = free0 as i128 - free1 as i128;
+    println!(
+        "graph_soak: replays={replays} free_before={:.2} MiB free_after={:.2} MiB drift={:.3} MiB total={:.2} MiB distinct_tokens={}",
+        free0 as f64 / (1024.0 * 1024.0),
+        free1 as f64 / (1024.0 * 1024.0),
+        drift as f64 / (1024.0 * 1024.0),
+        total as f64 / (1024.0 * 1024.0),
+        tokens_out.len()
+    );
+    if drift > 64 * 1024 * 1024 {
+        return Err(format!("decode graph leaked {drift} bytes over {replays} replays").into());
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let res = match args.first().map(|s| s.as_str()) {
@@ -200,6 +271,7 @@ fn main() {
         Some("inspect") if args.len() >= 2 => cmd_inspect(&args[1]),
         Some("tokenize") => cmd_tokenize(&args[1..]),
         Some("run") => cmd_run(&args[1..]),
+        Some("graph-soak") => cmd_graph_soak(&args[1..]),
         _ => usage(),
     };
     if let Err(e) = res {

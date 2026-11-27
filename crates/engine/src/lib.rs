@@ -41,7 +41,9 @@ define_infer_kernels! {
         embed_f16 => infer_names::EMBED_LOOKUP_F16,
         embed_q8_0 => infer_names::EMBED_LOOKUP_Q8_0,
         embed_q4_k => infer_names::EMBED_LOOKUP_Q4_K,
+        embed_q6_k => infer_names::EMBED_LOOKUP_Q6_K,
         rmsnorm_f32 => infer_names::RMSNORM_F32,
+        qk_rmsnorm_f32 => infer_names::QK_RMSNORM_F32,
         linear_f32 => infer_names::LINEAR_F32,
         linear_f16 => infer_names::LINEAR_F16,
         linear_q5_0 => infer_names::LINEAR_Q5_0,
@@ -54,12 +56,15 @@ define_infer_kernels! {
         silu_mul_f32 => infer_names::SILU_MUL_F32,
         add_inplace_f32 => infer_names::ADD_INPLACE_F32,
         add_rmsnorm_f32 => infer_names::ADD_RMSNORM_F32,
+        decode_advance_u32 => infer_names::DECODE_ADVANCE_U32,
         argmax_stage1_f32 => infer_names::ARGMAX_STAGE1_F32,
         argmax_stage2_f32 => infer_names::ARGMAX_STAGE2_F32,
         gemv_f16_f32 => infer_names::GEMV_F16_F32,
         gemv_q5_0_f32 => infer_names::GEMV_Q5_0_F32,
         gemv_q8_0_f32 => infer_names::GEMV_Q8_0_F32,
         gemv_q4_k_f32 => infer_names::GEMV_Q4_K_F32,
+        gemv_q4_k_r4_f32 => infer_names::GEMV_Q4_K_R4_F32,
+        gemv_q4_k_r8_f32 => infer_names::GEMV_Q4_K_R8_F32,
         gemv_q6_k_f32 => infer_names::GEMV_Q6_K_F32,
     }
     rdna4_optional {
@@ -68,6 +73,11 @@ define_infer_kernels! {
         gemm_wmma_q8_0 => infer_names::GEMM_WMMA_Q8_0,
         gemm_wmma_q4_k => infer_names::GEMM_WMMA_Q4_K,
         gemm_wmma_q6_k => infer_names::GEMM_WMMA_Q6_K,
+        gemm_wmma_narrow_f16 => infer_names::GEMM_WMMA_NARROW_F16,
+        gemm_wmma_narrow_q5_0 => infer_names::GEMM_WMMA_NARROW_Q5_0,
+        gemm_wmma_narrow_q8_0 => infer_names::GEMM_WMMA_NARROW_Q8_0,
+        gemm_wmma_narrow_q4_k => infer_names::GEMM_WMMA_NARROW_Q4_K,
+        gemm_wmma_narrow_q6_k => infer_names::GEMM_WMMA_NARROW_Q6_K,
     }
 }
 

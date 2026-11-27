@@ -19,6 +19,16 @@ DEFAULT_MODELS = [
         "/home/noorm/models/DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf",
         "<｜User｜>Solve 2x + 6 = 14 for x.<｜Assistant｜><think>\n",
     ),
+    (
+        "qwen3-4b-instruct-2507-q4_k_m",
+        "/home/noorm/models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+        "<|im_start|>user\nThe capital of France is<|im_end|>\n<|im_start|>assistant\n",
+    ),
+    (
+        "qwen3-8b-q4_k_m",
+        "/home/noorm/models/spec-lab/Qwen3-8B-Q4_K_M.gguf",
+        "<|im_start|>user\nThe capital of France is<|im_end|>\n<|im_start|>assistant\n",
+    ),
 ]
 
 
@@ -32,21 +42,21 @@ def build_128_prompt_tokens(model: str, base_prompt: str) -> list[int]:
     return ids[:128]
 
 
-def run_once(model: str, tokens: list[int], max_tokens: int) -> dict:
+def run_once(model: str, tokens: list[int], max_tokens: int, warmup: int = 0) -> dict:
     csv = ",".join(str(x) for x in tokens)
-    out = subprocess.check_output(
-        [
-            "./target/release/scoria",
-            "run",
-            model,
-            "--tokens",
-            csv,
-            "--max-tokens",
-            str(max_tokens),
-            "--ignore-eos",
-        ],
-        text=True,
-    )
+    cmd = [
+        "./target/release/scoria",
+        "run",
+        model,
+        "--tokens",
+        csv,
+        "--max-tokens",
+        str(max_tokens),
+        "--ignore-eos",
+    ]
+    if warmup:
+        cmd += ["--warmup", str(warmup)]
+    out = subprocess.check_output(cmd, text=True)
     m = re.search(
         r"prefill_ms=([\d.]+) \(([\d.]+) tok/s\), decode_ms=([\d.]+) \(([\d.]+) tok/s\)",
         out,
@@ -67,10 +77,25 @@ def main():
     ap.add_argument("--trials", type=int, default=3)
     ap.add_argument("--decode-tokens", type=int, default=64)
     ap.add_argument("--ledger", default="harness/ledger.jsonl")
+    ap.add_argument(
+        "--warmup",
+        type=int,
+        default=1,
+        help="Untimed warm-up runs per prompt shape (default 1; 0 disables)",
+    )
     ap.add_argument("--only-7b", action="store_true")
+    ap.add_argument(
+        "--only",
+        default=None,
+        help="Only run models whose name contains this substring (e.g. qwen3-8b)",
+    )
     args = ap.parse_args()
 
     models = DEFAULT_MODELS[1:] if args.only_7b else DEFAULT_MODELS
+    if args.only:
+        models = [m for m in models if args.only in m[0]]
+        if not models:
+            raise SystemExit(f"--only {args.only!r} matched no models")
     summary = {
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "tag": args.tag,
@@ -87,9 +112,14 @@ def main():
         )
         long_toks = build_128_prompt_tokens(path, prompt)
 
-        short_trials = [run_once(path, short_toks, args.decode_tokens) for _ in range(args.trials)]
-        long_trials = [run_once(path, long_toks, 1) for _ in range(args.trials)]
+        # Warm up inside the measured process: the first forward pays lazy HSACO
+        # binding and clock ramp (tens of ms), which llama-bench also excludes.
+        wu = args.warmup
 
+        short_trials = [
+            run_once(path, short_toks, args.decode_tokens, wu) for _ in range(args.trials)
+        ]
+        long_trials = [run_once(path, long_toks, 1, wu) for _ in range(args.trials)]
         short_dec = statistics.median(t["decode_tok_s"] for t in short_trials)
         short_pre = statistics.median(t["prefill_tok_s"] for t in short_trials)
         long_pre = statistics.median(t["prefill_tok_s"] for t in long_trials)

@@ -101,6 +101,42 @@ extern "C" __global__ void embed_lookup_q4_k(const unsigned char* __restrict__ t
     }
 }
 
+extern "C" __global__ void embed_lookup_q6_k(const unsigned char* __restrict__ table,
+                                             const unsigned* __restrict__ token_ids,
+                                             float* __restrict__ out,
+                                             unsigned n_tokens,
+                                             unsigned n_embd) {
+    unsigned tok = blockIdx.x;
+    if (tok >= n_tokens) return;
+    unsigned tid = threadIdx.x;
+    unsigned nb = n_embd / 256u;
+    const unsigned char* row = table + (size_t)token_ids[tok] * nb * 210u;
+    float* dst = out + (size_t)tok * n_embd;
+    for (unsigned b = tid; b < nb; b += blockDim.x) {
+        const unsigned char* blk = row + (size_t)b * 210u;
+        float d = scoria_f16_bits_to_f32(scoria_read_u16_unaligned(blk + 208u));
+        const signed char* sc = (const signed char*)(blk + 192u);
+        float* y = dst + (size_t)b * 256u;
+        for (unsigned half = 0; half < 2u; ++half) {
+            const unsigned char* ql = blk + (size_t)half * 64u;
+            const unsigned char* qh = blk + 128u + (size_t)half * 32u;
+            const signed char* s = sc + (size_t)half * 8u;
+            float* yy = y + (size_t)half * 128u;
+            for (unsigned l = 0; l < 32u; ++l) {
+                unsigned is = l >> 4;
+                int q1 = (int)((ql[l] & 0x0Fu) | (((qh[l] >> 0) & 3u) << 4)) - 32;
+                int q2 = (int)((ql[l + 32u] & 0x0Fu) | (((qh[l] >> 2) & 3u) << 4)) - 32;
+                int q3 = (int)((ql[l] >> 4) | (((qh[l] >> 4) & 3u) << 4)) - 32;
+                int q4 = (int)((ql[l + 32u] >> 4) | (((qh[l] >> 6) & 3u) << 4)) - 32;
+                yy[l] = d * (float)s[is + 0u] * (float)q1;
+                yy[l + 32u] = d * (float)s[is + 2u] * (float)q2;
+                yy[l + 64u] = d * (float)s[is + 4u] * (float)q3;
+                yy[l + 96u] = d * (float)s[is + 6u] * (float)q4;
+            }
+        }
+    }
+}
+
 extern "C" __global__ void rmsnorm_f32(const float* __restrict__ x,
                                        const float* __restrict__ w,
                                        float* __restrict__ out,
@@ -161,6 +197,64 @@ extern "C" __global__ void rmsnorm_f32(const float* __restrict__ x,
     } else {
         for (unsigned i = tid; i < n_embd; i += blockDim.x) {
             out_row[i] = x_row[i] * inv * w[i];
+        }
+    }
+}
+
+// Qwen3 per-head RMSNorm over `head_dim` for Q and K, applied before RoPE.
+// One wave per (token, head); head_dim is typically 128 so each lane owns one float4.
+extern "C" __global__ void qk_rmsnorm_f32(float* __restrict__ q,
+                                          float* __restrict__ k,
+                                          const float* __restrict__ q_w,
+                                          const float* __restrict__ k_w,
+                                          unsigned m,
+                                          unsigned n_heads,
+                                          unsigned n_kv_heads,
+                                          unsigned head_dim,
+                                          float eps) {
+    unsigned tok = blockIdx.x;
+    unsigned h = blockIdx.y;
+    if (tok >= m || h >= (n_heads + n_kv_heads)) return;
+    unsigned lane = threadIdx.x;
+    if (lane >= SCORIA_WAVE_SIZE) return;
+
+    float* vec;
+    const float* w;
+    if (h < n_heads) {
+        vec = q + ((size_t)tok * n_heads + h) * head_dim;
+        w = q_w;
+    } else {
+        vec = k + ((size_t)tok * n_kv_heads + (h - n_heads)) * head_dim;
+        w = k_w;
+    }
+
+    float ss = 0.0f;
+    if ((head_dim & 3u) == 0u) {
+        unsigned n4 = head_dim >> 2;
+        const float4* v4 = (const float4*)vec;
+        for (unsigned i = lane; i < n4; i += SCORIA_WAVE_SIZE) {
+            float4 v = v4[i];
+            ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+        }
+        float total = scoria_wave_sum(ss);
+        float inv = rsqrtf(total / (float)head_dim + eps);
+        float4* o4 = (float4*)vec;
+        const float4* w4 = (const float4*)w;
+        for (unsigned i = lane; i < n4; i += SCORIA_WAVE_SIZE) {
+            float4 v = o4[i];
+            float4 wv = w4[i];
+            float4 ov = {v.x * inv * wv.x, v.y * inv * wv.y, v.z * inv * wv.z, v.w * inv * wv.w};
+            o4[i] = ov;
+        }
+    } else {
+        for (unsigned i = lane; i < head_dim; i += SCORIA_WAVE_SIZE) {
+            float v = vec[i];
+            ss += v * v;
+        }
+        float total = scoria_wave_sum(ss);
+        float inv = rsqrtf(total / (float)head_dim + eps);
+        for (unsigned i = lane; i < head_dim; i += SCORIA_WAVE_SIZE) {
+            vec[i] = vec[i] * inv * w[i];
         }
     }
 }
@@ -406,8 +500,8 @@ extern "C" __global__ void linear_q6_k(const unsigned char* __restrict__ weight,
 
 extern "C" __global__ void rope_neox_f32(float* __restrict__ q,
                                          float* __restrict__ k,
+                                         const unsigned* __restrict__ pos_ptr,
                                          unsigned m,
-                                         unsigned start_pos,
                                          unsigned n_heads,
                                          unsigned n_kv_heads,
                                          unsigned head_dim,
@@ -415,6 +509,7 @@ extern "C" __global__ void rope_neox_f32(float* __restrict__ q,
     unsigned tok = blockIdx.x;
     unsigned h = blockIdx.y;
     if (tok >= m || h >= (n_heads + n_kv_heads)) return;
+    unsigned start_pos = *pos_ptr;
 
     unsigned half_dim = head_dim >> 1;
     unsigned i = threadIdx.x;
@@ -443,13 +538,13 @@ extern "C" __global__ void kv_cache_append_f32(const float* __restrict__ k_in,
                                                const float* __restrict__ v_in,
                                                float* __restrict__ k_cache,
                                                float* __restrict__ v_cache,
+                                               const unsigned* __restrict__ pos_ptr,
                                                unsigned m,
-                                               unsigned start_pos,
                                                unsigned kv_dim) {
     unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned total = m * kv_dim;
     if (idx >= total) return;
-    size_t dst_idx = (size_t)start_pos * kv_dim + idx;
+    size_t dst_idx = (size_t)(*pos_ptr) * kv_dim + idx;
     k_cache[dst_idx] = k_in[idx];
     v_cache[dst_idx] = v_in[idx];
 }
@@ -458,14 +553,15 @@ extern "C" __global__ void gqa_attn_f32(const float* __restrict__ q,
                                         const float* __restrict__ k_cache,
                                         const float* __restrict__ v_cache,
                                         float* __restrict__ out,
+                                        const unsigned* __restrict__ pos_ptr,
                                         unsigned m,
-                                        unsigned start_pos,
                                         unsigned n_heads,
                                         unsigned n_kv_heads,
                                         unsigned head_dim) {
     unsigned q_head = blockIdx.x;
     unsigned tok = blockIdx.y;
     if (q_head >= n_heads || tok >= m) return;
+    unsigned start_pos = *pos_ptr;
 
     unsigned tid = threadIdx.x;
     unsigned lane = tid & (SCORIA_WAVE_SIZE - 1u);
@@ -668,6 +764,15 @@ extern "C" __global__ void gqa_attn_f32(const float* __restrict__ q,
             if (d < head_dim) out_base[d] = acc[e] * inv_l;
         }
     }
+}
+
+// Decode-loop epilogue: feed the sampled token back into the input slot and advance
+// the position counter, so a captured HIP graph can be replayed unchanged.
+extern "C" __global__ void decode_advance_u32(const unsigned* __restrict__ argmax,
+                                              unsigned* __restrict__ token_ids,
+                                              unsigned* __restrict__ pos) {
+    token_ids[0] = argmax[0];
+    pos[0] = pos[0] + 1u;
 }
 
 extern "C" __global__ void silu_mul_f32(const float* __restrict__ gate,
@@ -1025,16 +1130,26 @@ __device__ __forceinline__ void scoria_q4k_dot_word(unsigned qw,
            + (float)(b3 >> 4) * x_hi.w;
 }
 
-extern "C" __global__ void gemv_q4_k_f32(const unsigned char* __restrict__ weight,
-                                         const float* __restrict__ x,
-                                         const float* __restrict__ bias,
-                                         float* __restrict__ y,
-                                         unsigned n,
-                                         unsigned k) {
-    unsigned row0 = blockIdx.x * 2u;
+// Q4_K decode GEMV.
+//
+// The workgroup is 128 threads = 4 waves = 16 groups of 8 lanes. Each group owns
+// one 256-weight superblock: its 8 lanes split the 4 quant chunks x 2 nibble halves
+// (32B of `qs` per lane pair) and the wave reduces the partial dots.
+//
+// A hard 16-group layout starves the block whenever `nb = k/256 < 16`
+// (Qwen3-4B: nb=10 -> only 62.5% of groups had work, measured 342 GB/s vs the
+// 7B model's 524 GB/s). `ROWS` rows per block are therefore chosen on the host so
+// that `(ROWS/2) * nb >= 16`, i.e. every group gets at least one superblock per row
+// pair, and rows per block grow as `k` shrinks.
+template <unsigned ROWS>
+__device__ __forceinline__ void gemv_q4_k_rows_impl(const unsigned char* __restrict__ weight,
+                                                    const float* __restrict__ x,
+                                                    const float* __restrict__ bias,
+                                                    float* __restrict__ y,
+                                                    unsigned n,
+                                                    unsigned k) {
+    unsigned row0 = blockIdx.x * ROWS;
     if (row0 >= n) return;
-    unsigned row1 = row0 + 1u;
-    bool has_r1 = row1 < n;
 
     unsigned tid = threadIdx.x;
     unsigned lane = tid & (SCORIA_WAVE_SIZE - 1u);
@@ -1045,84 +1160,119 @@ extern "C" __global__ void gemv_q4_k_f32(const unsigned char* __restrict__ weigh
     unsigned chunk = lane_in_blk >> 1;
     unsigned half_c = lane_in_blk & 1u;
     unsigned nb = k / 256u;
+    size_t row_bytes = (size_t)nb * 144u;
 
-    const unsigned char* w0 = weight + (size_t)row0 * nb * 144u;
-    const unsigned char* w1 = has_r1 ? (w0 + (size_t)nb * 144u) : nullptr;
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
+    float acc[ROWS];
+    #pragma unroll
+    for (unsigned r = 0; r < ROWS; ++r) acc[r] = 0.0f;
 
-    for (unsigned b = grp; b < nb; b += 16u) {
-        const unsigned char* blk0 = w0 + (size_t)b * 144u;
-        uint4 hdr0 = *(const uint4*)blk0;
-        uint4 q0 = *(const uint4*)(blk0 + 16u + (size_t)lane_in_blk * 16u);
-        uint4 hdr1 = {0u, 0u, 0u, 0u};
-        uint4 q1 = {0u, 0u, 0u, 0u};
-        if (has_r1) {
-            const unsigned char* blk1 = w1 + (size_t)b * 144u;
-            hdr1 = *(const uint4*)blk1;
-            q1 = *(const uint4*)(blk1 + 16u + (size_t)lane_in_blk * 16u);
-        }
+    #pragma unroll
+    for (unsigned rp = 0; rp < ROWS / 2u; ++rp) {
+        unsigned r0 = row0 + rp * 2u;
+        if (r0 < n) {
+            bool has_r1 = (r0 + 1u) < n;
+            const unsigned char* w0 = weight + (size_t)r0 * row_bytes;
+            const unsigned char* w1 = w0 + row_bytes;
 
-        const float* xp = x + (size_t)b * 256u + chunk * 64u + half_c * 16u;
-        float4 x_lo0 = *(const float4*)(xp + 0u);
-        float4 x_lo1 = *(const float4*)(xp + 4u);
-        float4 x_lo2 = *(const float4*)(xp + 8u);
-        float4 x_lo3 = *(const float4*)(xp + 12u);
-        float4 x_hi0 = *(const float4*)(xp + 32u);
-        float4 x_hi1 = *(const float4*)(xp + 36u);
-        float4 x_hi2 = *(const float4*)(xp + 40u);
-        float4 x_hi3 = *(const float4*)(xp + 44u);
+            for (unsigned b = grp; b < nb; b += 16u) {
+                const unsigned char* blk0 = w0 + (size_t)b * 144u;
+                uint4 hdr0 = *(const uint4*)blk0;
+                uint4 q0 = *(const uint4*)(blk0 + 16u + (size_t)lane_in_blk * 16u);
+                uint4 hdr1 = {0u, 0u, 0u, 0u};
+                uint4 q1 = {0u, 0u, 0u, 0u};
+                if (has_r1) {
+                    const unsigned char* blk1 = w1 + (size_t)b * 144u;
+                    hdr1 = *(const uint4*)blk1;
+                    q1 = *(const uint4*)(blk1 + 16u + (size_t)lane_in_blk * 16u);
+                }
 
-        float xs_lo = (x_lo0.x + x_lo0.y + x_lo0.z + x_lo0.w)
-                    + (x_lo1.x + x_lo1.y + x_lo1.z + x_lo1.w)
-                    + (x_lo2.x + x_lo2.y + x_lo2.z + x_lo2.w)
-                    + (x_lo3.x + x_lo3.y + x_lo3.z + x_lo3.w);
-        float xs_hi = (x_hi0.x + x_hi0.y + x_hi0.z + x_hi0.w)
-                    + (x_hi1.x + x_hi1.y + x_hi1.z + x_hi1.w)
-                    + (x_hi2.x + x_hi2.y + x_hi2.z + x_hi2.w)
-                    + (x_hi3.x + x_hi3.y + x_hi3.z + x_hi3.w);
+                const float* xp = x + (size_t)b * 256u + chunk * 64u + half_c * 16u;
+                float4 x_lo0 = *(const float4*)(xp + 0u);
+                float4 x_lo1 = *(const float4*)(xp + 4u);
+                float4 x_lo2 = *(const float4*)(xp + 8u);
+                float4 x_lo3 = *(const float4*)(xp + 12u);
+                float4 x_hi0 = *(const float4*)(xp + 32u);
+                float4 x_hi1 = *(const float4*)(xp + 36u);
+                float4 x_hi2 = *(const float4*)(xp + 40u);
+                float4 x_hi3 = *(const float4*)(xp + 44u);
 
-        float d1_0, m1_0, d2_0, m2_0;
-        scoria_q4k_unpack_scales(hdr0, chunk, &d1_0, &m1_0, &d2_0, &m2_0);
-        float s_lo0 = 0.0f, s_hi0 = 0.0f;
-        scoria_q4k_dot_word(q0.x, x_lo0, x_hi0, &s_lo0, &s_hi0);
-        scoria_q4k_dot_word(q0.y, x_lo1, x_hi1, &s_lo0, &s_hi0);
-        scoria_q4k_dot_word(q0.z, x_lo2, x_hi2, &s_lo0, &s_hi0);
-        scoria_q4k_dot_word(q0.w, x_lo3, x_hi3, &s_lo0, &s_hi0);
-        acc0 += (d1_0 * s_lo0 - m1_0 * xs_lo) + (d2_0 * s_hi0 - m2_0 * xs_hi);
+                float xs_lo = (x_lo0.x + x_lo0.y + x_lo0.z + x_lo0.w)
+                            + (x_lo1.x + x_lo1.y + x_lo1.z + x_lo1.w)
+                            + (x_lo2.x + x_lo2.y + x_lo2.z + x_lo2.w)
+                            + (x_lo3.x + x_lo3.y + x_lo3.z + x_lo3.w);
+                float xs_hi = (x_hi0.x + x_hi0.y + x_hi0.z + x_hi0.w)
+                            + (x_hi1.x + x_hi1.y + x_hi1.z + x_hi1.w)
+                            + (x_hi2.x + x_hi2.y + x_hi2.z + x_hi2.w)
+                            + (x_hi3.x + x_hi3.y + x_hi3.z + x_hi3.w);
 
-        if (has_r1) {
-            float d1_1, m1_1, d2_1, m2_1;
-            scoria_q4k_unpack_scales(hdr1, chunk, &d1_1, &m1_1, &d2_1, &m2_1);
-            float s_lo1 = 0.0f, s_hi1 = 0.0f;
-            scoria_q4k_dot_word(q1.x, x_lo0, x_hi0, &s_lo1, &s_hi1);
-            scoria_q4k_dot_word(q1.y, x_lo1, x_hi1, &s_lo1, &s_hi1);
-            scoria_q4k_dot_word(q1.z, x_lo2, x_hi2, &s_lo1, &s_hi1);
-            scoria_q4k_dot_word(q1.w, x_lo3, x_hi3, &s_lo1, &s_hi1);
-            acc1 += (d1_1 * s_lo1 - m1_1 * xs_lo) + (d2_1 * s_hi1 - m2_1 * xs_hi);
+                float d1_0, m1_0, d2_0, m2_0;
+                scoria_q4k_unpack_scales(hdr0, chunk, &d1_0, &m1_0, &d2_0, &m2_0);
+                float s_lo0 = 0.0f, s_hi0 = 0.0f;
+                scoria_q4k_dot_word(q0.x, x_lo0, x_hi0, &s_lo0, &s_hi0);
+                scoria_q4k_dot_word(q0.y, x_lo1, x_hi1, &s_lo0, &s_hi0);
+                scoria_q4k_dot_word(q0.z, x_lo2, x_hi2, &s_lo0, &s_hi0);
+                scoria_q4k_dot_word(q0.w, x_lo3, x_hi3, &s_lo0, &s_hi0);
+                acc[rp * 2u] += (d1_0 * s_lo0 - m1_0 * xs_lo) + (d2_0 * s_hi0 - m2_0 * xs_hi);
+
+                if (has_r1) {
+                    float d1_1, m1_1, d2_1, m2_1;
+                    scoria_q4k_unpack_scales(hdr1, chunk, &d1_1, &m1_1, &d2_1, &m2_1);
+                    float s_lo1 = 0.0f, s_hi1 = 0.0f;
+                    scoria_q4k_dot_word(q1.x, x_lo0, x_hi0, &s_lo1, &s_hi1);
+                    scoria_q4k_dot_word(q1.y, x_lo1, x_hi1, &s_lo1, &s_hi1);
+                    scoria_q4k_dot_word(q1.z, x_lo2, x_hi2, &s_lo1, &s_hi1);
+                    scoria_q4k_dot_word(q1.w, x_lo3, x_hi3, &s_lo1, &s_hi1);
+                    acc[rp * 2u + 1u] += (d1_1 * s_lo1 - m1_1 * xs_lo) + (d2_1 * s_hi1 - m2_1 * xs_hi);
+                }
+            }
         }
     }
 
-    float w0s = scoria_wave_sum(acc0);
-    float w1s = scoria_wave_sum(acc1);
-    __shared__ float s_red[2][4];
-    if (lane == 0) {
-        s_red[0][wave_id] = w0s;
-        s_red[1][wave_id] = w1s;
+    __shared__ float s_red[ROWS][8];
+    #pragma unroll
+    for (unsigned r = 0; r < ROWS; ++r) {
+        float s = scoria_wave_sum(acc[r]);
+        if (lane == 0) s_red[r][wave_id] = s;
     }
     __syncthreads();
     if (tid == 0) {
-        float sum0 = 0.0f;
-        float sum1 = 0.0f;
-        for (unsigned w = 0; w < n_waves; ++w) {
-            sum0 += s_red[0][w];
-            sum1 += s_red[1][w];
-        }
-        y[row0] = sum0 + (bias ? bias[row0] : 0.0f);
-        if (has_r1) {
-            y[row1] = sum1 + (bias ? bias[row1] : 0.0f);
+        #pragma unroll
+        for (unsigned r = 0; r < ROWS; ++r) {
+            unsigned row = row0 + r;
+            if (row < n) {
+                float sum = 0.0f;
+                for (unsigned w = 0; w < n_waves; ++w) sum += s_red[r][w];
+                y[row] = sum + (bias ? bias[row] : 0.0f);
+            }
         }
     }
+}
+
+extern "C" __global__ void gemv_q4_k_f32(const unsigned char* __restrict__ weight,
+                                         const float* __restrict__ x,
+                                         const float* __restrict__ bias,
+                                         float* __restrict__ y,
+                                         unsigned n,
+                                         unsigned k) {
+    gemv_q4_k_rows_impl<2u>(weight, x, bias, y, n, k);
+}
+
+extern "C" __global__ void gemv_q4_k_r4_f32(const unsigned char* __restrict__ weight,
+                                            const float* __restrict__ x,
+                                            const float* __restrict__ bias,
+                                            float* __restrict__ y,
+                                            unsigned n,
+                                            unsigned k) {
+    gemv_q4_k_rows_impl<4u>(weight, x, bias, y, n, k);
+}
+
+extern "C" __global__ void gemv_q4_k_r8_f32(const unsigned char* __restrict__ weight,
+                                            const float* __restrict__ x,
+                                            const float* __restrict__ bias,
+                                            float* __restrict__ y,
+                                            unsigned n,
+                                            unsigned k) {
+    gemv_q4_k_rows_impl<8u>(weight, x, bias, y, n, k);
 }
 
 extern "C" __global__ void gemv_q6_k_f32(const unsigned char* __restrict__ weight,
@@ -1442,14 +1592,112 @@ struct WmmaLoaderQ6_K {
     }
 };
 
+// Prefill GEMM: 64x128 macro-tile, 32-deep K step, four 16x16 WMMA accumulators per
+// wave. Eight waves cover the tile as 2 (m) x 4 (n) wave-tile pairs of 2x2 fragments,
+// which doubles arithmetic intensity to ~43 flop/byte over the previous 32x64 tile
+// (21 flop/byte) and halves the LDS traffic per WMMA.
 template <typename WeightLoader>
-__device__ __forceinline__ void gemm_wmma_tiled_impl(const unsigned char* __restrict__ weight,
+__device__ __forceinline__ void gemm_wmma_wide_impl(const unsigned char* __restrict__ weight,
                                                      const float* __restrict__ x,
                                                      const float* __restrict__ bias,
                                                      float* __restrict__ y,
                                                      unsigned m,
                                                      unsigned n,
                                                      unsigned k) {
+    unsigned tid = threadIdx.x;
+    unsigned wave_id = tid >> 5;
+    unsigned lane = tid & 31u;
+    unsigned wm = wave_id >> 2;
+    unsigned wn = wave_id & 3u;
+    unsigned m0 = blockIdx.y * 64u;
+    unsigned n0 = blockIdx.x * 128u;
+
+    __shared__ _Float16 s_x[64][36];
+    __shared__ _Float16 s_w[128][36];
+
+    float8_t acc[4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) acc[i] = (float8_t){0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    unsigned rx = tid >> 3;
+    unsigned cx = (tid & 7u) * 4u;
+
+    unsigned mn = lane & 15u;
+    unsigned k_off = (lane >> 4) * 8u;
+
+    for (unsigned k0 = 0; k0 < k; k0 += 32u) {
+        #pragma unroll
+        for (unsigned half = 0; half < 2u; ++half) {
+            unsigned gm = m0 + half * 32u + rx;
+            _Float16* dst = &s_x[half * 32u + rx][cx];
+            if (gm < m) {
+                float4 xv = *(const float4*)(x + (size_t)gm * k + k0 + cx);
+                dst[0] = (_Float16)xv.x;
+                dst[1] = (_Float16)xv.y;
+                dst[2] = (_Float16)xv.z;
+                dst[3] = (_Float16)xv.w;
+            } else {
+                dst[0] = (_Float16)0.0f;
+                dst[1] = (_Float16)0.0f;
+                dst[2] = (_Float16)0.0f;
+                dst[3] = (_Float16)0.0f;
+            }
+        }
+
+        WeightLoader::load(weight, k, n, n0, k0, tid, s_w);
+        WeightLoader::load(weight, k, n, n0 + 64u, k0, tid, s_w + 64);
+        __syncthreads();
+
+        #pragma unroll
+        for (unsigned kk = 0u; kk < 32u; kk += 16u) {
+            half8_t a0, a1, b0, b1;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                a0[i] = s_x[(wm * 2u + 0u) * 16u + mn][kk + k_off + (unsigned)i];
+                a1[i] = s_x[(wm * 2u + 1u) * 16u + mn][kk + k_off + (unsigned)i];
+                b0[i] = s_w[(wn * 2u + 0u) * 16u + mn][kk + k_off + (unsigned)i];
+                b1[i] = s_w[(wn * 2u + 1u) * 16u + mn][kk + k_off + (unsigned)i];
+            }
+            acc[0] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a0, b0, acc[0]);
+            acc[1] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a0, b1, acc[1]);
+            acc[2] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a1, b0, acc[2]);
+            acc[3] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a1, b1, acc[3]);
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (unsigned im = 0; im < 2u; ++im) {
+        #pragma unroll
+        for (unsigned in = 0; in < 2u; ++in) {
+            float8_t c = acc[im * 2u + in];
+            unsigned out_n = n0 + (wn * 2u + in) * 16u + mn;
+            if (out_n < n) {
+                float b_val = bias ? bias[out_n] : 0.0f;
+                unsigned m_base = m0 + (wm * 2u + im) * 16u + (lane >> 4) * 8u;
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    unsigned out_m = m_base + (unsigned)i;
+                    if (out_m < m) {
+                        y[(size_t)out_m * n + out_n] = c[i] + b_val;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Narrow variant: 32x64 macro-tile (one 16x16 WMMA per wave). Keeps enough blocks to
+// fill the CUs when the output matrix is small (e.g. Qwen3-4B kv projections at
+// n=1024, where the wide tile would launch only 16 blocks for 64 CUs).
+template <typename WeightLoader>
+__device__ __forceinline__ void gemm_wmma_narrow_impl(const unsigned char* __restrict__ weight,
+                                                      const float* __restrict__ x,
+                                                      const float* __restrict__ bias,
+                                                      float* __restrict__ y,
+                                                      unsigned m,
+                                                      unsigned n,
+                                                      unsigned k) {
     unsigned tid = threadIdx.x;
     unsigned wave_id = tid >> 5;
     unsigned lane = tid & 31u;
@@ -1514,6 +1762,56 @@ __device__ __forceinline__ void gemm_wmma_tiled_impl(const unsigned char* __rest
     }
 }
 
+extern "C" __global__ void gemm_wmma_narrow_f16(const unsigned char* __restrict__ weight,
+                                                const float* __restrict__ x,
+                                                const float* __restrict__ bias,
+                                                float* __restrict__ y,
+                                                unsigned m,
+                                                unsigned n,
+                                                unsigned k) {
+    gemm_wmma_narrow_impl<WmmaLoaderF16>(weight, x, bias, y, m, n, k);
+}
+
+extern "C" __global__ void gemm_wmma_narrow_q5_0(const unsigned char* __restrict__ weight,
+                                                 const float* __restrict__ x,
+                                                 const float* __restrict__ bias,
+                                                 float* __restrict__ y,
+                                                 unsigned m,
+                                                 unsigned n,
+                                                 unsigned k) {
+    gemm_wmma_narrow_impl<WmmaLoaderQ5_0>(weight, x, bias, y, m, n, k);
+}
+
+extern "C" __global__ void gemm_wmma_narrow_q8_0(const unsigned char* __restrict__ weight,
+                                                 const float* __restrict__ x,
+                                                 const float* __restrict__ bias,
+                                                 float* __restrict__ y,
+                                                 unsigned m,
+                                                 unsigned n,
+                                                 unsigned k) {
+    gemm_wmma_narrow_impl<WmmaLoaderQ8_0>(weight, x, bias, y, m, n, k);
+}
+
+extern "C" __global__ void gemm_wmma_narrow_q4_k(const unsigned char* __restrict__ weight,
+                                                 const float* __restrict__ x,
+                                                 const float* __restrict__ bias,
+                                                 float* __restrict__ y,
+                                                 unsigned m,
+                                                 unsigned n,
+                                                 unsigned k) {
+    gemm_wmma_narrow_impl<WmmaLoaderQ4_K>(weight, x, bias, y, m, n, k);
+}
+
+extern "C" __global__ void gemm_wmma_narrow_q6_k(const unsigned char* __restrict__ weight,
+                                                 const float* __restrict__ x,
+                                                 const float* __restrict__ bias,
+                                                 float* __restrict__ y,
+                                                 unsigned m,
+                                                 unsigned n,
+                                                 unsigned k) {
+    gemm_wmma_narrow_impl<WmmaLoaderQ6_K>(weight, x, bias, y, m, n, k);
+}
+
 extern "C" __global__ void gemm_wmma_f16(const unsigned char* __restrict__ weight,
                                          const float* __restrict__ x,
                                          const float* __restrict__ bias,
@@ -1521,7 +1819,7 @@ extern "C" __global__ void gemm_wmma_f16(const unsigned char* __restrict__ weigh
                                          unsigned m,
                                          unsigned n,
                                          unsigned k) {
-    gemm_wmma_tiled_impl<WmmaLoaderF16>(weight, x, bias, y, m, n, k);
+    gemm_wmma_wide_impl<WmmaLoaderF16>(weight, x, bias, y, m, n, k);
 }
 
 extern "C" __global__ void gemm_wmma_q5_0(const unsigned char* __restrict__ weight,
@@ -1531,7 +1829,7 @@ extern "C" __global__ void gemm_wmma_q5_0(const unsigned char* __restrict__ weig
                                           unsigned m,
                                           unsigned n,
                                           unsigned k) {
-    gemm_wmma_tiled_impl<WmmaLoaderQ5_0>(weight, x, bias, y, m, n, k);
+    gemm_wmma_wide_impl<WmmaLoaderQ5_0>(weight, x, bias, y, m, n, k);
 }
 
 extern "C" __global__ void gemm_wmma_q8_0(const unsigned char* __restrict__ weight,
@@ -1541,7 +1839,7 @@ extern "C" __global__ void gemm_wmma_q8_0(const unsigned char* __restrict__ weig
                                           unsigned m,
                                           unsigned n,
                                           unsigned k) {
-    gemm_wmma_tiled_impl<WmmaLoaderQ8_0>(weight, x, bias, y, m, n, k);
+    gemm_wmma_wide_impl<WmmaLoaderQ8_0>(weight, x, bias, y, m, n, k);
 }
 
 extern "C" __global__ void gemm_wmma_q4_k(const unsigned char* __restrict__ weight,
@@ -1551,7 +1849,7 @@ extern "C" __global__ void gemm_wmma_q4_k(const unsigned char* __restrict__ weig
                                           unsigned m,
                                           unsigned n,
                                           unsigned k) {
-    gemm_wmma_tiled_impl<WmmaLoaderQ4_K>(weight, x, bias, y, m, n, k);
+    gemm_wmma_wide_impl<WmmaLoaderQ4_K>(weight, x, bias, y, m, n, k);
 }
 
 extern "C" __global__ void gemm_wmma_q6_k(const unsigned char* __restrict__ weight,
@@ -1561,6 +1859,6 @@ extern "C" __global__ void gemm_wmma_q6_k(const unsigned char* __restrict__ weig
                                           unsigned m,
                                           unsigned n,
                                           unsigned k) {
-    gemm_wmma_tiled_impl<WmmaLoaderQ6_K>(weight, x, bias, y, m, n, k);
+    gemm_wmma_wide_impl<WmmaLoaderQ6_K>(weight, x, bias, y, m, n, k);
 }
 #endif
