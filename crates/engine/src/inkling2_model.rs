@@ -39,7 +39,12 @@
 //! position at a time, which is exact for causal attention) and any speed work. It exists
 //! to produce a logit vector from real weights that can be checked against the reference.
 
+use std::ffi::c_void;
+
 use scoria_gguf::{GgufError, GgufFile, ModelConfig, TensorInfo};
+use scoria_hip_rt::{DeviceBuf, HipStream};
+
+use crate::EngineContext;
 
 use crate::inkling2::{Inkling2Params, Visit, schedule};
 use crate::inkling2_attn::{
@@ -449,6 +454,145 @@ impl Head {
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// GPU projections
+// ---------------------------------------------------------------------------------------
+//
+// The six attention projections and `W_o` are the arithmetic half of a visit: 2.6 GB of
+// f32 weights read per token. They are uploaded once and run through `linear_f32`, which is
+// already verified against the host (`harness/ledger` gate). Everything else -- the
+// per-head attention, the relative bias, the convolutions, the MoE -- stays on the host
+// for now, so this is a drop-in replacement for `matvec` with an explicit oracle: the same
+// token must produce the same logits whether the projections run here or on the card.
+/// Raw device pointers to one layer's projection weights. Copying them out of the `Gpu`
+/// first keeps the borrow checker out of the way: the pointers outlive the `&mut Gpu` call
+/// that consumes them.
+#[derive(Clone, Copy)]
+struct GpuPtrs {
+    q: *mut c_void,
+    k: *mut c_void,
+    v: *mut c_void,
+    gate: *mut c_void,
+    rel: *mut c_void,
+    sink: *mut c_void,
+    o: *mut c_void,
+}
+
+struct GpuLayer {
+    q: DeviceBuf,
+    k: DeviceBuf,
+    v: DeviceBuf,
+    gate: DeviceBuf,
+    o: DeviceBuf,
+    rel: DeviceBuf,
+    sink: DeviceBuf,
+}
+
+struct Gpu {
+    ctx: EngineContext,
+    stream: HipStream,
+    layers: Vec<GpuLayer>,
+    x: DeviceBuf,
+    y: DeviceBuf,
+    wave_size: u32,
+    /// Bytes resident in VRAM, for the log line.
+    pub resident: usize,
+}
+
+fn upload(ctx: &EngineContext, data: &[f32]) -> DeviceBuf {
+    let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+    let mut buf = DeviceBuf::alloc(bytes.len()).expect("VRAM allocation for a projection");
+    buf.copy_from_host(bytes).expect("H2D upload");
+    let _ = ctx;
+    buf
+}
+
+impl Gpu {
+    fn new(ctx: EngineContext, layers: &[Layer], max_in: usize, max_out: usize) -> Self {
+        let wave_size = ctx.wave_size;
+        let stream = HipStream::new().expect("HIP stream");
+        let mut resident = 0;
+        let mut out = Vec::with_capacity(layers.len());
+        for lw in layers {
+            macro_rules! up {
+                ($w:expr) => {{
+                    let b = upload(&ctx, $w);
+                    resident += b.bytes();
+                    b
+                }};
+            }
+            out.push(GpuLayer {
+                q: up!(&lw.w_q),
+                k: up!(&lw.w_k),
+                v: up!(&lw.w_v),
+                gate: up!(&lw.w_gate),
+                o: up!(&lw.w_o),
+                rel: up!(&lw.w_rel),
+                sink: up!(&lw.w_sink),
+            });
+        }
+        Self {
+            // `W_o` reads `n_heads * head_dim` floats, which is wider than the model's
+            // hidden size, so the input buffer is sized for the widest operand.
+            x: DeviceBuf::alloc(max_in.max(max_out) * 4).expect("VRAM input buffer"),
+            y: DeviceBuf::alloc(max_out * 4).expect("VRAM output buffer"),
+            ctx,
+            stream,
+            layers: out,
+            wave_size,
+            resident,
+        }
+    }
+
+    /// `y = W x` for one token, with `W` already resident. Returns `n_out` floats.
+    fn run(&mut self, weight: *mut c_void, x: &[f32], n_out: usize) -> Vec<f32> {
+        let x_bytes = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, x.len() * 4) };
+        self.x.copy_from_host(x_bytes).expect("H2D x");
+        let mut m = 1u32;
+        let mut n = n_out as u32;
+        let mut k = x.len() as u32;
+        let waves_per_wg = 256u32 / self.wave_size.max(1);
+        let grid_x = n.div_ceil(waves_per_wg);
+        // `hipModuleLaunchKernel` copies each argument *from the address* in this array,
+        // including pointer arguments: the entry must be `&ptr`, not `ptr`. Passing the
+        // pointer value makes HIP read the kernel argument out of device memory on the host,
+        // which faults inside libamdhip64 (or, once the queue runs, raises
+        // HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION from the kernel).
+        let mut arg_w = weight;
+        let mut arg_x = self.x.as_ptr();
+        let mut arg_bias: *mut c_void = std::ptr::null_mut();
+        let mut arg_y = self.y.as_ptr();
+        let mut args: [*mut c_void; 7] = [
+            &mut arg_w as *mut *mut c_void as *mut c_void,
+            &mut arg_x as *mut *mut c_void as *mut c_void,
+            &mut arg_bias as *mut *mut c_void as *mut c_void,
+            &mut arg_y as *mut *mut c_void as *mut c_void,
+            &mut m as *mut u32 as *mut c_void,
+            &mut n as *mut u32 as *mut c_void,
+            &mut k as *mut u32 as *mut c_void,
+        ];
+        unsafe {
+            self.ctx
+                .infer_module
+                .launch_handle(
+                    self.ctx.infer.linear_f32,
+                    [grid_x, 1, 1],
+                    [256, 1, 1],
+                    0,
+                    &self.stream,
+                    &mut args,
+                )
+                .expect("linear_f32 launch");
+        }
+        self.stream.synchronize().expect("stream sync");
+        let mut out = vec![0f32; n_out];
+        let out_bytes =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n_out * 4) };
+        self.y.copy_to_host(out_bytes).expect("D2H y");
+        out
+    }
+}
+
 pub struct Model {
     file: GgufFile,
     pub cfg: ModelConfig,
@@ -464,6 +608,8 @@ pub struct Model {
     block_states: Vec<Vec<f32>>,
     /// Token position of the next forward, i.e. how much history the caches hold.
     pub pos: usize,
+    /// Present when the projections run on the card; `None` keeps the verified host path.
+    gpu: Option<Gpu>,
     traces: Vec<VisitTrace>,
     /// Time spent in the MoE half of each visit, and in everything else.
     pub profile: Profile,
@@ -482,6 +628,8 @@ pub struct Model {
 pub struct Profile {
     pub attention: f64,
     pub moe: f64,
+    /// Of `attention`, the part spent in GPU projections (if any).
+    pub gpu_proj: f64,
     pub visits: usize,
 }
 
@@ -564,6 +712,7 @@ impl Model {
             layers,
             moes,
             pos: 0,
+            gpu: None,
             traces: Vec::new(),
             profile: Profile::default(),
             max_visits: usize::MAX,
@@ -572,6 +721,27 @@ impl Model {
             file,
             last_report: None,
         })
+    }
+
+    /// Move the projection weights to VRAM and run them on the card.
+    ///
+    /// 2.6 GB of f32 weights, uploaded once. Everything else stays on the host, so this is
+    /// exactly the same arithmetic as `matvec` and the logits are the oracle.
+    pub fn enable_gpu(&mut self) -> Result<usize, String> {
+        if self.gpu.is_some() {
+            return Ok(0);
+        }
+        let ctx = EngineContext::init(0).map_err(|e| format!("HIP init: {e:?}"))?;
+        let max_in = self.cfg.n_embd;
+        let max_out = (self.cfg.n_heads * self.cfg.head_dim).max(self.cfg.n_embd);
+        let gpu = Gpu::new(ctx, &self.layers, max_in, max_out);
+        let resident = gpu.resident;
+        self.gpu = Some(gpu);
+        Ok(resident)
+    }
+
+    pub fn gpu_active(&self) -> bool {
+        self.gpu.is_some()
     }
 
     /// Worker count for the MoE expert loop of every layer.
@@ -819,24 +989,51 @@ impl Model {
             1.0 + self.params.log_scale_alpha * x.max(1.0).ln()
         };
 
-        // The six projections are independent of each other, so they run concurrently:
-        // one spawn round per visit instead of one per matvec. Each is a serial dot-product
-        // loop over its own rows, which keeps the arithmetic identical to the single-threaded
-        // path (no reduction order changes).
-        let (mut q, mut k, mut v, mut rel, sink) = std::thread::scope(|scope| {
-            let hq = scope.spawn(|| matvec(&lw.w_q, &qn, n_heads * head_dim, n_embd));
-            let hk = scope.spawn(|| matvec(&lw.w_k, &kn, kv_dim, n_embd));
-            let hv = scope.spawn(|| matvec(&lw.w_v, &vn, kv_dim, n_embd));
-            let hr = scope.spawn(|| matvec(&lw.w_rel, &qn, n_heads * lw.d_rel, n_embd));
-            let hs = scope.spawn(|| matvec(&lw.w_sink, &qn, n_heads, n_embd));
-            (
-                hq.join().expect("q projection"),
-                hk.join().expect("k projection"),
-                hv.join().expect("v projection"),
-                hr.join().expect("rel projection"),
-                hs.join().expect("sink projection"),
-            )
+        // The projection weights may be resident in VRAM, in which case `linear_f32` runs
+        // each one as a single-token GEMV. Otherwise the six host matvecs run concurrently:
+        // one spawn round per visit instead of one per matvec.
+        let gpu_ptrs = self.gpu.as_ref().map(|g| {
+            let gl = &g.layers[layer];
+            GpuPtrs {
+                q: gl.q.as_ptr(),
+                k: gl.k.as_ptr(),
+                v: gl.v.as_ptr(),
+                gate: gl.gate.as_ptr(),
+                rel: gl.rel.as_ptr(),
+                sink: gl.sink.as_ptr(),
+                o: gl.o.as_ptr(),
+            }
         });
+        let (mut q, mut k, mut v, mut rel, mut gate, sink) = match gpu_ptrs {
+            Some(ptrs) => {
+                let t = std::time::Instant::now();
+                let g = self.gpu.as_mut().expect("gpu active");
+                let q = g.run(ptrs.q, &qn, n_heads * head_dim);
+                let k = g.run(ptrs.k, &kn, kv_dim);
+                let v = g.run(ptrs.v, &vn, kv_dim);
+                let gate = g.run(ptrs.gate, &qn, n_heads * head_dim);
+                let rel = g.run(ptrs.rel, &qn, n_heads * lw.d_rel);
+                let sink = g.run(ptrs.sink, &qn, n_heads);
+                self.profile.gpu_proj += t.elapsed().as_secs_f64();
+                (q, k, v, rel, gate, sink)
+            }
+            None => std::thread::scope(|scope| {
+                let hq = scope.spawn(|| matvec(&lw.w_q, &qn, n_heads * head_dim, n_embd));
+                let hk = scope.spawn(|| matvec(&lw.w_k, &kn, kv_dim, n_embd));
+                let hv = scope.spawn(|| matvec(&lw.w_v, &vn, kv_dim, n_embd));
+                let hg = scope.spawn(|| matvec(&lw.w_gate, &qn, n_heads * head_dim, n_embd));
+                let hr = scope.spawn(|| matvec(&lw.w_rel, &qn, n_heads * lw.d_rel, n_embd));
+                let hs = scope.spawn(|| matvec(&lw.w_sink, &qn, n_heads, n_embd));
+                (
+                    hq.join().expect("q projection"),
+                    hk.join().expect("k projection"),
+                    hv.join().expect("v projection"),
+                    hr.join().expect("rel projection"),
+                    hg.join().expect("gate projection"),
+                    hs.join().expect("sink projection"),
+                )
+            }),
+        };
         for hh in 0..n_heads {
             scaled_l2_clip(
                 &mut q[hh * head_dim..(hh + 1) * head_dim],
@@ -881,7 +1078,6 @@ impl Model {
             unweighted_rmsnorm(&mut v[hh * head_dim..(hh + 1) * head_dim], eps);
         }
 
-        let mut gate = matvec(&lw.w_gate, &qn, n_heads * head_dim, n_embd);
         for g in gate.iter_mut() {
             *g = sigmoid(*g);
         }
@@ -984,7 +1180,16 @@ impl Model {
         }
 
         let gated: Vec<f32> = attn.iter().zip(&gate).map(|(a, g)| a * g).collect();
-        let mut out = matvec(&lw.w_o, &gated, n_embd, n_heads * head_dim);
+        let mut out = match gpu_ptrs {
+            Some(ptrs) => {
+                let t = std::time::Instant::now();
+                let g = self.gpu.as_mut().expect("gpu active");
+                let out = g.run(ptrs.o, &gated, n_embd);
+                self.profile.gpu_proj += t.elapsed().as_secs_f64();
+                out
+            }
+            None => matvec(&lw.w_o, &gated, n_embd, n_heads * head_dim),
+        };
         short_conv1d_4tap(&mut out, &lw.post_conv, &mut cache.post_conv, n_embd);
 
         let residual = if lw.boundary {

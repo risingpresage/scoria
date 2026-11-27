@@ -14,7 +14,7 @@ use scoria_gguf::{BpeTokenizer, GgufFile, ModelConfig};
 
 fn usage() -> ! {
     eprintln!(
-        "Usage:\n  scoria gate [--quick]\n  scoria inspect <model.gguf>\n  scoria tokenize <model.gguf> <prompt> [--no-bos]\n  scoria run <model.gguf> (--prompt <text> | --tokens <csv>) [--max-tokens <N>] [--max-seq <N>] [--no-bos] [--ignore-eos] [--warmup <N>] [--kv-f16] [--dump-logits <path>] [--tap-layer <L>] [--profile]\n  scoria graph-soak <model.gguf> [--replays <N>] [--tokens <csv>]\n  scoria plan <model.gguf> [--vram-mib <N>] [--ctx <N>]\n  scoria strata <model.gguf> [--top-k <N>] [--tokens <N>] [--qd <N>]\n  scoria arch-check <model.gguf> [--dequant-smoke]\n  scoria layer0 <model.gguf> [--tokens <csv>] [--moe] [--router-softmax]\n  scoria logits <model.gguf> [--tokens <csv>] [--top <N>]"
+        "Usage:\n  scoria gate [--quick]\n  scoria inspect <model.gguf>\n  scoria tokenize <model.gguf> <prompt> [--no-bos]\n  scoria run <model.gguf> (--prompt <text> | --tokens <csv>) [--max-tokens <N>] [--max-seq <N>] [--no-bos] [--ignore-eos] [--warmup <N>] [--kv-f16] [--dump-logits <path>] [--tap-layer <L>] [--profile]\n  scoria graph-soak <model.gguf> [--replays <N>] [--tokens <csv>]\n  scoria plan <model.gguf> [--vram-mib <N>] [--ctx <N>]\n  scoria strata <model.gguf> [--top-k <N>] [--tokens <N>] [--qd <N>]\n  scoria arch-check <model.gguf> [--dequant-smoke]\n  scoria layer0 <model.gguf> [--tokens <csv>] [--moe] [--router-softmax]\n  scoria logits <model.gguf> [--tokens <csv>] [--top <N>] [--prompt <text>] [--perp <text>] [--generate <N>] [--threads <N>] [--no-gpu] [--max-visits <N>]"
     );
     process::exit(2);
 }
@@ -834,6 +834,18 @@ fn cmd_logits(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if threads > 0 {
         model.set_threads(threads);
     }
+    let want_gpu = !rest.iter().any(|a| a == "--no-gpu");
+    if want_gpu {
+        match model.enable_gpu() {
+            Ok(resident) => println!(
+                "projections: GPU (linear_f32), {:.2} GiB resident",
+                resident as f64 / (1u64 << 30) as f64
+            ),
+            Err(e) => println!("projections: host ({e})"),
+        }
+    } else {
+        println!("projections: host (--no-gpu)");
+    }
     let load = started.elapsed();
     println!(
         "model: {} layers, {} visits, vocab {}",
@@ -899,8 +911,9 @@ fn cmd_logits(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let per_token = tokens.len() as f64;
     if p.visits > 0 {
         println!(
-            "  last token: attention {:.2}s moe {:.2}s over {} visits (moe {:.0}%)",
+            "  last token: attention {:.2}s (gpu {:.2}s) moe {:.2}s over {} visits (moe {:.0}%)",
             p.attention,
+            p.gpu_proj,
             p.moe,
             p.visits,
             100.0 * p.moe / (p.attention + p.moe)
@@ -989,6 +1002,11 @@ fn cmd_logits(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if threads > 0 {
         again.set_threads(threads);
     }
+    if want_gpu {
+        // The determinism check must compare like with like: a host model against a GPU
+        // model differs in the last bits by construction (different reduction order).
+        let _ = again.enable_gpu();
+    }
     for &tok in &tokens[..tokens.len() - 1] {
         again.forward(tok);
     }
@@ -999,6 +1017,29 @@ fn cmd_logits(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let diff = repeat.iter().zip(&last).filter(|(a, b)| a != b).count();
         println!("  {diff} logits differ");
         return Err("non-deterministic logits".into());
+    }
+
+    // The host path is the oracle for the GPU path: same weights, same arithmetic, only the
+    // reduction order differs.
+    if want_gpu {
+        let mut host = Model::open_with_router(path, router)?;
+        host.max_visits = max_visits;
+        if threads > 0 {
+            host.set_threads(threads);
+        }
+        for &tok in &tokens[..tokens.len() - 1] {
+            host.forward(tok);
+        }
+        let reference = host.forward(tokens[tokens.len() - 1]);
+        let mut worst = 0f32;
+        for (a, b) in reference.iter().zip(&last) {
+            worst = worst.max((a - b).abs());
+        }
+        let agree = Model::top_k(&reference, 1)[0].0 == Model::top_k(&last, 1)[0].0;
+        println!(
+            "gpu-vs-host: max |dlogit| {worst:.6}, argmax agrees: {agree}, host argmax {}",
+            Model::top_k(&reference, 1)[0].0
+        );
     }
     Ok(())
 }

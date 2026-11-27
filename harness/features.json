@@ -7,6 +7,15 @@
   ],
   "features": [
     {
+      "id": "phase3-inkling2-gpu-projections",
+      "phase": 3,
+      "title": "Inkling projections on gfx1201 via linear_f32: 0.97-1.00 s/token prefill, 0.99-1.11 decode",
+      "status": "verified",
+      "verify": "./target/release/scoria logits <gguf> --prompt \"The capital of France is\" --generate 8 && cargo test -p scoria-engine --test inkling2_gpu_gemv && ./scripts/check.sh",
+      "observed": "7 projections per visit (q,k,v,gate,rel,sink,W_o) run on the card from 2.40 GiB of resident f32 weights. GPU vs host: max |dlogit| 2.8e-5, argmax agrees. Perplexity 1.317 over 37 tokens (top-1 34/37), ' Paris.' unchanged, repeat run bit-identical. 0.97-1.00 s/token prefill, 0.99-1.11 s/token decode, down from 1.84 (previous host-only baseline) and 7.6-8.0 (start of the threading work).",
+      "note": "MoE is now 87% of the token (0.79 s) and stays on the host: the experts are IQ2XS/IQ3XXS/NVFP4 and there is no device dequantiser for those, so the next step is either three new .hip quant codecs or an f16-resident expert cache (Strata residency). Per-head attention, relative bias, convolutions and the 200058-row unembedding are also still host-side."
+    },
+    {
       "id": "phase3-inkling2-throughput",
       "phase": 3,
       "title": "Inkling 2 Mini host path: 4.1x faster (row-wise expert dequant, threaded MoE/head/projections)",

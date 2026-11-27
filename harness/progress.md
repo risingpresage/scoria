@@ -163,6 +163,22 @@ Four changes, in order of payoff:
 
 **What this is not:** there are no GPU kernels in this path at all, prefill and decode are the same rate because the host runs one position at a time, and the first token after load is slower (it pulls 12.7 GB of weights through the page cache). The measured 1.84 s/token is the honest warm number.
 
+## 2026-11-28 — the projections move to `gfx1201`: 0.97-1.00 s/token prefill, 0.99-1.11 s/token decode
+Eight of the nine per-visit GEMVs (q, k, v, gate, rel, sink, `W_o`) now run on the card through the already-verified `linear_f32` kernel, with 2.40 GiB of f32 projection weights resident in VRAM. Everything else stays on the host.
+
+| stage | s/token |
+| --- | --- |
+| start of the threading work, host only | 7.6-8.0 |
+| host, 16 threads (end of last turn) | 1.84 |
+| projections on GPU (q/k/v/rel/sink/`W_o`) | 1.28 |
+| + gate projection on GPU | **0.97-1.00 prefill, 0.99-1.11 decode** |
+
+Correctness is unchanged, and the host path is the oracle: **max |dlogit| = 2.8e-5, argmax agrees**, perplexity 1.317 over 37 tokens with top-1 34/37, and "The capital of France is" still gives `" Paris."`. That tag is a genuine cross-implementation check: the same weights, the same f32 arithmetic, only the wave-reduction order differs.
+
+**The bug worth remembering.** The first attempt segfaulted inside `libamdhip64` and then, once the host crash was gone, raised `HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION` from the kernel. `hipModuleLaunchKernel`'s `kernelParams` entries are the **address of each argument, pointer arguments included**: passing the device pointer *value* makes HIP read the kernel argument out of device memory on the host. qwen2's `hip_launch!` hides this behind `KernelArg::as_arg_ptr` (`(self as *mut *mut c_void)`), so hand-rolled launches must write `&mut ptr` and not `ptr`. `crates/engine/tests/inkling2_gpu_gemv.rs` now pins the launch convention against the host matvec at `1x4`, `8x1024` and the real `3072x2304`.
+
+**Where the time is now:** MoE 0.79 s of 0.97 s (87%). Attention is 0.11 s, of which 0.05 s is GPU. The remaining MoE is *not* a launch away: the experts are IQ2XS / IQ3XXS / NVFP4, and no device dequantiser for those exists yet, so a grouped expert GEMV needs either three new quant codecs in `.hip` or an f16-resident expert cache (Strata's residency policy applied to experts).
+
 ## Parity gate calibration (cosine > 0.999 is prompt-dependent, not an implementation defect)
 - Measured the control that settles it: **llama.cpp's own Vulkan backend vs llama.cpp's own CPU backend** scores `cos = 0.997985` (`maxdiff 1.152`) on the Qwen3-4B harness chat prompt (`151644,872,198,785,…,77091,198`, `m=13`), where scoria scores `0.997652` (`maxdiff 1.103`). Both pick top1 `785`. No GPU implementation reaches 0.999 on that prompt.
 - Forcing prefill onto the scalar FP32 GEMM (`SCORIA_PREFILL_FP32=1`) changes nothing: 4B `0.997614` vs `0.997652` for FP16 WMMA, 8B `0.996415` vs `0.996404`. So the deficit is **not** FP16 WMMA rounding.
