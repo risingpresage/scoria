@@ -7,6 +7,15 @@
   ],
   "features": [
     {
+      "id": "phase3-inkling2-kv-ring-long-context",
+      "phase": 3,
+      "title": "Windowed KV ring with exact eviction, and a measured 1100-token run",
+      "status": "verified",
+      "verify": "cargo test -p scoria-engine --release --test inkling2_kv_ring && ./target/release/scoria logits <gguf> --length 1100 && ./scripts/check.sh",
+      "observed": "40 windowed visits bounded at 320 MiB regardless of sequence length; 8 full-history visits at 65536 B/token (matches scoria plan). 1100 positions: 0.71 s/token, RSS 13.73 GiB. Ring vs unbounded history with a 64-token window over 150 tokens: 0 differing logits. Perplexity 1.317 and GPU-vs-host max |dlogit| 3.1e-5 unchanged.",
+      "note": "200k positions would need ~13.4 GB of KV (6.7 GB at FP16) and fits in 31 GB of RAM, but at 0.71 s/token and rising a 200k run is close to a day, so the largest measured context is 1100. Full-history KV cannot be tiered without changing the attention algorithm: those visits read all history every token."
+    },
+    {
       "id": "phase3-inkling2-gpu-experts",
       "phase": 3,
       "title": "NVFP4 expert GEMV on gfx1201 + batched launches: 0.47-0.51 s/token",

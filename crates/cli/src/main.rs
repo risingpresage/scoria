@@ -14,7 +14,7 @@ use scoria_gguf::{BpeTokenizer, GgufFile, ModelConfig};
 
 fn usage() -> ! {
     eprintln!(
-        "Usage:\n  scoria gate [--quick]\n  scoria inspect <model.gguf>\n  scoria tokenize <model.gguf> <prompt> [--no-bos]\n  scoria run <model.gguf> (--prompt <text> | --tokens <csv>) [--max-tokens <N>] [--max-seq <N>] [--no-bos] [--ignore-eos] [--warmup <N>] [--kv-f16] [--dump-logits <path>] [--tap-layer <L>] [--profile]\n  scoria graph-soak <model.gguf> [--replays <N>] [--tokens <csv>]\n  scoria plan <model.gguf> [--vram-mib <N>] [--ctx <N>]\n  scoria strata <model.gguf> [--top-k <N>] [--tokens <N>] [--qd <N>]\n  scoria arch-check <model.gguf> [--dequant-smoke]\n  scoria layer0 <model.gguf> [--tokens <csv>] [--moe] [--router-softmax]\n  scoria logits <model.gguf> [--tokens <csv>] [--top <N>] [--prompt <text>] [--perp <text>] [--generate <N>] [--threads <N>] [--no-gpu] [--max-visits <N>]"
+        "Usage:\n  scoria gate [--quick]\n  scoria inspect <model.gguf>\n  scoria tokenize <model.gguf> <prompt> [--no-bos]\n  scoria run <model.gguf> (--prompt <text> | --tokens <csv>) [--max-tokens <N>] [--max-seq <N>] [--no-bos] [--ignore-eos] [--warmup <N>] [--kv-f16] [--dump-logits <path>] [--tap-layer <L>] [--profile]\n  scoria graph-soak <model.gguf> [--replays <N>] [--tokens <csv>]\n  scoria plan <model.gguf> [--vram-mib <N>] [--ctx <N>]\n  scoria strata <model.gguf> [--top-k <N>] [--tokens <N>] [--qd <N>]\n  scoria arch-check <model.gguf> [--dequant-smoke]\n  scoria layer0 <model.gguf> [--tokens <csv>] [--moe] [--router-softmax]\n  scoria logits <model.gguf> [--length <N>] [--tokens <csv>] [--top <N>] [--prompt <text>] [--perp <text>] [--generate <N>] [--threads <N>] [--no-gpu] [--max-visits <N>]"
     );
     process::exit(2);
 }
@@ -809,6 +809,9 @@ fn cmd_logits(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let max_visits = arg_val(rest, "--max-visits")
         .map(|v| v.parse::<usize>().unwrap_or(usize::MAX))
         .unwrap_or(usize::MAX);
+    // A deterministic synthetic stream, for long-context runs: same ids every run, so two
+    // measurements at the same length are comparable.
+    let length = arg_val(rest, "--length").map(|v| v.parse::<usize>().unwrap_or(0));
 
     let (tok, prompt_tokens) = if let Some(text) = perp.or(prompt) {
         let g = GgufFile::open(path)?;
@@ -818,7 +821,10 @@ fn cmd_logits(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         (None, tokens.clone())
     };
-    let tokens = prompt_tokens;
+    let tokens = match length {
+        Some(n) if n > 0 => (0..n).map(|i| 300 + ((i * 37) % 4000) as u32).collect(),
+        _ => prompt_tokens,
+    };
     if tokens.is_empty() {
         return Err("no tokens (empty prompt)".into());
     }
@@ -998,9 +1004,41 @@ fn cmd_logits(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     // Determinism is not optional: a second run of the same token sequence must reproduce
     // the logits bit for bit, otherwise nothing downstream can be trusted.
+    let (windowed, full) = model.kv_bytes();
+    let rss_kib = std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| {
+            s.split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse::<u64>().ok())
+        })
+        .map(|pages| pages * 4)
+        .unwrap_or(0);
+    println!(
+        "kv: windowed {:.1} MiB + full {:.1} MiB at {} positions ({} B/token for the full slots), rss {:.2} GiB",
+        windowed as f64 / (1u64 << 20) as f64,
+        full as f64 / (1u64 << 20) as f64,
+        tokens.len(),
+        if tokens.is_empty() {
+            0
+        } else {
+            full / tokens.len()
+        },
+        rss_kib as f64 / (1u64 << 20) as f64,
+    );
+
     // Replay on the same model: a second GPU model would need another copy of every resident
     // tensor, and an allocation that silently failed would compare a GPU run against a host
     // run and report "non-deterministic" for the wrong reason.
+    // Both checks double the run time, so a long-context measurement skips them; the
+    // 5-token probe and the 150-token ring test cover them.
+    if tokens.len() > 64 || rest.iter().any(|a| a == "--no-check") {
+        println!(
+            "determinism: skipped on a long run ({} tokens)",
+            tokens.len()
+        );
+        return Ok(());
+    }
     model.reset();
     for &tok in &tokens[..tokens.len() - 1] {
         model.forward(tok);

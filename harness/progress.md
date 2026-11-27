@@ -199,6 +199,24 @@ Correctness holds: perplexity **1.317** over 37 tokens (top-1 34/37), `" Paris."
 
 **Residency, honestly.** This is a fixed residency set, not a policy: `upload_experts` keeps every tensor the device can decode and gives up per tensor if VRAM runs out. There is no LRU, no prefetch, no demotion -- that is still Strata's missing half.
 
+## 2026-11-28 — windowed KV ring, and the first long-context run (1100 tokens)
+The 48 visits used to append to 48 unbounded `Vec`s: 393 KB of KV per token, 78 GB at 200k positions. Windowed visits now store a **ring** of `window` slots, and the ring is verified against the unbounded path rather than argued for.
+
+| measurement | value |
+| --- | --- |
+| 300-position run | 0.51 s/token, KV 160 MiB windowed + **18.8 MiB full = 65536 B/token** |
+| 1100-position run | **0.71 s/token**, KV 320 MiB windowed (capped) + 72 MiB full, RSS **13.73 GiB** |
+| ring vs unbounded, window 64, 150 tokens | **0 differing logits** (bit-for-bit), 86 evictions |
+| ppl / greedy / GPU parity at 37-5 tokens | 1.317, `" Paris."`, max |dlogit| 3.1e-5 (unchanged) |
+
+**The layout.** 40 windowed visits (20 sliding layers, minus the full-history ones, across three loop passes) each hold `window = 1024` slots x 2 tensors x 1024 values x 4 B = 320 MiB in total, and it does not grow with the sequence. The 8 full-history visits keep everything: `2 x 1024 x 4 = 65536 B/token`, which matches `scoria plan`'s projection exactly.
+
+**At 200k positions that is 13.1 GB of full-history KV + 320 MiB of rings**, i.e. ~13.4 GB (6.7 GB at FP16), against 31 GB of RAM. So the *memory* now fits; the *run* does not in any reasonable time -- 0.71 s/token at 1100 and rising with context puts 200k near a day. The largest context actually measured is 1100 tokens.
+
+**Why the ring is exact, not approximate.** Sliding visits only ever attend to the last `window` positions, so evicting older ones cannot change the answer -- provided absolute positions, masks and the relative-bias bank all still agree. The store keeps absolute position numbers and maps them modulo the window, and the visible range is trimmed once (`max(retained, pos+1-window)`) before both the bias and the attention, so the ring and the mask can never disagree. `tests/inkling2_kv_ring.rs` runs the same 150 tokens twice with a 64-token window, once with eviction and once with the unbounded store, and requires **identical** logits. A 1024-token window would need 1024+ tokens per run to expose the same bug.
+
+**What this does and does not do for Strata.** The windowed ring *is* an eviction policy, and the expert residency set *is* a residency policy; both are now real. What is still absent is a **tiered** store with LRU, prefetch and demotion. For full-history KV that is not an oversight: those 8 visits read every earlier position on every token, so paging them would mean 13.1 GB of reads per token -- a policy cannot fix that, only a different attention algorithm (sparse or chunked) could.
+
 ## Parity gate calibration (cosine > 0.999 is prompt-dependent, not an implementation defect)
 - Measured the control that settles it: **llama.cpp's own Vulkan backend vs llama.cpp's own CPU backend** scores `cos = 0.997985` (`maxdiff 1.152`) on the Qwen3-4B harness chat prompt (`151644,872,198,785,…,77091,198`, `m=13`), where scoria scores `0.997652` (`maxdiff 1.103`). Both pick top1 `785`. No GPU implementation reaches 0.999 on that prompt.
 - Forcing prefill onto the scalar FP32 GEMM (`SCORIA_PREFILL_FP32=1`) changes nothing: 4B `0.997614` vs `0.997652` for FP16 WMMA, 8B `0.996415` vs `0.996404`. So the deficit is **not** FP16 WMMA rounding.

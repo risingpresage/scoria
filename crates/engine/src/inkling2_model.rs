@@ -187,26 +187,113 @@ impl MessageGate {
 /// Per-visit state: the four convolution histories and the KV cache. The reference gives
 /// every loop pass its own cache layer, which `schedule` already models as own visits.
 #[derive(Clone)]
+/// One visit's KV history.
+///
+/// A sliding-window visit only ever attends to the last `window` positions, so keeping more
+/// is pure waste: at 48 visits x 2 tensors x 1024 values x 4 bytes it is 393 KB per token,
+/// i.e. 78 GB at 200k positions. Windowed visits therefore store a **ring** of `window`
+/// slots: a position is written once and overwritten when it falls out of the window, so
+/// memory is bounded by the window rather than by the sequence.
+///
+/// Full-history visits have no such bound -- dense attention in those 8 visits reads every
+/// earlier position every token, so eviction there is not a policy question, it is a
+/// correctness question. They keep everything.
+///
+/// The ring keeps absolute position numbers (`count`), so relative distances — and hence
+/// the relative-bias bank and the mask — are computed exactly as before. That is what makes
+/// the ring verifiable against the unbounded path instead of merely plausible.
+struct KvStore {
+    /// `usize::MAX` when the visit keeps full history.
+    window: usize,
+    dim: usize,
+    /// Allocated slots; grows towards `window` and never shrinks.
+    cap: usize,
+    /// Absolute number of positions pushed.
+    count: usize,
+    k: Vec<f32>,
+    v: Vec<f32>,
+}
+
+impl KvStore {
+    fn new(window: Option<usize>, dim: usize) -> Self {
+        Self {
+            window: window.unwrap_or(usize::MAX),
+            dim,
+            cap: 0,
+            count: 0,
+            k: Vec::new(),
+            v: Vec::new(),
+        }
+    }
+
+    fn unbounded(&self) -> bool {
+        self.window == usize::MAX
+    }
+
+    /// Absolute index of the oldest retained position.
+    fn first(&self) -> usize {
+        if self.unbounded() || self.count <= self.window {
+            0
+        } else {
+            self.count - self.window
+        }
+    }
+
+    /// Slot holding absolute position `t`.
+    fn slot(&self, t: usize) -> usize {
+        if self.unbounded() { t } else { t % self.window }
+    }
+
+    fn push(&mut self, k: &[f32], v: &[f32]) {
+        assert_eq!(k.len(), self.dim);
+        assert_eq!(v.len(), self.dim);
+        if self.unbounded() {
+            self.k.extend_from_slice(k);
+            self.v.extend_from_slice(v);
+        } else {
+            if self.cap == 0 {
+                self.cap = self.window.clamp(1, 16);
+                self.k.resize(self.cap * self.dim, 0.0);
+                self.v.resize(self.cap * self.dim, 0.0);
+            } else if self.count == self.cap && self.cap < self.window {
+                // While `count <= cap < window` every slot index equals the absolute
+                // position, so growing is a resize and nothing has to be repacked.
+                let next = (self.cap * 2).min(self.window);
+                self.cap = next;
+                self.k.resize(self.cap * self.dim, 0.0);
+                self.v.resize(self.cap * self.dim, 0.0);
+            }
+            let slot = self.slot(self.count);
+            self.k[slot * self.dim..(slot + 1) * self.dim].copy_from_slice(k);
+            self.v[slot * self.dim..(slot + 1) * self.dim].copy_from_slice(v);
+        }
+        self.count += 1;
+    }
+
+    /// Bytes of KV **in use**. Deliberately `len` and not `capacity`: a `Vec` doubles
+    /// itself, so capacity overstates the history by up to 2x and would make the per-token
+    /// arithmetic disagree with the layout (`2 tensors x kv_dim x 4`).
+    fn bytes(&self) -> usize {
+        (self.k.len() + self.v.len()) * 4
+    }
+}
+
 struct VisitCache {
     k_conv: Vec<f32>,
     v_conv: Vec<f32>,
     post_conv: Vec<f32>,
     ffn_conv: Vec<f32>,
-    k_seq: Vec<f32>,
-    v_seq: Vec<f32>,
-    len: usize,
+    kv: KvStore,
 }
 
 impl VisitCache {
-    fn new(n_embd: usize, kv_dim: usize) -> Self {
+    fn new(n_embd: usize, kv_dim: usize, window: Option<usize>) -> Self {
         Self {
             k_conv: vec![0.0; 3 * kv_dim],
             v_conv: vec![0.0; 3 * kv_dim],
             post_conv: vec![0.0; 3 * n_embd],
             ffn_conv: vec![0.0; 3 * n_embd],
-            k_seq: Vec::new(),
-            v_seq: Vec::new(),
-            len: 0,
+            kv: KvStore::new(window, kv_dim),
         }
     }
 }
@@ -757,6 +844,12 @@ pub struct Model {
     block_states: Vec<Vec<f32>>,
     /// Token position of the next forward, i.e. how much history the caches hold.
     pub pos: usize,
+    /// Overrides the attention window (and the ring capacity) for tests; `None` uses the
+    /// checkpoint's `sliding_window`.
+    kv_window_override: Option<usize>,
+    /// When false, windowed visits keep their whole history and rely on the mask alone.
+    /// That is the oracle the ring is verified against.
+    kv_ring: bool,
     /// Present when the projections run on the card; `None` keeps the verified host path.
     gpu: Option<Gpu>,
     traces: Vec<VisitTrace>,
@@ -840,8 +933,14 @@ impl Model {
             moes.push(Moe::load_layer(&file, &cfg, score, idx)?);
         }
         let visits = schedule(&cfg);
-        let caches = (0..visits.len())
-            .map(|_| VisitCache::new(cfg.n_embd, cfg.n_kv_heads * cfg.head_dim))
+        let kv_dim = cfg.n_kv_heads * cfg.head_dim;
+        let caches = visits
+            .iter()
+            .map(|v| {
+                let sliding = layers[v.layer].sliding;
+                let window = sliding.then(|| cfg.sliding_window.unwrap_or(1024));
+                VisitCache::new(cfg.n_embd, kv_dim, window)
+            })
             .collect();
         let embd = file
             .tensor("token_embd.weight")
@@ -863,6 +962,8 @@ impl Model {
             layers,
             moes,
             pos: 0,
+            kv_window_override: None,
+            kv_ring: true,
             gpu: None,
             traces: Vec::new(),
             profile: Profile::default(),
@@ -891,6 +992,35 @@ impl Model {
         Ok(resident)
     }
 
+    /// Rebuild the caches with a different attention window and/or with the ring eviction
+    /// switched off. `ring = false` keeps every position and masks afterwards, which is the
+    /// behaviour the ring has to reproduce exactly.
+    pub fn configure_kv(&mut self, window: Option<usize>, ring: bool) {
+        self.kv_window_override = window;
+        self.kv_ring = ring;
+        self.reset();
+    }
+
+    /// The attention window in force for this model.
+    fn mask_window(&self) -> Option<usize> {
+        self.kv_window_override.or(self.cfg.sliding_window)
+    }
+
+    /// Bytes the KV history currently occupies, split by whether the visit is bounded.
+    /// `(windowed, full)` in bytes.
+    pub fn kv_bytes(&self) -> (usize, usize) {
+        let mut windowed = 0;
+        let mut full = 0;
+        for (cache, v) in self.caches.iter().zip(&self.visits) {
+            if self.layers[v.layer].sliding {
+                windowed += cache.kv.bytes();
+            } else {
+                full += cache.kv.bytes();
+            }
+        }
+        (windowed, full)
+    }
+
     pub fn gpu_active(&self) -> bool {
         self.gpu.is_some()
     }
@@ -903,8 +1033,16 @@ impl Model {
     }
 
     pub fn reset(&mut self) {
-        for c in self.caches.iter_mut() {
-            *c = VisitCache::new(self.cfg.n_embd, self.cfg.n_kv_heads * self.cfg.head_dim);
+        let kv_dim = self.cfg.n_kv_heads * self.cfg.head_dim;
+        let ring = self.kv_ring;
+        // The ring capacity is the *effective* window, so overriding it for a test shrinks
+        // the ring too -- otherwise the store would never evict and the test would compare
+        // two unbounded stores.
+        let window = self.mask_window().unwrap_or(1024);
+        for (c, v) in self.caches.iter_mut().zip(&self.visits) {
+            let sliding = self.layers[v.layer].sliding;
+            let capacity = sliding.then_some(window);
+            *c = VisitCache::new(self.cfg.n_embd, kv_dim, if ring { capacity } else { None });
         }
         self.block_states.clear();
         self.pos = 0;
@@ -1076,6 +1214,7 @@ impl Model {
         let eps = cfg.rms_eps;
         let n_embd = cfg.n_embd;
         let lw = &self.layers[layer];
+        let mask_window = self.mask_window();
         let cache = &mut self.caches[visit];
         let moe = &mut self.moes[layer];
         let n_heads = lw.n_heads;
@@ -1245,13 +1384,27 @@ impl Model {
             }
         }
 
-        cache.k_seq.extend_from_slice(&k);
-        cache.v_seq.extend_from_slice(&v);
-        let kv_pos = cache.len;
-        cache.len += 1;
+        let kv_pos = cache.kv.count;
+        cache.kv.push(&k, &v);
 
-        let pos_k: Vec<usize> = (0..=kv_pos).collect();
-        let mut bias = vec![0f32; n_heads * (kv_pos + 1)];
+        // The visible set is the intersection of "still retained" (the ring's window) and
+        // "inside the attention window". Trimming here instead of masking inside
+        // `decode_head` keeps the two identical: the ring can only ever drop positions the
+        // mask would have hidden anyway.
+        let window = if lw.sliding {
+            Some(mask_window.unwrap_or(lw.rel_extent))
+        } else {
+            None
+        };
+        let first_visible = match window {
+            Some(w) => cache.kv.first().max((kv_pos + 1).saturating_sub(w)),
+            None => cache.kv.first(),
+        };
+        let visible = kv_pos + 1 - first_visible;
+        assert_eq!(visible, cache.kv.count - first_visible);
+
+        let pos_k: Vec<usize> = (first_visible..=kv_pos).collect();
+        let mut bias = vec![0f32; n_heads * visible];
         relative_bias(
             &rel,
             n_heads,
@@ -1263,45 +1416,44 @@ impl Model {
             &mut bias,
         );
 
-        let window = if lw.sliding {
-            Some(cfg.sliding_window.unwrap_or(lw.rel_extent))
-        } else {
-            None
-        };
         let mut attn = vec![0f32; n_heads * head_dim];
         for hh in 0..n_heads {
             let kvh = hh / group;
-            let mut kh = Vec::with_capacity((kv_pos + 1) * head_dim);
-            let mut vh = Vec::with_capacity((kv_pos + 1) * head_dim);
-            for t in 0..=kv_pos {
-                let base = (t * lw.kv_heads + kvh) * head_dim;
-                kh.extend_from_slice(&cache.k_seq[base..base + head_dim]);
-                vh.extend_from_slice(&cache.v_seq[base..base + head_dim]);
+            let mut kh = Vec::with_capacity(visible * head_dim);
+            let mut vh = Vec::with_capacity(visible * head_dim);
+            for t in first_visible..=kv_pos {
+                let slot = cache.kv.slot(t);
+                let base = slot * lw.kv_dim;
+                kh.extend_from_slice(
+                    &cache.kv.k[base + kvh * head_dim..base + (kvh + 1) * head_dim],
+                );
+                vh.extend_from_slice(
+                    &cache.kv.v[base + kvh * head_dim..base + (kvh + 1) * head_dim],
+                );
             }
             let out = decode_head(
                 &q[hh * head_dim..(hh + 1) * head_dim],
                 &kh,
                 &vh,
-                &bias[hh * (kv_pos + 1)..(hh + 1) * (kv_pos + 1)],
+                &bias[hh * visible..(hh + 1) * visible],
                 sink[hh],
-                kv_pos,
-                window,
+                visible - 1,
+                None,
             );
             attn[hh * head_dim..(hh + 1) * head_dim].copy_from_slice(&out);
         }
 
         // Diagnostics: head 0's attention distribution including the sink.
         {
-            let mut logits = Vec::with_capacity(kv_pos + 2);
+            let mut logits = Vec::with_capacity(visible + 1);
             let scale = (head_dim as f32).sqrt().recip();
-            for (t, bias_t) in bias.iter().enumerate().take(kv_pos + 1) {
-                let visible = window.is_none_or(|w| kv_pos - t < w);
-                if !visible {
-                    logits.push(f32::NEG_INFINITY);
-                    continue;
-                }
-                let base = t * lw.kv_heads * head_dim;
-                let dot: f32 = (0..head_dim).map(|d| q[d] * cache.k_seq[base + d]).sum();
+            // Head 0 only: `bias` is `heads * visible` long, so the row must be bounded
+            // explicitly or the diagnostic walks into the next head's row.
+            for (i, bias_t) in bias.iter().enumerate().take(visible) {
+                let t = first_visible + i;
+                let slot = cache.kv.slot(t);
+                let base = slot * lw.kv_dim;
+                let dot: f32 = (0..head_dim).map(|d| q[d] * cache.kv.k[base + d]).sum();
                 logits.push(dot * scale + bias_t);
             }
             let mut with_sink = logits.clone();
@@ -1310,7 +1462,7 @@ impl Model {
             let exps: Vec<f32> = with_sink.iter().map(|v| (v - max).exp()).collect();
             let sum: f32 = exps.iter().sum();
             let probs: Vec<f32> = exps.iter().map(|v| v / sum).collect();
-            let (peak_idx, peak) = probs[..=kv_pos].iter().enumerate().fold(
+            let (peak_idx, peak) = probs[..visible].iter().enumerate().fold(
                 (0usize, f32::NEG_INFINITY),
                 |(bi, bv), (i, v)| {
                     if *v > bv { (i, *v) } else { (bi, bv) }
@@ -1324,8 +1476,8 @@ impl Model {
             self.traces.push(VisitTrace {
                 layer,
                 peak,
-                peak_distance: kv_pos - peak_idx,
-                sink: probs[kv_pos + 1],
+                peak_distance: (visible - 1) - peak_idx,
+                sink: probs[visible],
                 entropy,
             });
         }
@@ -1552,6 +1704,63 @@ mod tests {
         for (o, m) in out.iter().zip(&message) {
             assert!((*o - m).abs() < 1e-4, "{out:?} vs {message:?}");
         }
+    }
+
+    #[test]
+    fn kv_ring_keeps_exactly_the_window_and_maps_absolute_positions() {
+        // A window of 4 over 10 positions: positions 0..5 are evicted, and absolute
+        // position `t` still reads back its own values through the modulo slot.
+        let dim = 2;
+        let mut kv = KvStore::new(Some(4), dim);
+        for t in 0..10usize {
+            kv.push(&[t as f32, -1.0], &[t as f32, 100.0]);
+            assert_eq!(kv.count, t + 1);
+            let expect_first = (t + 1).saturating_sub(4);
+            assert_eq!(kv.first(), expect_first, "first after {t}");
+            // Everything retained reads back its own value, nothing older is reachable.
+            for u in expect_first..=t {
+                let slot = kv.slot(u);
+                assert_eq!(kv.k[slot * dim], u as f32, "k[{u}] after {t}");
+                assert_eq!(kv.v[slot * dim], u as f32, "v[{u}] after {t}");
+            }
+            assert!(kv.k.len() <= 4 * dim, "capacity must not exceed the window");
+        }
+        assert_eq!(kv.count, 10);
+        assert_eq!(kv.first(), 6);
+        assert_eq!(kv.slot(6), 2);
+        assert_eq!(kv.slot(9), 1);
+
+        // An unbounded store keeps everything and never evicts.
+        let mut full = KvStore::new(None, dim);
+        for t in 0..10usize {
+            full.push(&[t as f32, 0.0], &[0.0, t as f32]);
+        }
+        assert_eq!(full.first(), 0);
+        assert_eq!(full.count, 10);
+        assert_eq!(full.k.len(), 10 * dim);
+    }
+
+    #[test]
+    fn kv_ring_grows_lazily_without_repacking() {
+        // The first 16 slots are allocated up front, then doubled up to the window. While
+        // `count <= cap <= window` the slot index equals the absolute position, so growth
+        // is a resize and no position has to be moved.
+        let dim = 1;
+        let mut kv = KvStore::new(Some(64), dim);
+        kv.push(&[0.0], &[0.0]);
+        assert_eq!(kv.k.len(), 16);
+        for t in 1..64usize {
+            kv.push(&[t as f32], &[t as f32]);
+        }
+        assert_eq!(kv.k.len(), 64, "grown to the window, not beyond");
+        for (t, value) in kv.k.iter().enumerate() {
+            assert_eq!(*value, t as f32, "k[{t}] survived the growth");
+        }
+        // The 65th position overwrites slot 0 and nothing else.
+        kv.push(&[64.0], &[64.0]);
+        assert_eq!(kv.k[0], 64.0);
+        assert_eq!(kv.first(), 1);
+        assert_eq!(kv.k.len(), 64);
     }
 
     #[test]
