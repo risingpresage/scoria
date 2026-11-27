@@ -102,7 +102,7 @@ Five crates:
   and `llvm-objdump` assertions that fail the build on a banned mnemonic.
 - `scoria-gguf`: mmap GGUF parser, CPU reference dequantisation, byte-level BPE.
 - `scoria-engine`: tensor upload, KV cache, layer schedule, per-codec dispatch.
-- `scoria-cli`: `gate`, `inspect`, `tokenize`, `run`, `graph-soak`, `plan`, `strata`.
+- `scoria-cli`: `gate`, `inspect`, `tokenize`, `run`, `graph-soak`, `plan`, `strata`, `arch-check`.
 
 Device code is compiled only with
 

@@ -14,7 +14,7 @@ use scoria_gguf::{BpeTokenizer, GgufFile, ModelConfig};
 
 fn usage() -> ! {
     eprintln!(
-        "Usage:\n  scoria gate [--quick]\n  scoria inspect <model.gguf>\n  scoria tokenize <model.gguf> <prompt> [--no-bos]\n  scoria run <model.gguf> (--prompt <text> | --tokens <csv>) [--max-tokens <N>] [--max-seq <N>] [--no-bos] [--ignore-eos] [--warmup <N>] [--kv-f16] [--dump-logits <path>] [--tap-layer <L>] [--profile]\n  scoria graph-soak <model.gguf> [--replays <N>] [--tokens <csv>]\n  scoria plan <model.gguf> [--vram-mib <N>] [--ctx <N>]\n  scoria strata <model.gguf> [--top-k <N>] [--tokens <N>] [--qd <N>]"
+        "Usage:\n  scoria gate [--quick]\n  scoria inspect <model.gguf>\n  scoria tokenize <model.gguf> <prompt> [--no-bos]\n  scoria run <model.gguf> (--prompt <text> | --tokens <csv>) [--max-tokens <N>] [--max-seq <N>] [--no-bos] [--ignore-eos] [--warmup <N>] [--kv-f16] [--dump-logits <path>] [--tap-layer <L>] [--profile]\n  scoria graph-soak <model.gguf> [--replays <N>] [--tokens <csv>]\n  scoria plan <model.gguf> [--vram-mib <N>] [--ctx <N>]\n  scoria strata <model.gguf> [--top-k <N>] [--tokens <N>] [--qd <N>]\n  scoria arch-check <model.gguf>"
     );
     process::exit(2);
 }
@@ -592,6 +592,129 @@ a hot-expert LRU beats raw disk speed",
     Ok(())
 }
 
+/// Validate a checkpoint against the `inkling2_loop` architecture contract: which
+/// tensors exist for every role, which quantisation types the engine cannot dequantise
+/// yet, and the 48-visit execution order with its KV slots.
+fn cmd_arch_check(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use scoria_engine::inkling2;
+    if args.is_empty() {
+        usage();
+    }
+    let path = &args[0];
+    let gguf = GgufFile::open(path)?;
+    let cfg = ModelConfig::from_gguf(&gguf)?;
+    if cfg.architecture != inkling2::ARCH {
+        return Err(format!(
+            "{} is `{}`, not `{}`",
+            path,
+            cfg.architecture,
+            inkling2::ARCH
+        )
+        .into());
+    }
+    let params = inkling2::Inkling2Params::from_gguf(&gguf, &cfg);
+    let (checks, unknown) = inkling2::check(&gguf, &cfg);
+
+    println!("model:       {path}");
+    println!(
+        "params:      rel {}x{} clip {:.3} | qk_clip {:.3} | log_scale {:.2}/{} | situ {:.1}/{:.1}",
+        params.relative_length,
+        params.relative_extent,
+        params.qk_clip,
+        params.qk_clip,
+        params.log_scale_alpha,
+        params.log_scale_floor,
+        params.situ_beta,
+        params.situ_linear_beta
+    );
+    println!(
+        "             attn_res block {} | softcap {:.1} | conv cache {} | expert ff {} scale {:.1}",
+        params.attn_res_block,
+        params.final_logit_softcap,
+        params.shortconv_cache,
+        params.expert_ff,
+        params.expert_weights_scale
+    );
+    println!();
+
+    let w = inkling2::ROLES
+        .iter()
+        .map(|r| r.suffix.len())
+        .max()
+        .unwrap_or(0);
+    println!(
+        "{:<w$}  {:>6}  {:>7}  {:<28} status",
+        "role",
+        "layers",
+        "missing",
+        "types",
+        w = w
+    );
+    for c in &checks {
+        let status = if c.missing > 0 {
+            "MISSING".to_string()
+        } else if !c.unsupported.is_empty() {
+            format!("needs dequant: {}", c.unsupported.join(","))
+        } else {
+            "ok".to_string()
+        };
+        println!(
+            "{:<w$}  {:>6}  {:>7}  {:<28} {}",
+            c.suffix,
+            c.present,
+            c.missing,
+            c.types.join(","),
+            status,
+            w = w
+        );
+    }
+
+    let calls = inkling2::schedule(&cfg);
+    let budget = cfg.kv_budget();
+    println!();
+    println!(
+        "schedule:    {} visits = {} direct + {} looped + {} tail; {} KV slots",
+        calls.len(),
+        cfg.loop_start.unwrap_or(0),
+        (cfg.loop_end.unwrap_or(0) - cfg.loop_start.unwrap_or(0)) * cfg.loop_count.unwrap_or(1),
+        cfg.n_layers - cfg.loop_end.unwrap_or(cfg.n_layers),
+        budget.slots
+    );
+    println!(
+        "visit order: 0..{} layer 0..{}, then layer {}..{} x{}, then layer {}..{}",
+        cfg.loop_start.unwrap_or(0),
+        cfg.loop_start.unwrap_or(0),
+        cfg.loop_start.unwrap_or(0),
+        cfg.loop_end.unwrap_or(0),
+        cfg.loop_count.unwrap_or(1),
+        cfg.loop_end.unwrap_or(0),
+        cfg.n_layers
+    );
+    if !unknown.is_empty() {
+        println!("unrecognised tensors ({}):", unknown.len());
+        for name in &unknown {
+            println!("  {name}");
+        }
+    }
+    let unsupported: Vec<String> = checks
+        .iter()
+        .filter(|c| !c.unsupported.is_empty())
+        .map(|c| format!("{}:{}", c.suffix, c.unsupported.join(",")))
+        .collect();
+    if !unsupported.is_empty() {
+        println!("blocking dequant work: {}", unsupported.join(" "));
+    }
+    let missing: Vec<&str> = checks
+        .iter()
+        .filter(|c| c.missing > 0)
+        .map(|c| c.suffix)
+        .collect();
+    if !missing.is_empty() {
+        println!("missing required roles: {}", missing.join(" "));
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let res = match args.first().map(|s| s.as_str()) {
@@ -605,6 +728,7 @@ fn main() {
         Some("graph-soak") => cmd_graph_soak(&args[1..]),
         Some("plan") => cmd_plan(&args[1..]),
         Some("strata") => cmd_strata(&args[1..]),
+        Some("arch-check") => cmd_arch_check(&args[1..]),
         _ => usage(),
     };
     if let Err(e) = res {

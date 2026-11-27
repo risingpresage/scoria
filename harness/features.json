@@ -7,6 +7,15 @@
   ],
   "features": [
     {
+      "id": "phase3-inkling2-contract",
+      "phase": 3,
+      "title": "inkling2_loop architecture contract: 42 tensor roles, layer variants, loop schedule, checked against the checkpoint",
+      "status": "verified",
+      "verify": "./scripts/check.sh && ./target/release/scoria arch-check /home/noorm/models/inkling/Inkling-2-Mini-UD-Q3_K_XL.gguf",
+      "observed": "`scoria arch-check` on Inkling-2-Mini-UD-Q3_K_XL finds every required role with 0 missing across 42 roles: 20 sliding-window layers carry a fused `attn_norm`, the 4 full-history layers (5/11/17/23) carry `attn_{q,k,v}_inp_norm` plus `attn_{k,v}_conv_proj`, and the 12 looped layers carry 13 `loop_*_ctrl_*`/`loop_msg_query` tensors. Schedule expands to 48 visits (6 direct + 36 looped + 6 tail) and 48 KV slots. Remaining work is dequantisation only: Q5K, BF16, Q3K, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL and GGML type 40 (unknown to this tree). 6 unit tests cover the schedule and the two layer variants.",
+      "note": "FP8 conversion is available on gfx1201 and verified by compiling probes: `v_cvt_pk_fp8_f32` (f32x2 -> fp8x2) and `v_cvt_f32_fp8_e32` (fp8 -> f32), neither banned; FP8 WMMA already measures 383.76 TFLOPS in `scoria gate`."
+    },
+    {
       "id": "phase3-kv-budget-strata",
       "phase": 3,
       "title": "Sliding-window-aware KV budget planner and measured Strata paging prototype for Inkling 2 Mini",
