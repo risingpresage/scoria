@@ -7,6 +7,15 @@
   ],
   "features": [
     {
+      "id": "phase3-inkling2-block-residual",
+      "phase": 3,
+      "title": "Block-boundary residual and mlp_input attention for layer 0",
+      "status": "verified",
+      "verify": "./target/release/scoria layer0 <gguf> --moe && ./scripts/check.sh",
+      "observed": "|residual| now equals |post| (7.301 for token 785) instead of embedding+attn (48.562), confirming the block boundary performs no residual add; the MoE input comes from the 1-query attention over [embedding, attn_out] with |norm_in| 51.678/50.317/48.943 against |ffn_norm.weight| 50.492. Expert ids change accordingly and weights still sum to 8.0; all finite.",
+      "note": "Comparison against the transformers reference is blocked on this machine: no torch/transformers installed, no HF safetensors checkpoint on disk (only the GGUF), and llama.cpp b11050 rejects inkling2_loop. Layers 1-23, the loop gates, the final norm, output matvec and final_logit_softcapping are still unwired, so no logit exists."
+    },
+    {
       "id": "phase3-inkling2-moe",
       "phase": 3,
       "title": "Layer-0 top-8 MoE on real weights: router, softcapped SwiGLU, per-expert outer scale",

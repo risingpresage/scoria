@@ -107,6 +107,11 @@
 - Three test failures found and fixed while wiring this, all in *my* expectations rather than the code: `tanh(100/25)*25` is 24.983 (I had assumed 25); a weighted RMSNorm does **not** have an exact `sqrt(n)` norm — only the unweighted one does, so the doc comment now says "within a few percent" instead of claiming an invariant; and the MoE probe initially skipped the pre-MoE normalisation and the post-MLP convolution entirely, which the reference's decoder layer makes explicit.
 - 3 MoE unit tests: softcap saturation, the hand-computed SwiGLU value, and the routing rule that selection uses the biased score while weights use the raw score (a classic MoE bug).
 
+## 2026-11-28 — layer 0 made structurally faithful: block boundary + mlp_input attention
+- The reference's decoder layer is not "attention -> residual add -> FFN": at a **block boundary** (`layer % 6 == 0`, which layer 0 is) it appends its *input* to a list of block snapshots and leaves `residual` equal to the attention output, with **no residual add**. Then the FFN input is a **single learned query attending over those snapshots plus the current hidden state** (`mlp_input`), normed, not the residual stream. Both are now implemented.
+- Effect on real weights: `|residual|` drops from 48.6 to 7.30 (=`|post|`, confirming no add happened), and the MoE input norm becomes 51.7/50.3/48.9 against `|ffn_norm.weight|` = 50.5.
+- Expert selections shift accordingly (e.g. `[18,45,33,95,11,124,123,114]` for token 785), weights still sum to 8.0, all finite.
+
 ## Parity gate calibration (cosine > 0.999 is prompt-dependent, not an implementation defect)
 - Measured the control that settles it: **llama.cpp's own Vulkan backend vs llama.cpp's own CPU backend** scores `cos = 0.997985` (`maxdiff 1.152`) on the Qwen3-4B harness chat prompt (`151644,872,198,785,…,77091,198`, `m=13`), where scoria scores `0.997652` (`maxdiff 1.103`). Both pick top1 `785`. No GPU implementation reaches 0.999 on that prompt.
 - Forcing prefill onto the scalar FP32 GEMM (`SCORIA_PREFILL_FP32=1`) changes nothing: 4B `0.997614` vs `0.997652` for FP16 WMMA, 8B `0.996415` vs `0.996404`. So the deficit is **not** FP16 WMMA rounding.

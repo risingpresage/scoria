@@ -19,7 +19,12 @@ use crate::inkling2_attn::{
 };
 
 pub struct LayerZero {
+    /// `(residual, normalised MoE input)` produced by `attention_step`.
+    pending_ffn: Option<(Vec<f32>, Vec<f32>)>,
     last_residual: Vec<f32>,
+    /// Block snapshots the attention residual reads from. Layer 0 is a block boundary, so
+    /// it appends its input (the embedding) here.
+    block_states: Vec<Vec<f32>>,
     n_embd: usize,
     n_heads: usize,
     head_dim: usize,
@@ -46,6 +51,7 @@ pub struct LayerZero {
     scale_q: Vec<f32>,
     scale_rel: Vec<f32>,
     proj_rel: Vec<f32>,
+    ffn_res_query: Vec<f32>,
     ffn_norm: Vec<f32>,
     ffn_post_conv: Vec<f32>,
     conv_k: Vec<f32>,
@@ -137,6 +143,8 @@ impl LayerZero {
         let kv_heads = cfg.n_kv_heads;
         Ok(Self {
             last_residual: Vec::new(),
+            pending_ffn: None,
+            block_states: Vec::new(),
             n_embd: cfg.n_embd,
             n_heads,
             head_dim,
@@ -176,6 +184,7 @@ impl LayerZero {
             scale_q: dequant_tensor(file, "blk.0.attn_q_clip.weight")?,
             scale_rel: dequant_tensor(file, "blk.0.attn_rel_clip.weight")?,
             proj_rel: dequant_tensor(file, "blk.0.attn_rel_bias.weight")?,
+            ffn_res_query: dequant_tensor(file, "blk.0.ffn_res_query.weight")?,
             ffn_norm: dequant_tensor(file, "blk.0.ffn_norm.weight")?,
             ffn_post_conv: dequant_tensor(file, "blk.0.ffn_post_conv.weight")?,
             conv_k: dequant_tensor(file, "blk.0.attn_k_conv.weight")?,
@@ -197,8 +206,7 @@ impl LayerZero {
     /// residual add, which is the reference's order. (The block attention residual that
     /// sits between them needs block states, which this probe does not model yet.)
     pub fn ffn(&mut self, moe: &mut crate::inkling2_moe::Moe) -> FfnOutput {
-        let mut x = self.last_residual.clone();
-        rmsnorm(&mut x, &self.ffn_norm, self.eps);
+        let (residual, x) = self.pending_ffn.clone().expect("attention_step ran first");
         let input_norm = norm(&x);
 
         let mut y = moe.forward(&x);
@@ -210,12 +218,7 @@ impl LayerZero {
             &mut self.caches.ffn_post,
             self.n_embd,
         );
-        let layer: Vec<f32> = self
-            .last_residual
-            .iter()
-            .zip(&y)
-            .map(|(a, b)| a + b)
-            .collect();
+        let layer: Vec<f32> = residual.iter().zip(&y).map(|(a, b)| a + b).collect();
         FfnOutput {
             weight_norm: norm(&self.ffn_norm),
             input_norm,
@@ -230,6 +233,8 @@ impl LayerZero {
     }
 
     pub fn reset(&mut self) {
+        self.block_states.clear();
+        self.pending_ffn = None;
         self.caches = Caches {
             k: vec![0.0; 3 * self.kv_dim],
             v: vec![0.0; 3 * self.kv_dim],
@@ -355,7 +360,9 @@ impl LayerZero {
         let gated: Vec<f32> = attn.iter().zip(&gate).map(|(a, g)| a * g).collect();
         let projected = matvec(&self.w_o, &gated, self.n_embd, self.n_heads * self.head_dim);
 
-        // Post convolution, then the residual add.
+        // Post convolution, then the block-boundary bookkeeping. Layer 0 is a block
+        // boundary (`layer % 6 == 0`), so the reference appends its input to the block
+        // states and leaves `residual` equal to the attention output, with no add.
         let mut post_out = projected;
         short_conv1d_4tap(
             &mut post_out,
@@ -363,7 +370,35 @@ impl LayerZero {
             &mut self.caches.post,
             self.n_embd,
         );
-        let residual: Vec<f32> = row.iter().zip(&post_out).map(|(a, b)| a + b).collect();
+        self.block_states.push(row.to_vec());
+        let residual = post_out.clone();
+
+        // `mlp_input`: a single learned query attending over the block snapshots plus the
+        // current hidden state, non-causal, scaled by n_embd^-0.5. The MoE consumes its
+        // output, not the residual stream.
+        let mut stacked: Vec<Vec<f32>> = self.block_states.clone();
+        stacked.push(post_out.clone());
+        for v in stacked.iter_mut() {
+            crate::inkling2_attn::unweighted_rmsnorm(v, self.eps);
+        }
+        let scale = (self.n_embd as f32).sqrt().recip();
+        let mut combined = vec![0f32; self.n_embd];
+        let mut weights = Vec::with_capacity(stacked.len());
+        for v in &stacked {
+            let dot: f32 = self.ffn_res_query.iter().zip(v).map(|(a, b)| a * b).sum();
+            weights.push(dot * scale);
+        }
+        crate::inkling2_attn::sink_softmax(&mut weights, f32::NEG_INFINITY);
+        for (w, v) in weights.iter().zip(&stacked) {
+            for (c, vi) in combined.iter_mut().zip(v) {
+                *c += w * vi;
+            }
+        }
+
+        let ffn_residual = residual.clone();
+        let mut ffn_in = combined;
+        rmsnorm(&mut ffn_in, &self.ffn_norm, self.eps);
+        self.pending_ffn = Some((ffn_residual, ffn_in));
 
         self.last_residual = residual.clone();
         LayerZeroOutput {
