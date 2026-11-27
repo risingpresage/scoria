@@ -7,6 +7,15 @@
   ],
   "features": [
     {
+      "id": "phase3-inkling2-iq4nl-per-tensor",
+      "phase": 3,
+      "title": "IQ4_NL device codec + per-tensor expert residency",
+      "status": "verified",
+      "verify": "cargo test -p scoria-engine --test inkling2_gpu_iq4nl && scoria logits <gguf> --compare-single && ./scripts/check.sh",
+      "observed": "linear_iq4nl matches dequant_row_iq4nl on real checkpoint rows (blk.20/blk.23 ffn_down_exps, k=1152) to <=5e-5 relative, deterministic across launches. Decode 0.39-0.44 s/token (was 0.45-0.47); MoE 0.23 s/token with 0.22 on the card; VRAM 10.95 GiB; perplexity 7.598 unchanged; GPU-vs-host max |dlogit| 2.9e-5 with the argmax agreeing.",
+      "note": "Covers only the down tensors of 12 layers. Their gate_up half (2/3 of their expert compute) still runs on the host and needs device codecs for IQ2XS/IQ2S/IQ3XXS/IQ3S/Q3K; IQ3XXS alone would cover 5 layers. A first attempt ran the host gate_up serially and was slower than all-host (1.10-2.25 s/token)."
+    },
+    {
       "id": "phase3-inkling2-batched-prefill",
       "phase": 3,
       "title": "Chunked batched prefill (expert-gathered) + perplexity correction",

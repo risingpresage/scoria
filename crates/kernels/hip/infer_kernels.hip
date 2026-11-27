@@ -464,6 +464,70 @@ extern "C" __global__ void linear_nvfp4(const unsigned char* __restrict__ weight
     }
 }
 
+// IQ4_NL (GGML type 20): 18 bytes per 32 elements -- an f16 scale and 16 bytes of packed
+// nibbles indexing a 16-level codebook. Low nibble of byte j is element j, high nibble is
+// element j+16. Transcribed from `dequant_row_iq4_nl`; the codebook is non-uniform
+// ([-127,-104,-83,-65,-49,-35,-22,-10, 1,13,25,38,53,69,89,113]), so it is a switch rather
+// than a scale-multiply.
+__device__ __forceinline__ float scoria_iq4nl(unsigned code) {
+    switch (code & 15u) {
+        case 0: return -127.0f;
+        case 1: return -104.0f;
+        case 2: return -83.0f;
+        case 3: return -65.0f;
+        case 4: return -49.0f;
+        case 5: return -35.0f;
+        case 6: return -22.0f;
+        case 7: return -10.0f;
+        case 8: return 1.0f;
+        case 9: return 13.0f;
+        case 10: return 25.0f;
+        case 11: return 38.0f;
+        case 12: return 53.0f;
+        case 13: return 69.0f;
+        case 14: return 89.0f;
+        default: return 113.0f;
+    }
+}
+
+extern "C" __global__ void linear_iq4nl(const unsigned char* __restrict__ weight,
+                                        const float* __restrict__ x,
+                                        const float* __restrict__ bias,
+                                        float* __restrict__ y,
+                                        unsigned m,
+                                        unsigned n,
+                                        unsigned k) {
+    unsigned wave_id = threadIdx.x / SCORIA_WAVE_SIZE;
+    unsigned lane = threadIdx.x & (SCORIA_WAVE_SIZE - 1u);
+    unsigned waves_per_wg = blockDim.x / SCORIA_WAVE_SIZE;
+    unsigned row = blockIdx.x * waves_per_wg + wave_id;
+    unsigned tok = blockIdx.y;
+    if (row >= n || tok >= m) return;
+
+    unsigned nb = k / 32u;
+    const unsigned char* w_row = weight + (size_t)row * nb * 18u;
+    const float* x_row = x + (size_t)tok * k;
+    float acc = 0.0f;
+    for (unsigned b = lane; b < nb; b += SCORIA_WAVE_SIZE) {
+        const unsigned char* blk = w_row + (size_t)b * 18u;
+        float d = scoria_f16_bits_to_f32(scoria_read_u16_unaligned(blk));
+        const unsigned char* qs = blk + 2;
+        const float* xp = x_row + (size_t)b * 32u;
+        float blk_sum = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            unsigned char byte = qs[j];
+            blk_sum += scoria_iq4nl((unsigned)(byte & 0x0Fu)) * xp[j];
+            blk_sum += scoria_iq4nl((unsigned)(byte >> 4)) * xp[j + 16];
+        }
+        acc += d * blk_sum;
+    }
+    float sum = scoria_wave_sum(acc);
+    if (lane == 0) {
+        y[(size_t)tok * n + row] = sum + (bias ? bias[row] : 0.0f);
+    }
+}
+
 extern "C" __global__ void linear_q4_k(const unsigned char* __restrict__ weight,
                                        const float* __restrict__ x,
                                        const float* __restrict__ bias,

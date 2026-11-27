@@ -61,6 +61,7 @@ pub mod infer_names {
     pub const LINEAR_Q4_K: &str = "linear_q4_k";
     pub const LINEAR_Q6_K: &str = "linear_q6_k";
     pub const LINEAR_NVFP4: &str = "linear_nvfp4";
+    pub const LINEAR_IQ4NL: &str = "linear_iq4nl";
     pub const ROPE_NEOX_F32: &str = "rope_neox_f32";
     pub const KV_CACHE_APPEND_F32: &str = "kv_cache_append_f32";
     pub const KV_CACHE_APPEND_F16: &str = "kv_cache_append_f16";

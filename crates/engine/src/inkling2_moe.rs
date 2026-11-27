@@ -108,7 +108,7 @@ impl ExpertTensor {
     /// which stays in cache, so the same dequantisation work runs against a third of the
     /// memory traffic.
     #[allow(clippy::too_many_arguments)]
-    fn row_matvec(
+    pub(crate) fn row_matvec(
         &self,
         file: &GgufFile,
         e: usize,

@@ -276,6 +276,22 @@ I did **not** implement the projection batching this step called for. I went aft
 
 Also in this change: `CHUNK_MAX` raised to 64; `Moe::forward_chunk` takes `&mut self` so its scratch survives across calls; `moe_forward_parts` now takes `&Moe`.
 
+## 2026-11-28 — IQ4_NL on the card, and per-tensor expert residency
+`linear_iq4nl` decodes IQ4_NL (18 bytes per 32 elements: an f16 scale, 16 packed nibble bytes, and a **non-uniform** 16-level codebook) and dots it on `gfx1201`. Validated elementwise against `dequant_row_iq4nl` on **real checkpoint rows** (`blk.20`/`blk.23` `ffn_down_exps`, k=1152): relative error <= 5e-5, bit-identical across launches.
+
+**Per-tensor residency is the part that makes it count.** Until now a layer used the card only if *both* expert tensors were NVFP4. IQ4_NL covers only the `down` tensors (layers 20-23), so the new `GpuExperts` decides residency **per tensor**: 12 layers whose `gate_up` has no device codec now run their `down` half on the card instead of both halves on the host.
+
+| | before | after |
+| decode | 0.45-0.47 s/token | **0.39-0.44** (best 0.39) |
+| MoE | 0.28 s/token | 0.23 s/token (gpu expert time 0.22 of the 0.23) |
+| VRAM resident | 10.24 GiB | 10.95 GiB |
+| perplexity | 7.598 | 7.598 |
+| GPU-vs-host | 3.1e-5 | **2.9e-5**, argmax agrees |
+
+One trap worth recording: the first version of the per-tensor path ran the host `gate_up` half **serially** and made decode *slower* (1.10-2.25 s/token). Threading it across the routed experts — the same thing `forward_route` does — recovered the gain. A partial offload has to keep the part left on the host as fast as it was.
+
+The remaining host work is the `gate_up` half of those 12 layers (2/3 of their expert compute), which needs device codecs for IQ2XS, IQ2S, IQ3XXS, IQ3S and Q3K. IQ3XXS is the biggest single win (5 layers) and needs a 256-entry grid plus the 4-bit sign table.
+
 ## Parity gate calibration (cosine > 0.999 is prompt-dependent, not an implementation defect)
 - Measured the control that settles it: **llama.cpp's own Vulkan backend vs llama.cpp's own CPU backend** scores `cos = 0.997985` (`maxdiff 1.152`) on the Qwen3-4B harness chat prompt (`151644,872,198,785,…,77091,198`, `m=13`), where scoria scores `0.997652` (`maxdiff 1.103`). Both pick top1 `785`. No GPU implementation reaches 0.999 on that prompt.
 - Forcing prefill onto the scalar FP32 GEMM (`SCORIA_PREFILL_FP32=1`) changes nothing: 4B `0.997614` vs `0.997652` for FP16 WMMA, 8B `0.996415` vs `0.996404`. So the deficit is **not** FP16 WMMA rounding.
