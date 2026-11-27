@@ -20,29 +20,26 @@
   },
   "phase2b": {
     "tag": "phase2b_final",
+    "note": "Two independent 3-trial-median runs on an otherwise busy desktop GPU (ComfyUI + compositor hold VRAM, gpu_busy 8-77%); spread is ~5-10%. Targets are not met on either run.",
     "qwen2.5-0.5b-q4_k_m": {
       "short_prompt_tokens": 26,
-      "short_prefill_tok_s_median": 4265.60,
-      "prefill_128_tok_s_median": 14853.13,
-      "short_decode_tok_s_median": 401.56
+      "run1": {"prefill_short": 4265.60, "pp128": 14853.13, "decode": 401.56},
+      "run2": {"prefill_short": 4033.79, "pp128": 15961.94, "decode": 382.48}
     },
     "deepseek-r1-distill-qwen-7b-q4_k_m": {
       "short_prompt_tokens": 20,
-      "short_prefill_tok_s_median": 647.49,
-      "prefill_128_tok_s_median": 2141.72,
-      "short_decode_tok_s_median": 112.52
+      "run1": {"prefill_short": 647.49, "pp128": 2141.72, "decode": 112.52},
+      "run2": {"prefill_short": 637.22, "pp128": 2423.02, "decode": 109.27}
     },
     "qwen3-4b-instruct-2507-q4_k_m": {
       "short_prompt_tokens": 13,
-      "short_prefill_tok_s_median": 645.86,
-      "prefill_128_tok_s_median": 3615.97,
-      "short_decode_tok_s_median": 154.35
+      "run1": {"prefill_short": 645.86, "pp128": 3615.97, "decode": 154.35},
+      "run2": {"prefill_short": 624.08, "pp128": 3523.89, "decode": 145.11}
     },
     "qwen3-8b-q4_k_m": {
       "short_prompt_tokens": 13,
-      "short_prefill_tok_s_median": 470.58,
-      "prefill_128_tok_s_median": 2230.71,
-      "short_decode_tok_s_median": 99.90
+      "run1": {"prefill_short": 470.58, "pp128": 2230.71, "decode": 99.90},
+      "run2": {"prefill_short": 469.44, "pp128": 2216.28, "decode": 99.70}
     }
   },
   "phase2a_comparison": {
@@ -64,7 +61,8 @@
     "qwen3-4b-instruct-2507-q4_k_m": {"replays": 100, "drift_mib": 0.0, "replays_1000_drift_mib": 2.0, "replays_2000_drift_mib": 14.0, "note": "hipMemGetInfo is process-global; drift tracks VRAM held by other GPU clients and stays far under the 64 MiB guard"}
   },
   "remaining_gap": {
-    "decode": "Weights are streamed ~492 GB/s on the 8B (5.02 GB/step) vs a 561.66 GB/s measured stream ceiling; lm_head alone reaches ~600 GB/s on the same kernel, so the loss is per-layer launch/fill work rather than raw GEMV.",
-    "prefill": "pp128 has a ~25 ms per-forward constant: Q4_K GEMV fill re-reads the 16 B superblock header once per BK=32 step (8x per 256-weight block) and each weight is read twice at BM=64 with m=128. Marginal rate beyond that constant is ~4165 tok/s on the 8B."
+    "decode": "Weights are streamed ~492 GB/s on the 8B (5.02 GB/step) vs a 561.66 GB/s measured stream ceiling; lm_head alone reaches ~600 GB/s on the same kernel, so the loss is per-layer launch/fill work rather than raw GEMV. hipGraph removed the per-token dispatch chain but only bought ~3%, so the residual is inside the small kernels (rmsnorm/rope/kv/silu) plus per-step sync.",
+    "prefill": "MEASURED NEGATIVE RESULT: a 128x64 tile that streams each weight once at m=128 instead of twice (BM=64) ran at exactly the same speed (57.29 vs 57.29 ms on Qwen3-8B pp128), so prefill is NOT bound by weight DRAM traffic nor by the Q4_K superblock header re-read. It is bound by LDS fill throughput: per BK=32 step a block writes 12 KB into LDS while doing 262144 MAC, the two phases are serialised by __syncthreads, and the loaders fuse the global load with the LDS store so the load latency is fully exposed. The next step is double-buffered LDS with the loaders split into a fetch phase (register-resident) and a store phase, which should recover the ~2x that the fill currently costs.",
+    "short_prompts": "m in 2..7 still takes the FP32 scalar GEMM path by design: routing it to FP16 WMMA drops cosine to 0.9983 on the 7B, below the 0.999 parity gate, even though greedy tokens stay identical."
   }
 }

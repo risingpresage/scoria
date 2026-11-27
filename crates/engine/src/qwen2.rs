@@ -1521,7 +1521,9 @@ fn launch_linear(
     // 0.9984 on the 7B) even though greedy tokens still match; the parity gate wins.
     if m >= 8 && k.is_multiple_of(32) && ctx.arch.is_rdna4() {
         // Wide 64x128 tile has ~2x the arithmetic intensity, but needs >=128 blocks to
-        // fill the 64 CUs; smaller matrices keep the 32x64 tile instead.
+        // fill the 64 CUs; smaller matrices keep the 32x64 tile instead. A 128x64 tile
+        // was measured too: it halves weight re-reads at m=128 but is exactly as fast,
+        // which pins prefill on LDS fill throughput rather than weight traffic.
         let wide_blocks = (n as u32).div_ceil(128) as u64 * (m as u32).div_ceil(64) as u64;
         let (wmma_handle, tile_n, tile_m) = if wide_blocks >= 128 {
             let h = match weight.ggml_type {
