@@ -43,10 +43,15 @@
           # Device code needs the ROCm LLVM, not stock clang: `--rocm-path` supplies the
           # OCML/OCKL bitcode linked into `-x hip --offload-device-only` output. Optional
           # so a host with /opt/rocm still works without the Nix package.
-          rocmLlvm = pkgs.rocmPackages.llvm.clang or null;
-          # The OCML/OCKL bitcode clang links into device code. Nixpkgs ships it in clr,
-          # separately from the compiler, which is why `--rocm-device-lib-path` exists.
-          rocmDeviceLibs = pkgs.rocmPackages.clr or null;
+          # nixpkgs packages ROCm's compiler and runtime but *not* the amdgcn device
+          # bitcode (ockl.bc/ocml.bc) that `-x hip --offload-device-only` links device
+          # code against, so its clang cannot compile these kernels. The shell and the
+          # package therefore use the host's ROCm, which has the bitcode:
+          #   build:     nix build --option extra-sandbox-paths /opt/rocm
+          #   dev shell: works as-is on a machine with /opt/rocm
+          # Set SCORIA_ROCM_PATH / SCORIA_ROCM_DEVICE_LIB in the environment to point
+          # somewhere else.
+          rocmRoot = "/opt/rocm";
 
           # scoria links nothing at build time: HIP is dlopen'd at runtime and kernels are
           # compiled to .hsaco by build.rs. So the package needs a compiler, not ROCm libs.
@@ -68,10 +73,7 @@
               pkgs.pkg-config
             ];
 
-            SCORIA_ROCM_CLANG = if rocmLlvm != null then "${rocmLlvm}/bin/clang++" else "clang++";
-            SCORIA_ROCM_PATH = if rocmLlvm != null then rocmLlvm else "/opt/rocm";
-            SCORIA_ROCM_DEVICE_LIB =
-              if rocmDeviceLibs != null then "${rocmDeviceLibs}/amdgcn/bitcode" else "";
+            SCORIA_ROCM_PATH = rocmRoot;
 
             # The test suite runs the GPU gate and disassembles kernels, so it cannot run
             # in the build sandbox. `nix develop` runs it against the real card instead.
@@ -105,15 +107,16 @@
               pkgs.pkg-config
             ];
 
-            SCORIA_ROCM_CLANG = if rocmLlvm != null then "${rocmLlvm}/bin/clang++" else "";
-            SCORIA_ROCM_PATH = if rocmLlvm != null then rocmLlvm else "/opt/rocm";
-            SCORIA_ROCM_DEVICE_LIB =
-              if rocmDeviceLibs != null then "${rocmDeviceLibs}/amdgcn/bitcode" else "";
+            SCORIA_ROCM_PATH = rocmRoot;
 
             shellHook = ''
               echo "scoria: $(rustc --version)"
-              echo "  ROCm clang: ''${SCORIA_ROCM_CLANG:-/opt/rocm/lib/llvm/bin/clang++}"
-              echo "  verify:     ./scripts/check.sh && ./target/release/scoria gate"
+              if [ -d "${rocmRoot}/lib/llvm/bin" ]; then
+                echo "  ROCm:   ${rocmRoot} (kernels will compile)"
+              else
+                echo "  ROCm:   missing at ${rocmRoot}; set SCORIA_ROCM_PATH to a ROCm install"
+              fi
+              echo "  verify: ./scripts/check.sh && ./target/release/scoria gate"
             '';
           };
 
