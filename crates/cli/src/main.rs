@@ -14,7 +14,7 @@ use scoria_gguf::{BpeTokenizer, GgufFile, ModelConfig};
 
 fn usage() -> ! {
     eprintln!(
-        "Usage:\n  scoria gate [--quick]\n  scoria inspect <model.gguf>\n  scoria tokenize <model.gguf> <prompt> [--no-bos]\n  scoria run <model.gguf> (--prompt <text> | --tokens <csv>) [--max-tokens <N>] [--max-seq <N>] [--no-bos] [--ignore-eos] [--warmup <N>] [--dump-logits <path>] [--tap-layer <L>] [--profile]\n  scoria graph-soak <model.gguf> [--replays <N>] [--tokens <csv>]\n  scoria plan <model.gguf> [--vram-mib <N>] [--ctx <N>]\n  scoria strata <model.gguf> [--top-k <N>] [--tokens <N>] [--qd <N>]"
+        "Usage:\n  scoria gate [--quick]\n  scoria inspect <model.gguf>\n  scoria tokenize <model.gguf> <prompt> [--no-bos]\n  scoria run <model.gguf> (--prompt <text> | --tokens <csv>) [--max-tokens <N>] [--max-seq <N>] [--no-bos] [--ignore-eos] [--warmup <N>] [--kv-f16] [--dump-logits <path>] [--tap-layer <L>] [--profile]\n  scoria graph-soak <model.gguf> [--replays <N>] [--tokens <csv>]\n  scoria plan <model.gguf> [--vram-mib <N>] [--ctx <N>]\n  scoria strata <model.gguf> [--top-k <N>] [--tokens <N>] [--qd <N>]"
     );
     process::exit(2);
 }
@@ -91,6 +91,7 @@ fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let no_bos = rest.iter().any(|a| a == "--no-bos");
     let ignore_eos = rest.iter().any(|a| a == "--ignore-eos");
     let profile = rest.iter().any(|a| a == "--profile");
+    let kv_f16 = rest.iter().any(|a| a == "--kv-f16");
     let warmup: usize = arg_val(rest, "--warmup")
         .map(|s| s.parse())
         .transpose()?
@@ -112,7 +113,12 @@ fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let ctx = EngineContext::init(0)?;
-    let mut model = Qwen2Model::load(&ctx, &gguf, max_seq)?;
+    let mut model = Qwen2Model::load_with(
+        &ctx,
+        &gguf,
+        max_seq,
+        scoria_engine::qwen2::ModelOpts { kv_f16 },
+    )?;
 
     let mut tap_cb = |name: &str, vals: &[f32]| {
         if let Some(target_l) = tap_layer {

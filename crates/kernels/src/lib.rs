@@ -62,8 +62,11 @@ pub mod infer_names {
     pub const LINEAR_Q6_K: &str = "linear_q6_k";
     pub const ROPE_NEOX_F32: &str = "rope_neox_f32";
     pub const KV_CACHE_APPEND_F32: &str = "kv_cache_append_f32";
+    pub const KV_CACHE_APPEND_F16: &str = "kv_cache_append_f16";
     pub const QK_NORM_ROPE_KV_F32: &str = "qk_norm_rope_kv_f32";
+    pub const QK_NORM_ROPE_KV_F16: &str = "qk_norm_rope_kv_f16";
     pub const GQA_ATTN_F32: &str = "gqa_attn_f32";
+    pub const GQA_ATTN_F16: &str = "gqa_attn_f16";
     pub const SILU_MUL_F32: &str = "silu_mul_f32";
     pub const ADD_INPLACE_F32: &str = "add_inplace_f32";
     pub const ADD_RMSNORM_F32: &str = "add_rmsnorm_f32";
@@ -183,6 +186,7 @@ mod tests {
             "gemv_q4_k_q8_1_f32",
             "v_dot4_i32_iu8",
             "gqa_attn_f32",
+            "gqa_attn_f16",
             "gemm_wmma_q4_k",
             "gemm_wmma_narrow_q4_k",
             "v_wmma_f32_16x16x16_f16",

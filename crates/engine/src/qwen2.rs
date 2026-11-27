@@ -159,12 +159,20 @@ pub struct KvCache {
     slots: HashMap<KvSlotKey, (DeviceBuf, DeviceBuf)>,
     pub max_seq: usize,
     pub kv_dim: usize,
+    /// Cached keys and values are stored as FP16 when true (half the VRAM and half
+    /// the long-context read traffic; activations stay FP32).
+    pub f16: bool,
 }
 
 impl KvCache {
     pub fn new(n_layers: usize, max_seq: usize, kv_dim: usize) -> HipResult<Self> {
+        Self::new_with(n_layers, max_seq, kv_dim, false)
+    }
+
+    pub fn new_with(n_layers: usize, max_seq: usize, kv_dim: usize, f16: bool) -> HipResult<Self> {
         let mut slots = HashMap::with_capacity(n_layers);
-        let bytes = max_seq * kv_dim * std::mem::size_of::<f32>();
+        let elem = if f16 { 2 } else { std::mem::size_of::<f32>() };
+        let bytes = max_seq * kv_dim * elem;
         for layer_id in 0..n_layers {
             let k_buf = DeviceBuf::alloc(bytes)?;
             let v_buf = DeviceBuf::alloc(bytes)?;
@@ -180,6 +188,7 @@ impl KvCache {
             slots,
             max_seq,
             kv_dim,
+            f16,
         })
     }
 
@@ -288,6 +297,8 @@ impl ScratchBuffers {
 
 pub struct Qwen2Model {
     pub config: ModelConfig,
+    /// KV cache element type actually in use (FP16 only when head_dim is 128 or 64).
+    pub kv_f16: bool,
     pub graph: ExecutionGraph,
     pub store: VramTensorStore,
     pub kv_cache: KvCache,
@@ -325,11 +336,27 @@ fn upload_optional(
     Ok(Some(store.upload(name, info, bytes)?))
 }
 
+/// Load-time options that trade a little precision for capacity or speed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ModelOpts {
+    /// Store the KV cache as FP16 instead of FP32.
+    pub kv_f16: bool,
+}
+
 impl Qwen2Model {
     pub fn load(
+        ctx: &EngineContext,
+        gguf: &GgufFile,
+        max_seq: usize,
+    ) -> Result<Self, ModelLoadError> {
+        Self::load_with(ctx, gguf, max_seq, ModelOpts::default())
+    }
+
+    pub fn load_with(
         _ctx: &EngineContext,
         gguf: &GgufFile,
         max_seq: usize,
+        opts: ModelOpts,
     ) -> Result<Self, ModelLoadError> {
         let config = ModelConfig::from_gguf(gguf)?;
         if config.architecture != "qwen2" && config.architecture != "qwen3" {
@@ -414,12 +441,15 @@ impl Qwen2Model {
             stages: vec![Stage::Dense(layer_specs)],
         };
         let kv_dim = config.n_kv_heads * config.head_dim;
-        let kv_cache = KvCache::new(config.n_layers, max_seq, kv_dim)?;
+        // `gqa_attn_f16` implements head_dim 128 and 64; anything else keeps FP32.
+        let kv_f16 = opts.kv_f16 && matches!(config.head_dim, 128 | 64);
+        let kv_cache = KvCache::new_with(config.n_layers, max_seq, kv_dim, kv_f16)?;
         let scratch = ScratchBuffers::alloc(&config, 256)?;
         let stream = HipStream::new()?;
 
         Ok(Self {
             config,
+            kv_f16,
             graph,
             store,
             kv_cache,
@@ -642,6 +672,7 @@ impl Qwen2Model {
                         self.config.head_dim,
                         self.config.rope_freq_base,
                         self.config.rms_eps,
+                        self.kv_f16,
                     )?;
                 } else {
                     if let (Some(qn), Some(kn)) = (lw.attn_q_norm, lw.attn_k_norm) {
@@ -704,6 +735,7 @@ impl Qwen2Model {
                         self.scratch.pos.as_ptr(),
                         m,
                         kv_dim,
+                        self.kv_f16,
                     )?;
                 }
 
@@ -719,6 +751,7 @@ impl Qwen2Model {
                     self.config.n_heads,
                     self.config.n_kv_heads,
                     self.config.head_dim,
+                    self.kv_f16,
                 )?;
 
                 let wo = self.store.get(lw.attn_output);
@@ -1304,6 +1337,7 @@ impl Qwen2Model {
                     self.config.head_dim,
                     self.config.rope_freq_base,
                     self.config.rms_eps,
+                    self.kv_f16,
                 )
             );
 
@@ -1321,6 +1355,7 @@ impl Qwen2Model {
                     self.config.n_heads,
                     self.config.n_kv_heads,
                     self.config.head_dim,
+                    self.kv_f16,
                 )
             );
 
@@ -1975,11 +2010,17 @@ fn launch_qk_norm_rope_kv(
     head_dim: usize,
     freq_base: f32,
     eps: f32,
+    f16: bool,
 ) -> HipResult<()> {
+    let handle = if f16 {
+        ctx.infer.qk_norm_rope_kv_f16
+    } else {
+        ctx.infer.qk_norm_rope_kv_f32
+    };
     hip_launch!(
         ctx,
         stream,
-        ctx.infer.qk_norm_rope_kv_f32,
+        handle,
         [n_tokens as u32, (n_heads + n_kv_heads) as u32, 1],
         [ctx.wave_size, 1, 1];
         q_ptr,
@@ -2073,12 +2114,18 @@ fn launch_kv_append(
     pos_ptr: *mut c_void,
     m: usize,
     kv_dim: usize,
+    f16: bool,
 ) -> HipResult<()> {
     let total = (m * kv_dim) as u32;
+    let handle = if f16 {
+        ctx.infer.kv_cache_append_f16
+    } else {
+        ctx.infer.kv_cache_append_f32
+    };
     hip_launch!(
         ctx,
         stream,
-        ctx.infer.kv_cache_append_f32,
+        handle,
         [total.div_ceil(256), 1, 1],
         [256, 1, 1];
         k_in,
@@ -2104,11 +2151,17 @@ fn launch_gqa_attn(
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
+    f16: bool,
 ) -> HipResult<()> {
+    let handle = if f16 {
+        ctx.infer.gqa_attn_f16
+    } else {
+        ctx.infer.gqa_attn_f32
+    };
     hip_launch!(
         ctx,
         stream,
-        ctx.infer.gqa_attn_f32,
+        handle,
         [n_heads as u32, m as u32, 1],
         [128, 1, 1];
         q_ptr,
