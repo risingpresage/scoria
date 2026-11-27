@@ -60,25 +60,37 @@ Against llama.cpp `b11050` (Vulkan, RADV, `-ngl 99`) on the same card, this is
 84-94% of its decode rate and 64-68% of its prefill rate. Prefill is the open
 gap.
 
-## Where this is going
+## Status
 
-The goal is the fastest path from GGUF weights to tokens on RDNA4, and then the
-architectures a dense llama.cpp path cannot run well:
+Running and measured on one card (RX 9070 XT, ROCm 7.16, `gfx1201`): dense
+Qwen2/Qwen3 from 0.5B to 8B in `Q4_K_M` through `F16`, greedy decode, at 84-94%
+of llama.cpp Vulkan's decode rate. `gfx942` compiles and passes the ISA
+assertions; it has not been benchmarked.
 
-- **Dense speed first.** Close the prefill gap (64-68% of llama.cpp today) and the
-  decode residue, shape by shape, on Qwen2/Qwen3 from 0.5B to 8B.
-- **Inkling 2 Mini.** 24 layers with layers 6-18 executed three times, and 128 MoE
-  experts with top-8 routing. The schedule already expands in `ExecutionGraph`
-  (48 steps, covered by `expand_inkling2_mini_looped_schedule` in
-  `crates/engine/src/lib.rs`); the expert GEMM and the looped KV policy do not
-  exist yet.
-- **Ternary and paged weights.** A `PTQ1_0` popcount path for the Bonsai ternary
+In flight:
+
+- **Prefill**, at 64-68% of llama.cpp. The tile is bound by LDS fill serialised
+  against the WMMA compute, not by weight traffic: a 128x64 tile that halves the
+  weight re-reads measured identical, 57.29 ms both ways on Qwen3-8B pp128.
+  Double-buffered loaders landed; splitting the loaders into fetch and store
+  phases is next.
+- **Decode** sits about 17% off the streaming floor on the 8B, and the residue is
+  dispatch rather than bandwidth. `hipGraph` took the entire launch chain out and
+  returned about 3%, which says the rest was already overlapped.
+
+Next up:
+
+- **Inkling 2 Mini**: 24 layers with layers 6-18 executed three times, and 128 MoE
+  experts with top-8 routing. The schedule expands in `ExecutionGraph` already
+  (48 steps, covered by `expand_inkling2_mini_looped_schedule`); the expert GEMM
+  and the looped KV policy are unwritten.
+- **Ternary and paged weights**: a `PTQ1_0` popcount path for the Bonsai ternary
   models, and `io_uring`/`O_DIRECT` paging so checkpoints larger than 16 GiB
-  stream from NVMe instead of needing to fit.
+  stream from NVMe instead of having to fit.
 
-Dense speed is the current phase; the other two are `pending` in
-`harness/features.json`, which only gains a `verified` status with observed output
-attached.
+Outside the current scope: sampling beyond greedy argmax, continuous batching, and
+an HTTP server. Prompts of 2-7 tokens run the scalar GEMM by choice: FP16 WMMA
+costs about 1.5e-3 cosine there, and the greedy tokens match either way.
 
 ## How it works
 
@@ -130,26 +142,6 @@ python3 scripts/parity_oracle.py --model <gguf> --tokens <ids>
 python3 scripts/bench_cac.py --tag <name> --trials 3
 ./target/release/scoria graph-soak <gguf> --replays 1000   # VRAM leak guard
 ```
-
-## Limits
-
-- One card and one stack: RX 9070 XT on ROCm 7.16, `gfx1201`. `gfx942` compiles
-  and passes the ISA assertions but has not been benchmarked.
-- Prefill is the open gap (64-68% of llama.cpp Vulkan). The bottleneck is the LDS
-  fill of the WMMA tile serialised against the compute, not weight traffic: a
-  128x64 tile that halves weight re-reads measured identical (57.29 ms both ways
-  on Qwen3-8B pp128). Double-buffered loaders helped; split fetch/store loaders
-  are the next step.
-- Decode is within about 17% of the streaming floor on the 8B, and the residue is
-  dispatch rather than bandwidth. `hipGraph` removed the whole launch chain and
-  gained about 3%, which measures how much of it was already overlapped.
-- Prompts of 2-7 tokens fall back to the scalar GEMM on purpose: FP16 WMMA costs
-  about 1.5e-3 cosine there, below the parity gate, even though greedy tokens
-  match.
-- Dense models only. MoE, sliding-window and looped schedules exist in the
-  `ExecutionGraph` type but have no kernels behind them yet.
-- Greedy argmax only; no sampling, no continuous batching, no OpenAI-style
-  server.
 
 Per-experiment history, negative results and the optimisation method are in
 `harness/PLAN.md`, `harness/THEORY.md`, `harness/progress.md` and
