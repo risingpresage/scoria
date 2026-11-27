@@ -1,8 +1,10 @@
 # scoria brand assets
 
-The mark is **a faceted volcanic shard**: three planes of a shattered block, with one
-molten face. *Scoria* is the dark, vesicular rock left when lava cools — the same
-after-the-heat idea as a weight tensor once the GPU has streamed it.
+The mark is a faceted volcanic shard: three planes of a shattered block, with one
+molten face. Scoria is the dark, vesicular rock left when lava cools.
+
+These files are not used by `README.md`. They exist for the repo's social preview,
+favicons, and anywhere else a mark is needed.
 
 ## Files
 
