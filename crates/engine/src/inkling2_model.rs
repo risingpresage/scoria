@@ -579,7 +579,7 @@ struct GpuPtrs {
 /// Upper bound on the routed experts batched into one synchronisation.
 const TOP_K_FOR_BATCH: usize = 8;
 /// Upper bound on the positions batched into one prefill chunk.
-const CHUNK_MAX: usize = 8;
+const CHUNK_MAX: usize = 64;
 
 struct GpuLayer {
     q: DeviceBuf,
@@ -1678,7 +1678,7 @@ impl Model {
         let t_moe = std::time::Instant::now();
         let moe_out = Self::moe_forward_parts(
             &mut self.gpu,
-            &mut self.moes[layer],
+            &self.moes[layer],
             &self.file,
             layer,
             n_embd,
@@ -1698,14 +1698,14 @@ impl Model {
     #[allow(clippy::too_many_arguments)]
     fn moe_forward_parts(
         gpu: &mut Option<Gpu>,
-        moe: &mut Moe,
+        moe: &Moe,
         file: &GgufFile,
         layer: usize,
         n_embd: usize,
         x: &[f32],
         profile: &mut Profile,
     ) -> Vec<f32> {
-        let route = moe.route(x);
+        let route = moe.route_pure(x);
         let gpu_ready = gpu
             .as_ref()
             .and_then(|g| g.experts.get(layer))
@@ -1958,7 +1958,7 @@ impl Model {
         let t_moe = std::time::Instant::now();
         let moe_outs = Self::moe_chunk_parts(
             &mut self.gpu,
-            &self.moes[layer],
+            &mut self.moes[layer],
             &self.file,
             layer,
             n_embd,
@@ -1979,7 +1979,7 @@ impl Model {
     #[allow(clippy::too_many_arguments)]
     fn moe_chunk_parts(
         gpu: &mut Option<Gpu>,
-        moe: &Moe,
+        moe: &mut Moe,
         file: &GgufFile,
         layer: usize,
         n_embd: usize,
@@ -1987,6 +1987,17 @@ impl Model {
         profile: &mut Profile,
     ) -> Vec<Vec<f32>> {
         let mut outs = vec![vec![0f32; n_embd]; xs.len()];
+        // Gathering only pays when positions *share* experts: with 128 experts and 8 routed
+        // per position, a chunk of C positions makes `C * 8` draws whose distinct count is
+        // 128 * (1 - (1 - 8/128)^C). Measured: at C=1 the per-position path is faster
+        // (1.63 vs 1.86 s/token), at C=8 the gathered path is much faster (0.70 vs 1.47).
+        // So: one position is decode, anything larger gathers.
+        if xs.len() == 1 {
+            for (i, x) in xs.iter().enumerate() {
+                outs[i] = Self::moe_forward_parts(gpu, moe, file, layer, n_embd, x, profile);
+            }
+            return outs;
+        }
         let gpu_ready = gpu
             .as_ref()
             .and_then(|g| g.experts.get(layer))

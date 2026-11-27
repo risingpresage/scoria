@@ -257,6 +257,25 @@ So the next increment is not more MoE batching — it is the projections with `m
 
 **Verified now, on both paths:** chunk 1/2/4/8 vs the single-position path agree to **max |dlogit| 3.3e-5 with the argmax matching at every position**, and perplexity is 7.598 at every chunk size on the GPU path and 15.903/15.904 on the short text. `./scripts/check.sh` green, with the heavy model-level test moved to a release step (it was stalling the debug suite for over an hour).
 
+## 2026-11-28 — prefill: the gather cannot win, and the real bottleneck named
+I did **not** implement the projection batching this step called for. I went after the measured bottleneck instead, and the measurement changed the conclusion.
+
+**Measured on an idle-ish slice of a shared machine** (a ComfyUI server has held a core for 1.5 days and load average sits at ~9.5, so sub-second timings carry ~2x noise while decode is stable):
+
+| | s/token |
+| decode | 0.45-0.47 (stable across runs) |
+| prefill chunk 1 | 0.97-1.46 |
+| prefill chunk 8 | 1.02-1.82 |
+| prefill chunk 32 | 1.27 |
+
+**Prefill is still slower than decode, and batching the experts cannot fix it.** A chunk of 8 positions makes 64 expert draws over 128 experts: ~50 distinct, i.e. **1.28 positions per expert**. Gathering therefore saves ~20% of dequantisation while paying host-side copying for 64 slices. Confirmed by direct comparison at the same chunk size: gathered 0.70 s/token vs per-position 1.47 s/token earlier in the session — gathering wins, but only by what the reuse allows.
+
+**What did work:** the chunked host MoE was *allocation-bound*, not arithmetic-bound. Sixteen workers each allocated ~73k floats per layer visit (≈300 MB of zeroing per position), which made it 9x slower per layer than the per-position path. A reusable `ChunkScratch` pool cut the MoE slice from 0.054 s to 0.017 s per visit and chunk-8 prefill from ~2.5-3.0 to ~1.0 s/token. Perplexity unchanged (7.598 / 15.903), oracle agreement unchanged.
+
+**The bottleneck both paths now point at is the same:** 11 of 24 layers store their experts in formats with no device dequantiser (IQ2XS, IQ2S, IQ3XXS, IQ3S, Q3K, IQ4NL) and fall back to the host. Decode spends 0.28 s/token there; the chunked prefill spends 0.82. Expert batching and prefilling both redistribute work *around* that; only a device codec removes it.
+
+Also in this change: `CHUNK_MAX` raised to 64; `Moe::forward_chunk` takes `&mut self` so its scratch survives across calls; `moe_forward_parts` now takes `&Moe`.
+
 ## Parity gate calibration (cosine > 0.999 is prompt-dependent, not an implementation defect)
 - Measured the control that settles it: **llama.cpp's own Vulkan backend vs llama.cpp's own CPU backend** scores `cos = 0.997985` (`maxdiff 1.152`) on the Qwen3-4B harness chat prompt (`151644,872,198,785,…,77091,198`, `m=13`), where scoria scores `0.997652` (`maxdiff 1.103`). Both pick top1 `785`. No GPU implementation reaches 0.999 on that prompt.
 - Forcing prefill onto the scalar FP32 GEMM (`SCORIA_PREFILL_FP32=1`) changes nothing: 4B `0.997614` vs `0.997652` for FP16 WMMA, 8B `0.996415` vs `0.996404`. So the deficit is **not** FP16 WMMA rounding.

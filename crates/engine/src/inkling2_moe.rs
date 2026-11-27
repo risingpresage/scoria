@@ -215,7 +215,69 @@ impl Scratch {
     }
 }
 
+/// Reusable per-worker buffers for a chunked MoE. Allocating these per call dominated the
+/// chunk path: 16 workers x ~73k floats per layer-visit is ~300 MB of zeroing per position,
+/// which made the batched host MoE 9x slower per layer than the per-position one.
+#[derive(Default)]
+struct ChunkScratch {
+    acc: Vec<Vec<f32>>,
+    gate: Vec<f32>,
+    up: Vec<f32>,
+    act: Vec<f32>,
+    gu: Vec<Vec<f32>>,
+    dn: Vec<Vec<f32>>,
+    acts: Vec<Vec<f32>>,
+    row: Vec<f32>,
+}
+
+impl ChunkScratch {
+    fn prepare(
+        &mut self,
+        positions: usize,
+        n_embd: usize,
+        ff: usize,
+        out_dim: usize,
+        dn_out: usize,
+    ) {
+        if self.acc.len() < positions {
+            self.acc.resize(positions, Vec::new());
+        }
+        for row in self.acc.iter_mut() {
+            row.clear();
+            row.resize(n_embd, 0.0);
+        }
+        self.gate.clear();
+        self.gate.resize(ff, 0.0);
+        self.up.clear();
+        self.up.resize(ff, 0.0);
+        self.act.clear();
+        self.act.resize(ff, 0.0);
+        if self.gu.len() < positions {
+            self.gu.resize(positions, Vec::new());
+        }
+        for row in self.gu.iter_mut() {
+            row.clear();
+            row.resize(out_dim, 0.0);
+        }
+        if self.dn.len() < positions {
+            self.dn.resize(positions, Vec::new());
+        }
+        for row in self.dn.iter_mut() {
+            row.clear();
+            row.resize(dn_out, 0.0);
+        }
+        if self.acts.len() < positions {
+            self.acts.resize(positions, Vec::new());
+        }
+        for row in self.acts.iter_mut() {
+            row.clear();
+            row.resize(ff, 0.0);
+        }
+    }
+}
+
 pub struct Moe {
+    chunk_scratch: Vec<ChunkScratch>,
     n_embd: usize,
     n_experts: usize,
     top_k: usize,
@@ -282,6 +344,7 @@ impl Moe {
             e_score_bias: read_f32(&t("exp_probs_b.bias"))?,
             gate_up,
             down,
+            chunk_scratch: Vec::new(),
             threads: std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1),
@@ -426,7 +489,7 @@ impl Moe {
     /// expert is evaluated once for all of them. Dequantisation — half the cost of a
     /// single-position expert GEMV — is therefore paid once per expert instead of once per
     /// (position, expert), which is the entire reason to batch a prefill.
-    pub fn forward_chunk(&self, file: &GgufFile, xs: &[Vec<f32>], outs: &mut [Vec<f32>]) {
+    pub fn forward_chunk(&mut self, file: &GgufFile, xs: &[Vec<f32>], outs: &mut [Vec<f32>]) {
         let n_embd = self.n_embd;
         let ff = self.ff;
         assert_eq!(xs.len(), outs.len());
@@ -443,70 +506,86 @@ impl Moe {
         }
 
         let experts = self.n_experts;
+        let gate_up_out = self.gate_up.out_dim;
+        let dn_out = self.down.out_dim;
         // Only experts that were actually routed to have work: for a chunk of C positions
         // that is at most `C * top_k`, so spawning a thread per expert range wastes most of
         // the spawns. This was a third of the chunk path's MoE cost at chunk size 1.
         let busy = buckets.iter().filter(|b| !b.is_empty()).count();
         let workers = self.threads.min(experts).min(busy.max(1)).max(1);
         let per = experts.div_ceil(workers);
-        let gate_up = &self.gate_up;
-        let down = &self.down;
         let gate_cap = self.gate_cap;
         let up_cap = self.up_cap;
         let buckets = &buckets;
+        while self.chunk_scratch.len() < workers {
+            self.chunk_scratch.push(ChunkScratch::default());
+        }
+        let Moe {
+            chunk_scratch,
+            gate_up,
+            down,
+            ..
+        } = self;
+        let gate_up_ref: &ExpertTensor = gate_up;
+        let down_ref: &ExpertTensor = down;
+        let scratch = &mut chunk_scratch[..workers];
+        for sc in scratch.iter_mut() {
+            sc.prepare(xs.len(), n_embd, ff, gate_up_out, dn_out);
+        }
 
         // Each worker owns a contiguous range of experts and its own accumulation buffer,
         // so positions touched by two experts are summed at the end rather than raced.
         let partials: Vec<Vec<Vec<f32>>> = std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(workers);
-            for worker in 0..workers {
+            for (worker, sc) in scratch.iter_mut().enumerate() {
                 let lo = worker * per;
                 let hi = ((worker + 1) * per).min(experts);
                 if lo >= hi {
                     break;
                 }
                 handles.push(scope.spawn(move || {
-                    let mut acc = vec![vec![0f32; n_embd]; xs.len()];
-                    let mut row = Vec::new();
-                    let mut gate = vec![0f32; ff];
-                    let mut up = vec![0f32; ff];
-                    let mut act = vec![0f32; ff];
-                    let mut gu: Vec<Vec<f32>> = Vec::new();
-                    let mut dn: Vec<Vec<f32>> = Vec::new();
                     for (expert, hits) in buckets.iter().enumerate().take(hi).skip(lo) {
                         if hits.is_empty() {
                             continue;
                         }
-                        gu.clear();
-                        for _ in 0..hits.len() {
-                            gu.push(vec![0f32; gate_up.out_dim]);
-                        }
                         let inputs: Vec<&[f32]> =
                             hits.iter().map(|(pos, _)| xs[*pos].as_slice()).collect();
-                        gate_up.row_matvec_m(file, expert, &inputs, &mut gu, &mut row);
+                        gate_up_ref.row_matvec_m(
+                            file,
+                            expert,
+                            &inputs,
+                            &mut sc.gu[..hits.len()],
+                            &mut sc.row,
+                        );
 
-                        let mut acts: Vec<Vec<f32>> = Vec::with_capacity(hits.len());
-                        for g in &gu {
-                            gate.copy_from_slice(&g[..ff]);
-                            up.copy_from_slice(&g[ff..]);
-                            swiglu_softcapped(&gate, &up, gate_cap, up_cap, &mut act);
-                            acts.push(act.clone());
+                        for which in 0..hits.len() {
+                            sc.gate.copy_from_slice(&sc.gu[which][..ff]);
+                            sc.up.copy_from_slice(&sc.gu[which][ff..]);
+                            swiglu_softcapped(
+                                &sc.gate,
+                                &sc.up,
+                                gate_cap,
+                                up_cap,
+                                &mut sc.acts[which],
+                            );
                         }
-
-                        dn.clear();
-                        for _ in 0..hits.len() {
-                            dn.push(vec![0f32; down.out_dim]);
-                        }
-                        let act_refs: Vec<&[f32]> = acts.iter().map(|a| a.as_slice()).collect();
-                        down.row_matvec_m(file, expert, &act_refs, &mut dn, &mut row);
+                        let act_refs: Vec<&[f32]> =
+                            sc.acts[..hits.len()].iter().map(|a| a.as_slice()).collect();
+                        down_ref.row_matvec_m(
+                            file,
+                            expert,
+                            &act_refs,
+                            &mut sc.dn[..hits.len()],
+                            &mut sc.row,
+                        );
 
                         for (which, (pos, weight)) in hits.iter().enumerate() {
-                            for (a, m) in acc[*pos].iter_mut().zip(&dn[which]) {
+                            for (a, m) in sc.acc[*pos].iter_mut().zip(&sc.dn[which]) {
                                 *a += weight * m;
                             }
                         }
                     }
-                    acc
+                    std::mem::take(&mut sc.acc)
                 }));
             }
             handles
@@ -596,6 +675,7 @@ mod tests {
                 1.0, 0.0, // e3 -> 1
             ],
             e_score_bias: vec![10.0, 0.0, 0.0, 0.0], // e0 wins on bias alone
+            chunk_scratch: Vec::new(),
             threads: 1,
             gate_up: ExpertTensor {
                 info: TensorInfo {
