@@ -93,6 +93,14 @@
 - GPU-vs-CPU test runs **four chained decode steps** and compares q, k, v, gate **and both conv caches** at every step, so a cache that does not advance (or advances twice) fails immediately. Order is conv → clip/rmsnorm → gate, matching `modeling_inkling2_loop.py`.
 - Long context was answered by measurement, not projection: Qwen3-8B **with FP16 KV assigns 65536 positions and runs**, while the same model at FP32 KV fails `hipMalloc` at 49152; `Scoria plan` shows Inkling needs 8 full-history KV slots (not 24) because 20 of its layers keep a 1024-token window, so 200k costs 3.13 GiB at FP8 against 12.52 GiB at FP32.
 
+## 2026-11-28 (dawn) — layer 0 runs end-to-end on real `inkling2_loop` weights
+- `crates/engine/src/inkling2_layer.rs` + `scoria layer0 <gguf>`: embedding row -> attention RMSNorm -> the six real projections read out of the checkpoint (`attn_q` Q6_K, `attn_k`/`attn_v`/`attn_gate`/`attn_rel` Q8_0, `attn_sink_proj` BF16, `attn_q_clip`/`attn_rel_clip` F32) -> `post_qkv` -> relative bias -> the verified decode attention -> output gate -> `W_o` -> the post convolution -> residual. All on dequantised f32 weights, through the same helpers the GPU kernels are checked against.
+- First real numbers from the checkpoint (tokens 785, 6722, 315, 9625, 374):
+  `|q|=49.5 |k|=29.8 |v|=32.000 gate_mean=0.377 |attn|=24.8 |post|=7.30 |residual|=48.6`, all finite, with `sink=[0.64, 1.29, 2.79, 0.61]` and head-0 attention values ~0.004-0.020.
+- The tell that the pipeline is oriented correctly: **`|v|` is exactly `32.000` on every step**, which is `sqrt(8 kv heads x 128 dims)` — the unavoidable norm of an unweighted RMSNorm over 1024 elements. A transposed or misindexed projection would not land on that. Added as an invariant test over lengths 4/128/1024.
+- `|k|` grows 29.8 -> 53.7 across the five steps because the 4-tap causal conv accumulates history, which is the expected behaviour and not a scale bug.
+- Memory: the embedding table is read as raw bytes and one row is dequantised per token (39 MB) instead of dequantising all 201024 rows (1.85 GB); results are bit-identical before and after that change.
+
 ## Parity gate calibration (cosine > 0.999 is prompt-dependent, not an implementation defect)
 - Measured the control that settles it: **llama.cpp's own Vulkan backend vs llama.cpp's own CPU backend** scores `cos = 0.997985` (`maxdiff 1.152`) on the Qwen3-4B harness chat prompt (`151644,872,198,785,…,77091,198`, `m=13`), where scoria scores `0.997652` (`maxdiff 1.103`). Both pick top1 `785`. No GPU implementation reaches 0.999 on that prompt.
 - Forcing prefill onto the scalar FP32 GEMM (`SCORIA_PREFILL_FP32=1`) changes nothing: 4B `0.997614` vs `0.997652` for FP16 WMMA, 8B `0.996415` vs `0.996404`. So the deficit is **not** FP16 WMMA rounding.

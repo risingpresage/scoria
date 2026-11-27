@@ -1,5 +1,6 @@
 pub mod inkling2;
 pub mod inkling2_attn;
+pub mod inkling2_layer;
 pub mod qwen2;
 
 use scoria_gguf::QuantCodec;

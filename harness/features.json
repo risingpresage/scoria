@@ -7,6 +7,15 @@
   ],
   "features": [
     {
+      "id": "phase3-inkling2-layer0",
+      "phase": 3,
+      "title": "Layer 0 of Inkling-2-Mini runs end to end on real weights (embedding through attention residual)",
+      "status": "verified",
+      "verify": "./target/release/scoria layer0 /home/noorm/models/inkling/Inkling-2-Mini-UD-Q3_K_XL.gguf --tokens 785,6722,315,9625,374 && ./scripts/check.sh",
+      "observed": "Five tokens through layer 0 produce finite activations: |q|=49.5/49.1/47.3/47.2/50.6, |k|=29.8->53.7 (conv accumulating history), |v|=32.000 on every step = sqrt(8 kv heads x 128) which is the exact norm of an unweighted RMSNorm over 1024 elements, gate_mean 0.34-0.51, |attn| 24.8-40.9, |post| 7.3-25.0, |residual| 48.6-53.3. sink[0..4]=[0.64,1.29,2.79,0.61], bias at distance 0 ~[-0.2, 1.5], head-0 attention ~0.004-0.020.",
+      "note": "One layer's attention contribution, not a logit: the MoE FFN, the 13 loop gates, the block attention residuals and the remaining 23 layers are unwired."
+    },
+    {
       "id": "phase3-inkling2-projection-postproc",
       "phase": 3,
       "title": "Projection post-processing on device: 4-tap causal conv, per-head clips, RMSNorm, output gate",

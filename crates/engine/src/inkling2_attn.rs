@@ -270,6 +270,16 @@ mod tests {
         let mut z = [0.0f32; 4];
         unweighted_rmsnorm(&mut z, 1e-6);
         assert!(z.iter().all(|v| *v == 0.0));
+
+        // Invariant: after an unweighted RMSNorm a head has norm sqrt(len), whatever the
+        // input. This is what made the real layer-0 run trustworthy: 8 kv heads x 128 dims
+        // has to come out at exactly sqrt(1024) = 32.
+        for len in [4usize, 128, 1024] {
+            let mut v: Vec<f32> = (0..len).map(|i| ((i * 37 % 41) as f32) - 20.0).collect();
+            unweighted_rmsnorm(&mut v, 1e-6);
+            let got = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!((got - (len as f32).sqrt()).abs() < 1e-3, "len {len}: {got}");
+        }
     }
 
     #[test]

@@ -14,7 +14,7 @@ use scoria_gguf::{BpeTokenizer, GgufFile, ModelConfig};
 
 fn usage() -> ! {
     eprintln!(
-        "Usage:\n  scoria gate [--quick]\n  scoria inspect <model.gguf>\n  scoria tokenize <model.gguf> <prompt> [--no-bos]\n  scoria run <model.gguf> (--prompt <text> | --tokens <csv>) [--max-tokens <N>] [--max-seq <N>] [--no-bos] [--ignore-eos] [--warmup <N>] [--kv-f16] [--dump-logits <path>] [--tap-layer <L>] [--profile]\n  scoria graph-soak <model.gguf> [--replays <N>] [--tokens <csv>]\n  scoria plan <model.gguf> [--vram-mib <N>] [--ctx <N>]\n  scoria strata <model.gguf> [--top-k <N>] [--tokens <N>] [--qd <N>]\n  scoria arch-check <model.gguf> [--dequant-smoke]"
+        "Usage:\n  scoria gate [--quick]\n  scoria inspect <model.gguf>\n  scoria tokenize <model.gguf> <prompt> [--no-bos]\n  scoria run <model.gguf> (--prompt <text> | --tokens <csv>) [--max-tokens <N>] [--max-seq <N>] [--no-bos] [--ignore-eos] [--warmup <N>] [--kv-f16] [--dump-logits <path>] [--tap-layer <L>] [--profile]\n  scoria graph-soak <model.gguf> [--replays <N>] [--tokens <csv>]\n  scoria plan <model.gguf> [--vram-mib <N>] [--ctx <N>]\n  scoria strata <model.gguf> [--top-k <N>] [--tokens <N>] [--qd <N>]\n  scoria arch-check <model.gguf> [--dequant-smoke]\n  scoria layer0 <model.gguf> [--tokens <csv>]"
     );
     process::exit(2);
 }
@@ -776,6 +776,70 @@ fn cmd_arch_check(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Run layer 0 of an `inkling2_loop` checkpoint end to end on the host: embedding ->
+/// attention norm -> projections -> conv/clip/RMSNorm/gate -> relative bias -> attention ->
+/// output gate -> W_o -> post conv -> residual. Prints diagnostics, because the FFN and the
+/// rest of the stack are not wired yet.
+fn cmd_layer0(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use scoria_engine::inkling2_layer::LayerZero;
+    if args.is_empty() {
+        usage();
+    }
+    let path = &args[0];
+    let rest = &args[1..];
+    let tokens: Vec<u32> = arg_val(rest, "--tokens")
+        .unwrap_or("785,6722,315,9625,374")
+        .split(',')
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().parse::<u32>())
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let gguf = GgufFile::open(path)?;
+    let cfg = ModelConfig::from_gguf(&gguf)?;
+    let mut layer = LayerZero::load(&gguf, &cfg)?;
+    println!(
+        "layer 0: {} | n_embd {} | {} heads x {} | {} kv heads | qk_clip {} | rel {}x{}",
+        cfg.architecture,
+        cfg.n_embd,
+        cfg.n_heads,
+        cfg.head_dim,
+        cfg.n_kv_heads,
+        gguf.meta_f32("inkling2_loop.attention.qk_clip")
+            .unwrap_or(0.0),
+        gguf.meta_u32("inkling2_loop.attention.relative_length")
+            .unwrap_or(0),
+        gguf.meta_u32("inkling2_loop.attention.relative_extent")
+            .unwrap_or(0)
+    );
+    for (step, &tok) in tokens.iter().enumerate() {
+        let out = layer.attention_step(tok);
+        let finite = out.head0_attn.iter().all(|v| v.is_finite());
+        println!(
+            "  step {step} tok {tok:>6}: |q|={:.3} |k|={:.3} |v|={:.3} gate_mean={:.3} |attn|={:.3} |post|={:.3} |residual|={:.3} finite={finite}",
+            out.q_norm,
+            out.k_norm,
+            out.v_norm,
+            out.gate_mean,
+            out.attn_norm,
+            out.post_conv_norm,
+            out.residual_norm
+        );
+        if step == 0 {
+            println!(
+                "    sink[0..4]={:?}\n    bias(at distance 0)[0..4]={:?}",
+                &out.sink[..4],
+                &out.bias_at_zero[..4]
+            );
+            println!(
+                "    q head0[0..4]={:?}\n    attn head0[0..4]={:?}",
+                &out.head0_q[..4],
+                &out.head0_attn[..4]
+            );
+        }
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let res = match args.first().map(|s| s.as_str()) {
@@ -790,6 +854,7 @@ fn main() {
         Some("plan") => cmd_plan(&args[1..]),
         Some("strata") => cmd_strata(&args[1..]),
         Some("arch-check") => cmd_arch_check(&args[1..]),
+        Some("layer0") => cmd_layer0(&args[1..]),
         _ => usage(),
     };
     if let Err(e) = res {
