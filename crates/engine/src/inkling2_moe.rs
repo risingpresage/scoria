@@ -56,6 +56,11 @@ pub fn swiglu_softcapped(gate: &[f32], up: &[f32], gate_cap: f32, up_cap: f32, o
 /// is 12.7 GB on disk, so copying them into the process would be the whole model twice.
 pub(crate) struct ExpertTensor {
     pub(crate) info: TensorInfo,
+    /// Raw tensor bytes copied into owned, pre-faulted memory. The checkpoint lives on a
+    /// compressed btrfs, so reading through the mmap costs an on-the-fly decompression and
+    /// loses its page cache to VRAM allocations; a plain `Vec<u8>` costs one decompression at
+    /// load time and then nothing.
+    pub(crate) hot: Option<Vec<u8>>,
     pub(crate) slab_bytes: usize,
     pub(crate) in_dim: usize,
     pub(crate) out_dim: usize,
@@ -91,6 +96,7 @@ impl ExpertTensor {
                 .ok_or_else(|| GgufError::Malformed(format!("`{name}` shape overflows")))?,
         )?;
         Ok(Self {
+            hot: None,
             slab_bytes: total / experts,
             info: info.clone(),
             in_dim: info.dims[0] as usize,
@@ -108,6 +114,37 @@ impl ExpertTensor {
     /// which stays in cache, so the same dequantisation work runs against a third of the
     /// memory traffic.
     #[allow(clippy::too_many_arguments)]
+    /// The tensor's bytes: the owned copy when present, otherwise the mmap.
+    fn bytes<'a>(&'a self, file: &'a GgufFile) -> &'a [u8] {
+        match &self.hot {
+            Some(hot) => hot,
+            None => file
+                .tensor_bytes(&self.info)
+                .expect("expert tensor is in the mmap"),
+        }
+    }
+
+    /// Copy the tensor into owned memory and touch every page, so a later read cannot fault.
+    ///
+    /// Fallible on purpose: an earlier version used `Vec::with_capacity` and the process was
+    /// silently OOM-killed mid-copy. A measurement tool must not take the machine down.
+    pub(crate) fn prefetch(&mut self, file: &GgufFile) -> usize {
+        if self.hot.is_some() {
+            return 0;
+        }
+        let Ok(bytes) = file.tensor_bytes(&self.info) else {
+            return 0;
+        };
+        let mut hot: Vec<u8> = Vec::new();
+        if hot.try_reserve_exact(bytes.len()).is_err() {
+            return 0;
+        }
+        hot.extend_from_slice(bytes);
+        let n = hot.len();
+        self.hot = Some(hot);
+        n
+    }
+
     pub(crate) fn row_matvec(
         &self,
         file: &GgufFile,
@@ -119,9 +156,7 @@ impl ExpertTensor {
         assert!(e < self.experts, "expert {e} out of range");
         assert_eq!(x.len(), self.in_dim, "row_matvec input");
         assert_eq!(out.len(), self.out_dim, "row_matvec output");
-        let bytes = file
-            .tensor_bytes(&self.info)
-            .expect("expert tensor is in the mmap");
+        let bytes = self.bytes(file);
         let row_bytes = self
             .info
             .ggml_type
@@ -158,9 +193,7 @@ impl ExpertTensor {
     ) {
         assert_eq!(xs.len(), outs.len(), "one output per input");
         assert!(e < self.experts, "expert {e} out of range");
-        let bytes = file
-            .tensor_bytes(&self.info)
-            .expect("expert tensor is in the mmap");
+        let bytes = self.bytes(file);
         let row_bytes = self
             .info
             .ggml_type
@@ -408,6 +441,24 @@ impl Moe {
 
     /// The SwiGLU softcaps, the expert width, and the two expert tensors, for a caller that
     /// wants to run the expert matvecs somewhere else (the GPU path).
+    /// Pre-fault the expert bytes a host read would otherwise pull through the mmap.
+    /// `keep` decides per tensor, because tensors resident on the card never need it.
+    pub fn prefetch_experts(
+        &mut self,
+        file: &GgufFile,
+        keep_gate_up: bool,
+        keep_down: bool,
+    ) -> usize {
+        let mut total = 0;
+        if keep_gate_up {
+            total += self.gate_up.prefetch(file);
+        }
+        if keep_down {
+            total += self.down.prefetch(file);
+        }
+        total
+    }
+
     pub fn caps(&self) -> (f32, f32) {
         (self.gate_cap, self.up_cap)
     }
@@ -678,6 +729,7 @@ mod tests {
             chunk_scratch: Vec::new(),
             threads: 1,
             gate_up: ExpertTensor {
+                hot: None,
                 info: TensorInfo {
                     name: "test".into(),
                     dims: vec![2, 2, 4],
@@ -691,6 +743,7 @@ mod tests {
                 outer: vec![1.0; 4],
             },
             down: ExpertTensor {
+                hot: None,
                 info: TensorInfo {
                     name: "test".into(),
                     dims: vec![1, 2, 4],

@@ -7,6 +7,15 @@
   ],
   "features": [
     {
+      "id": "phase3-inkling2-hot-experts",
+      "phase": 3,
+      "title": "Pre-faulted host expert bytes: mechanism confirmed (3 MB/s cold reads)",
+      "status": "partial",
+      "verify": "scoria logits <gguf> --perp <text> --prefill-chunk 32 --hot-experts",
+      "observed": "Reading ~2 GiB of expert bytes from the compressed btrfs through the mmap took >600 s (<3.3 MB/s). Prefill's host-side expert working set is ~109 MB/token (8 layers x 8 experts x ~1.7 MB), so <3.3 MB/s gives ~33 s/token, matching the observed 40 s/token with VRAM residency on. ExpertTensor::prefetch copies a tensor into owned pre-faulted memory (fallible: try_reserve_exact, after a silent OOM kill) and Model::prefetch_host_experts applies it to the tensors the card does not hold.",
+      "note": "The fix is implemented but not yet measured end to end: populating the copy costs 10-20 min of cold I/O here. Decode keeps residency (0.36-0.48 s/token); prefill keeps experts on the host (0.757-0.983 s/token at chunk 32)."
+    },
+    {
       "id": "phase3-inkling2-batched-projections",
       "phase": 3,
       "title": "m=chunk projection GEMVs: exact, but prefill still slower than decode",

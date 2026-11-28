@@ -1327,6 +1327,20 @@ impl Model {
         self.expert_residency = on;
     }
 
+    /// Pre-fault the expert bytes that will still be read from the host, i.e. the tensors the
+    /// card does not hold. Returns the bytes copied.
+    pub fn prefetch_host_experts(&mut self) -> usize {
+        let mut total = 0;
+        for (layer, moe) in self.moes.iter_mut().enumerate() {
+            let (gu, dn) = match self.gpu.as_ref().and_then(|g| g.experts.get(layer)) {
+                Some(Some(e)) => (e.gate_up.is_none(), e.down.is_none()),
+                _ => (true, true),
+            };
+            total += moe.prefetch_experts(&self.file, gu, dn);
+        }
+        total
+    }
+
     pub fn gpu_active(&self) -> bool {
         self.gpu.is_some()
     }

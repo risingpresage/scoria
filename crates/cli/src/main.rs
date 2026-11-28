@@ -857,7 +857,13 @@ fn cmd_logits(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         // slower for the chunked prefill (the host-side expert reads for the layers without a
         // device codec appear to lose the page cache to the VRAM allocation). Prefill keeps
         // its experts on the host.
-        model.set_expert_residency(false);
+        // Measured: residency is 2.5x faster for decode and 20-50x slower for the chunked
+        // prefill. `--hot-experts` keeps residency on and pre-faults the bytes the card does
+        // not hold, to test whether page-cache eviction was the whole problem.
+        let hot = rest.iter().any(|a| a == "--hot-experts");
+        if !hot {
+            model.set_expert_residency(false);
+        }
         if threads > 0 {
             model.set_threads(threads);
         }
@@ -869,6 +875,14 @@ fn cmd_logits(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 ),
                 Err(e) => println!("projections: host ({e})"),
             }
+        }
+        if hot {
+            // After `enable_gpu`, so only the tensors the card does not hold are copied.
+            let bytes = model.prefetch_host_experts();
+            println!(
+                "hot experts: {:.2} GiB pre-faulted in host memory",
+                bytes as f64 / (1u64 << 30) as f64
+            );
         }
         let started = std::time::Instant::now();
         let all = model.prefill(&tokens, prefill_chunk);

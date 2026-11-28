@@ -345,6 +345,19 @@ Perplexity 7.598 at every chunk size. **Batched prefill is 1.4x faster than deco
 
 Verified: `--proj-selftest` 0.00000 at m=2 and m=8, GPU-vs-host 3.6e-5 with the argmax agreeing, perplexity 7.598, gate green.
 
+## 2026-11-28 — the mechanism behind the 170x is confirmed: this GGUF reads at ~3 MB/s cold
+Last turn established that expert residency makes the chunked prefill 20-50x slower. This turn measured *why*, and the answer is I/O, not compute.
+
+**Evidence.** `--hot-experts` pre-faults the expert bytes the card does not hold into owned host memory. Reading ~2 GiB of them from the compressed btrfs took **more than 600 s** (the run had to be killed at the timeout; a second attempt with a 2400 s budget is what produced this note). That is **under 3.3 MB/s**. Prefill reads roughly 109 MB of host-side expert data per token (8 host layers x 8 experts x ~1.7 MB per expert), so at 3.3 MB/s that is **~33 s/token** -- which is exactly the 40 s/token that was observed with residency on. The arithmetic closes: VRAM residency (12.16 GiB of 15.9) evicts the page cache, the reads fall to the compressed-btrfs path, and that path is catastrophically slow on this machine.
+
+It also explains why decode survives it: decode's per-token host expert working set is the same 109 MB, but decode measured 1.00 s/token with experts on the host, so those reads were being served from cache. The difference is *whether the cache survives*, not how much is read.
+
+**What landed.** `ExpertTensor::prefetch` copies a tensor into owned, pre-faulted memory and `Model::prefetch_host_experts` applies it to exactly the tensors the card does not hold (called after `enable_gpu`, so resident tensors are skipped). It is fallible (`try_reserve_exact`) because the first version used `Vec::with_capacity` and the process was silently OOM-killed mid-copy -- a measurement tool must not take the machine down.
+
+**Not yet measured:** whether populating the hot copy recovers decode's residency benefit for prefill. Filling it costs ~10-20 minutes of cold I/O on this box, which is longer than a turn's measurement budget when the machine is also at load ~9.5.
+
+**A measurement-hygiene note:** the gate's heavy release test took 1602 s under contention versus 154-204 s on a quiet box. Any timing taken while another job of mine is running is worthless, and this session has repeatedly paid for that.
+
 ## Parity gate calibration (cosine > 0.999 is prompt-dependent, not an implementation defect)
 - Measured the control that settles it: **llama.cpp's own Vulkan backend vs llama.cpp's own CPU backend** scores `cos = 0.997985` (`maxdiff 1.152`) on the Qwen3-4B harness chat prompt (`151644,872,198,785,…,77091,198`, `m=13`), where scoria scores `0.997652` (`maxdiff 1.103`). Both pick top1 `785`. No GPU implementation reaches 0.999 on that prompt.
 - Forcing prefill onto the scalar FP32 GEMM (`SCORIA_PREFILL_FP32=1`) changes nothing: 4B `0.997614` vs `0.997652` for FP16 WMMA, 8B `0.996415` vs `0.996404`. So the deficit is **not** FP16 WMMA rounding.
