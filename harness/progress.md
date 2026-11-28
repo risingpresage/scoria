@@ -325,6 +325,26 @@ The telling detail: the earlier 0.97-1.82 s/token prefill figures came from runs
 
 **So: encode is not faster.** It is correct, and the projection batching it needed is now proven exact, but the chunk path needs that GPU-expert pathology found before prefill can be measured meaningfully.
 
+## 2026-11-28 — the 170x anomaly is expert residency, and it is path-dependent
+The anomaly is isolated. It is not the projection batching (chunk 1 does not use it), not the chunk orchestration (host-only prefill is 1.77 s/token against 1.54 decode), and not the expert code. It is **expert residency**, and it helps one path and destroys the other:
+
+| configuration | decode | prefill chunk 1 |
+| experts resident (12.16 GiB) | **0.36-0.48 s/token** | 40-100 s/token |
+| experts on host (2.40 GiB) | 1.00-1.02 s/token | **2.18 s/token** |
+
+Two more facts pinned it: the cost **grows with position** (token 1's MoE summed to 5.6 s, token 2's to 76.8 s inside the same chunked run), and it vanishes the moment expert uploads are disabled. The likely mechanism — not yet proven — is that 9.7 GiB of expert VRAM squeezes the page cache that serves the host-side expert reads for the 8 layers without a device codec, and this GGUF sits on a compressed btrfs, so those reads fall back to slow decompressing I/O. Decode is less exposed because it touches a smaller working set per token.
+
+**So residency is now a policy, not a constant.** `Model::set_expert_residency` and the CLI's prefill path turns it off. With that, batching finally shows its value:
+
+| prefill chunk | s/token | tok/s |
+| 1 | 1.351 | 0.74 |
+| 8 | 0.982 | 1.02 |
+| 32 | **0.757-0.983** | **1.02-1.32** |
+
+Perplexity 7.598 at every chunk size. **Batched prefill is 1.4x faster than decode at the same residency configuration (0.76 vs 1.00)**, and batching is worth 1.8x on its own (chunk 32 vs chunk 1). Decode with residency (0.40) is still faster in absolute terms, because it can use the residency that prefill cannot.
+
+Verified: `--proj-selftest` 0.00000 at m=2 and m=8, GPU-vs-host 3.6e-5 with the argmax agreeing, perplexity 7.598, gate green.
+
 ## Parity gate calibration (cosine > 0.999 is prompt-dependent, not an implementation defect)
 - Measured the control that settles it: **llama.cpp's own Vulkan backend vs llama.cpp's own CPU backend** scores `cos = 0.997985` (`maxdiff 1.152`) on the Qwen3-4B harness chat prompt (`151644,872,198,785,…,77091,198`, `m=13`), where scoria scores `0.997652` (`maxdiff 1.103`). Both pick top1 `785`. No GPU implementation reaches 0.999 on that prompt.
 - Forcing prefill onto the scalar FP32 GEMM (`SCORIA_PREFILL_FP32=1`) changes nothing: 4B `0.997614` vs `0.997652` for FP16 WMMA, 8B `0.996415` vs `0.996404`. So the deficit is **not** FP16 WMMA rounding.

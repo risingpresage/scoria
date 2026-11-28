@@ -893,7 +893,11 @@ impl Gpu {
     /// residency half of a tiered store: the hot set is whatever fits, the cold set is the
     /// GGUF mmap, and residency is decided per tensor because half an expert tensor is
     /// never useful.
-    fn upload_experts(&mut self, file: &GgufFile, moes: &[Moe]) -> usize {
+    fn upload_experts(&mut self, file: &GgufFile, moes: &[Moe], residency: bool) -> usize {
+        if !residency || std::env::var_os("SCORIA_NO_EXPERT_UPLOAD").is_some() {
+            self.experts = (0..moes.len()).map(|_| None).collect();
+            return 0;
+        }
         let mut resident = 0;
         self.experts = Vec::with_capacity(moes.len());
         for moe in moes {
@@ -1075,6 +1079,10 @@ pub struct Model {
     kv_ring: bool,
     /// Present when the projections run on the card; `None` keeps the verified host path.
     gpu: Option<Gpu>,
+    /// Whether expert tensors may be uploaded to VRAM. Measured to be strongly
+    /// path-dependent: residency is 2.5x faster for decode and 20-50x slower for the chunked
+    /// prefill, so it is a policy, not a constant.
+    expert_residency: bool,
     traces: Vec<VisitTrace>,
     /// Time spent in the MoE half of each visit, and in everything else.
     pub profile: Profile,
@@ -1188,6 +1196,7 @@ impl Model {
             kv_window_override: None,
             kv_ring: true,
             gpu: None,
+            expert_residency: true,
             traces: Vec::new(),
             profile: Profile::default(),
             max_visits: usize::MAX,
@@ -1210,7 +1219,8 @@ impl Model {
         let max_in = self.cfg.n_embd;
         let max_out = (self.cfg.n_heads * self.cfg.head_dim).max(self.cfg.n_embd);
         let mut gpu = Gpu::new(ctx, &self.layers, max_in, max_out);
-        let resident = gpu.resident + gpu.upload_experts(&self.file, &self.moes);
+        let resident =
+            gpu.resident + gpu.upload_experts(&self.file, &self.moes, self.expert_residency);
         self.gpu = Some(gpu);
         Ok(resident)
     }
@@ -1308,6 +1318,13 @@ impl Model {
             }
         }
         (windowed, full)
+    }
+
+    /// Keep expert tensors off the card. Decode wants them resident; the chunked prefill is
+    /// 20-50x slower with them resident on this machine, so the two paths disagree and the
+    /// caller decides.
+    pub fn set_expert_residency(&mut self, on: bool) {
+        self.expert_residency = on;
     }
 
     pub fn gpu_active(&self) -> bool {
@@ -2351,6 +2368,8 @@ impl Model {
         profile: &mut Profile,
     ) -> Vec<Vec<f32>> {
         let mut outs = vec![vec![0f32; n_embd]; xs.len()];
+        let trace = std::env::var_os("SCORIA_TRACE_CHUNK").is_some();
+        let t_entry = std::time::Instant::now();
         // Gathering only pays when positions *share* experts: with 128 experts and 8 routed
         // per position, a chunk of C positions makes `C * 8` draws whose distinct count is
         // 128 * (1 - (1 - 8/128)^C). Measured: at C=1 the per-position path is faster
@@ -2359,6 +2378,12 @@ impl Model {
         if xs.len() == 1 {
             for (i, x) in xs.iter().enumerate() {
                 outs[i] = Self::moe_forward_parts(gpu, moe, file, layer, n_embd, x, profile);
+            }
+            if trace {
+                eprintln!(
+                    "  chunk n=1 layer {layer}: {:.4}s (per-position)",
+                    t_entry.elapsed().as_secs_f64()
+                );
             }
             return outs;
         }
@@ -2376,6 +2401,13 @@ impl Model {
                 );
             }
             moe.forward_chunk(file, xs, &mut outs);
+            if trace {
+                eprintln!(
+                    "  chunk n={} layer {layer}: {:.4}s HOST",
+                    xs.len(),
+                    t_entry.elapsed().as_secs_f64()
+                );
+            }
             return outs;
         }
 
@@ -2504,6 +2536,13 @@ impl Model {
             base += hits.len();
         }
         profile.gpu_experts += t_batch.elapsed().as_secs_f64();
+        if trace {
+            eprintln!(
+                "  chunk n={} layer {layer}: {:.4}s GATHERED",
+                xs.len(),
+                t_entry.elapsed().as_secs_f64()
+            );
+        }
         outs
     }
 

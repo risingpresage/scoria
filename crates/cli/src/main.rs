@@ -853,6 +853,11 @@ fn cmd_logits(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if prefill_chunk > 0 {
         let mut model = Model::open_with_router(path, router)?;
         model.max_visits = max_visits;
+        // Measured on this machine: expert residency is 2.5x faster for decode and 20-50x
+        // slower for the chunked prefill (the host-side expert reads for the layers without a
+        // device codec appear to lose the page cache to the VRAM allocation). Prefill keeps
+        // its experts on the host.
+        model.set_expert_residency(false);
         if threads > 0 {
             model.set_threads(threads);
         }
